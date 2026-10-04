@@ -1,0 +1,296 @@
+syntax = "proto3";
+
+// CGF — Code Graph Facts. The language-neutral contract between the Go frontend
+// (extraction) and the Rust core (IFDS taint). One CgfPackage is emitted per Go
+// package. See panopticode/docs/02,03. Boolean-taint MVP; additive-only schema.
+package panopticode.cgf;
+
+option go_package = "github.com/panopticode/frontend/internal/cgfpb;cgfpb";
+
+// ---------------------------------------------------------------------------
+// Top level: one file per package.
+// ---------------------------------------------------------------------------
+message CgfPackage {
+  string repo           = 1; // canonical repo id, e.g. "gitlab.example.com/acme/ledger-svc"
+  string commit_sha     = 2; // bitemporal stamp (doc 03 §4)
+  string package_path   = 3; // Go import path
+  int32  schema_version = 4; // additive-only (doc 03 §5)
+  string language       = 5; // "go"
+
+  repeated Function     functions      = 10;
+  repeated Type         types          = 11;
+  repeated ProtoMessage proto_messages = 12;
+  repeated GrpcMethod   grpc_methods   = 13;
+  repeated GraphqlField graphql_fields = 14;
+  repeated Endpoint     endpoints      = 15;
+}
+
+// ---------------------------------------------------------------------------
+// Identity — two-level content hash (doc 03 §2). 32-byte SHA-256.
+//   iid = hash(repo, package_path, exported_symbol_path, normalized_signature)
+//   bid = hash(canonical LocalFlow) embedding callees' iids (NOT bids)
+// ---------------------------------------------------------------------------
+message Ident {
+  bytes iid = 1;
+  bytes bid = 2;
+}
+
+enum Origin {
+  ORIGIN_USER   = 0;
+  ORIGIN_STDLIB = 1;
+  ORIGIN_DEP    = 2;
+}
+
+enum Generator {
+  GEN_NONE    = 0;
+  GEN_PROTOC  = 1;
+  GEN_GQLGEN  = 2;
+  GEN_MOCKGEN = 3;
+}
+
+message Span {
+  string file = 1;
+  int32  line = 2;
+  int32  col  = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Function
+// ---------------------------------------------------------------------------
+message Function {
+  Ident     id        = 1;
+  string    fqn       = 2; // import/path/pkg.Type.Method
+  string    package   = 3;
+  Origin    origin    = 4;
+  bool      generated = 5;
+  Generator generator = 6;
+  bool      has_body  = 7; // false => signature-only; core uses default/known leaf
+  Span      span      = 8;
+
+  Signature signature = 9;
+  LocalFlow flow      = 10; // value-flow sidecar (empty if !has_body)
+
+  repeated bytes binds_to = 11; // Endpoint.iid this fn implements (handler<->endpoint)
+
+  // Param indices (flow InParam numbering: receiver excluded, first real param
+  // = 0) the core seeds as unconditional taint sources — the endpoint's
+  // untrusted args (doc 19). Affects summary_key, NOT bid (doc 20 §4).
+  repeated uint32 source_params = 12;
+}
+
+message Signature {
+  repeated Param   params       = 1; // index i => param_i (receiver is params[0] if method)
+  bool             has_receiver = 2;
+  repeated TypeRef returns      = 3; // index j => return_j
+  bool             variadic     = 4;
+}
+
+message Param {
+  string name   = 1;
+  string type   = 2;
+  bool   by_ref = 3; // pointer/slice/map => eligible OUT_PARAM_BYREF
+}
+
+message TypeRef { string type = 1; }
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+message Type {
+  string fqn = 1;
+  enum Kind {
+    STRUCT    = 0;
+    INTERFACE = 1;
+    ALIAS     = 2;
+  }
+  Kind           kind       = 2;
+  repeated bytes implements = 3; // iids of interfaces satisfied
+  repeated Field fields     = 4; // index j used by OUT_FIELD / field_j slots
+}
+
+message Field {
+  uint32 index = 1;
+  string name  = 2;
+  string type  = 3;
+}
+
+// ---------------------------------------------------------------------------
+// LocalFlow — the value-flow sidecar (language_facts). Vertices are the only
+// things edges connect; dense u32 ids local to the function. Calls are
+// BARRIERS: edges go into arg-ports / out of result-ports, never THROUGH a call.
+// ---------------------------------------------------------------------------
+message LocalFlow {
+  repeated FlowVertex vertices  = 1;
+  repeated FlowEdge   edges     = 2;
+  repeated CallSite   callsites = 3;
+}
+
+enum VertexKind {
+  IN_PARAM         = 0; // param_i        (index = param index; field_path k<=1)
+  IN_RECEIVER      = 1; // receiver
+  IN_GLOBAL        = 2; // global_i       (sym = global symbol iid)
+  OUT_RETURN       = 3; // return_j       (index = return index)
+  OUT_PARAM_BYREF  = 4; // param_i mutated by-ref
+  OUT_FIELD        = 5; // field_j of receiver/return aggregate
+  CALL_ARG_PORT    = 6; // callsite arg   (callsite_id, index = arg index)
+  CALL_RESULT_PORT = 7; // callsite result(callsite_id, index = result index)
+  // W1a. The receiver mutated by-ref. It cannot be OUT_PARAM_BYREF: that index
+  // is IN_PARAM-relative and the caller maps it to arg port index+1 whenever
+  // arg0_is_receiver (the N3 fix, ifds.rs), so port 0 is unaddressable — a
+  // receiver write emitted as OUT_PARAM_BYREF(0) would land on the first real
+  // argument. Mirrors the IN direction, where port 0 is Slot::Receiver.
+  OUT_RECEIVER_BYREF = 8;
+}
+
+message FlowVertex {
+  uint32     id          = 1;
+  VertexKind kind        = 2;
+  uint32     index       = 3;
+  repeated uint32 field_path = 4; // bounded k=2 field sensitivity; empty = whole
+  uint32     callsite_id = 5;     // for CALL_ARG_PORT / CALL_RESULT_PORT
+  bytes      sym         = 6;     // for IN_GLOBAL / OUT_FIELD: heap-cell identity.
+                                  // IN_GLOBAL: global symbol iid. Both kinds
+                                  // (W1F): H(type, field) — one abstract cell
+                                  // shared by every instance of that type.
+                                  // A set sym on OUT_FIELD makes the out-slot
+                                  // Global(sym), not Field(index).
+  string     type        = 7;     // static type (source/sink type match in core)
+  Span       span        = 8;
+  // human names for field_path elements (index-aligned; reporting only —
+  // identity is field_path: proto field number when tagged, else struct index)
+  repeated string field_names = 9;
+  // human name of the heap cell `sym` addresses, e.g. "epool.Pool.incoming".
+  // Reporting only — witness renders it as the route hop that crosses the cell,
+  // so a heap-mediated chain still opens against source (doc 24 N2).
+  string sym_name = 10;
+  // A16 (doc 30 §6.1) — the type discriminant that narrows an interface-typed
+  // heap cell's writer->reader pairings. H("", <go type string>), empty = no
+  // constraint (which is every pre-A16 CGF, so the core's filter is inert on
+  // them). Emitted only under --heap-slots --heap-iface-narrow.
+  //   IN_GLOBAL:  the CONCRETE type the reader asserts the cell's value to
+  //               (`event.EventSrc.(domain.SBPParam)`). The vertex sits on the
+  //               *ssa.TypeAssert result, not on the load, so a raw use of the
+  //               same field in the same function keeps its unconstrained slot.
+  //   OUT_FIELD:  the CONCRETE type this write stores into the interface field
+  //               (the *ssa.MakeInterface operand).
+  // A pairing is dropped when both are set and differ. Unknown on either side
+  // keeps the pairing — the sound direction.
+  bytes iface_type = 11;
+}
+
+message FlowEdge {
+  uint32 from      = 1;
+  uint32 to        = 2;
+  bool   via_alias = 3; // points-to-derived => lower confidence
+}
+
+// ---------------------------------------------------------------------------
+// Call sites — the wiring the core needs to compose summaries.
+// ---------------------------------------------------------------------------
+message CallSite {
+  uint32 id = 1;
+  enum Kind {
+    STATIC         = 0;
+    VIRTUAL        = 1; // VTA fan-out => multiple callee_iids
+    INVOKES_REMOTE = 2; // callee_iids = [GrpcMethod.iid]
+    GO             = 3;
+    DEFER          = 4;
+    BUILTIN        = 5;
+  }
+  Kind   kind = 2;
+
+  repeated bytes callee_iids = 3;
+  bool   opaque          = 4;  // unresolved => core applies default leaf
+  string callee_fqn      = 5;  // for catalog fqn/selector matching
+  uint32 argc            = 6;  // arg-port vertices for 0..argc-1
+  bool   arg0_is_receiver = 7;
+  uint32 resultc         = 8;  // result-port vertices for 0..resultc-1
+  Span   span            = 9;
+  float  dispatch_confidence = 10; // 1.0 static; <1 VTA fan-out / unresolved
+
+  // Stream data ports: a Send/Recv call on a generated Svc_MethodServer /
+  // Svc_MethodClient stream. Kind is INVOKES_REMOTE with callee_iids =
+  // [GrpcMethod.iid]; stream_op distinguishes the port from the open call.
+  enum StreamOp {
+    STREAM_OP_NONE = 0;
+    STREAM_OP_SEND = 1; // Send / SendMsg / SendAndClose
+    STREAM_OP_RECV = 2; // Recv / RecvMsg / CloseAndRecv
+  }
+  StreamOp stream_op          = 11;
+  bool     stream_client_side = 12; // true: op on Svc_MClient; false: on Svc_MServer
+
+  // B1 (doc 31 §4) — bit j set = result j is `error`-typed
+  // (types.Implements, so concrete error types count too). The core's default
+  // leaf refuses to taint those ports unless the callee is a catalog-listed
+  // error wrapper, which is the largest FP class in the tree (doc 30 §6.2).
+  //
+  // Zero on every pre-B1 CGF, and zero means "unknown" — the core's filter is
+  // inert on them, the sound direction. Result-port vertices carry no `type`
+  // (flow.go:585 emits ""), which is why this is a fact and not a lookup; a
+  // bitmask rather than filling those types keeps it one varint per callsite
+  // and inert with respect to any future consumer of `type`.
+  // Emitted only under --error-results.
+  uint64 error_results = 13;
+
+  // Name of arg port i (len == argc, "" = unnamed). Set by frontends whose
+  // call convention is by-name (GraphQL operations). Core: normalize.rs
+  // rewrites CALL_ARG_PORT indices into the contract's positional frame.
+  repeated string arg_names = 14;
+}
+
+// ---------------------------------------------------------------------------
+// Contract facts — the cross-repo currency (doc 02 §4).
+// ---------------------------------------------------------------------------
+message ProtoMessage {
+  string full_name = 1;
+  repeated ProtoField fields = 2;
+}
+
+message ProtoField {
+  uint32 index = 1;
+  string name  = 2;
+  string type  = 3;
+  repeated PiiTag pii = 4;
+}
+
+message PiiTag { string category = 1; } // EMAIL/PHONE/... (label deferred, tag kept)
+
+message GrpcMethod {
+  bytes  iid         = 1; // cross-repo store key
+  string full_name   = 2; // "ledger.Ledger/GetAccount"
+  string input_msg   = 3; // ProtoMessage.full_name
+  string output_msg  = 4;
+  bytes  handler_iid = 5; // server Function.iid bound via binds_to (same repo)
+  bytes  endpoint_iid = 6;
+  bool   client_streaming = 7; // mirrors descriptor.proto; bidi = both true
+  bool   server_streaming = 8;
+}
+
+message GraphqlField {
+  bytes  iid          = 1;
+  string type_field   = 2; // SDL-exact "Account.details", "AuthMutations.login"
+  bytes  resolver_iid = 3; // gqlgen generated resolver map (exact)
+  bytes  endpoint_iid = 4;
+  // SDL arg name -> resolver InParam index (flow numbering, ctx = 0). Order is
+  // the SDL/generated-dispatch argument order; the core uses it to normalize a
+  // by-name client callsite (CallSite.arg_names) into positions (doc 36 §3).
+  repeated GraphqlArg args = 5;
+}
+
+message GraphqlArg {
+  string name      = 1;
+  uint32 param_idx = 2;
+}
+
+// Unifier over GrpcMethod/GraphqlField/HTTPRoute.
+message Endpoint {
+  bytes iid = 1;
+  enum Kind {
+    GRPC    = 0;
+    GRAPHQL = 1;
+    HTTP    = 2;
+  }
+  Kind kind            = 2;
+  bool untrusted_input = 3; // catalog: is this a taint source surface?
+  string name          = 4; // display, e.g. "ledger.Ledger/GetAccount" or "Account.details"
+}

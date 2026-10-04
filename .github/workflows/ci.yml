@@ -1,0 +1,41 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  core:
+    name: build + test + e2e
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends protobuf-compiler
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: core
+
+      - name: cargo build
+        run: cargo build --manifest-path core/Cargo.toml
+
+      - name: cargo test
+        run: cargo test --manifest-path core/Cargo.toml
+
+      # The golden CGF under testdata/cgf/ makes this run without a Go or Node
+      # toolchain, without Postgres and without network access.
+      - name: e2e (golden CGF)
+        run: NOBUILD=1 scripts/e2e-core.sh
+
+      - name: cargo clippy
+        run: cargo clippy --manifest-path core/Cargo.toml --all-targets
+        continue-on-error: true

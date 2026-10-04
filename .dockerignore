@@ -1,0 +1,10 @@
+.git
+.github
+core/target
+output
+out
+testdata
+docs
+*.md
+!README.md
+.DS_Store

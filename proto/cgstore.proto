@@ -1,0 +1,112 @@
+syntax = "proto3";
+
+// cgstore — the persisted call-graph snapshot (R4 Ph1, incremental_callgraph_spec
+// §4/§8). One Meta + one PkgShard per package, under
+// output/cgstore/<repo>/<hex12(storeKey)>/<commit12>/. Go frontend only — the
+// Rust core never reads this. Versioned separately from cgf.proto: any breaking
+// change bumps schema_version, which is folded into storeKey (old snapshots
+// simply miss and a full rebuild rewrites them).
+package panopticode.cgstore;
+
+option go_package = "github.com/panopticode/frontend/internal/cgstorepb;cgstorepb";
+
+// Meta is written LAST (after every shard), atomically with the whole snapshot
+// dir (temp dir + rename). Its shard list carries per-file content hashes —
+// the snapshot's self-check; any mismatch on load ⇒ full rebuild, never guess.
+message Meta {
+  uint32 schema_version = 1;
+  string repo           = 2;  // module path, e.g. "gitlab.example.com/acme/ledger-svc"
+  string commit_sha     = 3;
+  string parent_sha     = 4;  // first-parent of commit_sha (Ph2 base-graph lookup)
+  string scope          = 5;  // resolved scope string (post-expansion)
+  string pcfe_version   = 6;  // hex sha256 of the running pc-fe binary
+  string go_toolchain   = 7;  // runtime.Version() of that binary
+  string cg_mode        = 8;  // "vta" | "cha" — whatever --dispatch built this
+  uint32 cap_n          = 9;  // resolver fan-out cap
+  bool   exclude_mocks  = 10;
+
+  // sha256 over the sorted iids of every emitted function: detects any drift
+  // between the snapshot's function universe and a freshly rebuilt SSA that
+  // the storeKey inputs failed to capture.
+  bytes fn_set_hash = 11;
+
+  int64 created_unix     = 12;
+  int64 dispatch_wall_ms = 13; // original graph-build cost (reload reporting)
+
+  // Resolver generics-gap counters, replayed verbatim on the cached path so
+  // the `generics-gap:` stderr line stays truthful without a live graph.
+  int32 generic_edges      = 14;
+  int32 sites_all_generic  = 15;
+  int32 sites_some_generic = 16;
+
+  // --field-paths at capture time: getter canonicalization drops pb-getter
+  // CallSites, so CallSite.Id ordinals only align with a matching-mode
+  // enumeration (snapshot.go filters canonicalized calls when true).
+  bool field_paths = 18;
+
+  // --closure-flow at capture time (W1d). Recorded for the same reason as
+  // field_paths: it changes CGF bytes. It does NOT change CallSite.Id alignment
+  // — the synthetic binding sites are appended after every real one and
+  // n_callsites counts only the real ones — so snapshot.go needs no filter for
+  // it. The flag is in the store key regardless, so a snapshot is never
+  // replayed under a mode that did not capture it.
+  bool closure_flow = 19;
+
+  message Shard {
+    string pkg    = 1; // package import path
+    bytes  sha256 = 2; // content hash of the shard file as written
+  }
+  repeated Shard shards = 17;
+}
+
+// PkgShard holds the per-package slice of the snapshot: dispatch edges of the
+// callers declared in pkg, plus the satisfaction facts (fingerprints + pairs)
+// of the types/interfaces declared in pkg. File name mirrors CGF sharding.
+message PkgShard {
+  string pkg = 1;
+
+  repeated CallerEdges      callers  = 2;
+  repeated TypeFingerprint  types    = 3;
+  repeated IfaceFingerprint ifaces   = 4;
+  repeated SatPair          sat_pairs = 5; // keyed by implementing type's package
+}
+
+// CallerEdges: all persisted dispatch sites of one function. Only sites the
+// live resolver actually resolved (targets or capped-opaque) are stored;
+// absent sites replay as unresolved — byte-identical to live behavior.
+message CallerEdges {
+  bytes  caller_iid  = 1;
+  uint32 n_callsites = 2; // TOTAL CallInstruction count in the caller (validation:
+                          // must equal the re-enumerated count on reload)
+  repeated SiteEdge sites = 3;
+}
+
+// SiteEdge keys a site by the same ordinal the CGF emits as CallSite.Id: the
+// index of the ssa.CallInstruction in deterministic fn.Blocks/Instrs order.
+message SiteEdge {
+  uint32 callsite_id   = 1;
+  repeated bytes callee_iids = 2; // FQN-sorted, exactly the live resolver's order
+  bool   opaque_by_cap = 3;       // capped site: callee_iids empty, replay opaque
+  float  confidence    = 4;       // = 1/len(callee_iids); persisted as cross-check
+}
+
+// Method-set fingerprint of a named type (spec §5 / synchronous-floyd design):
+// sha256 over the pointer method set sorted by types.Func.Id(), each entry
+// Id + canonical signature + an "also in value set" bit. No Ph1 consumer —
+// persisted now so Ph2's satisfaction delta has a base table to diff against.
+message TypeFingerprint {
+  string type_key = 1; // types.TypeString with full-path qualifier
+  bytes  msfp     = 2;
+}
+
+message IfaceFingerprint {
+  string iface_key = 1;
+  bytes  ifp       = 2;
+}
+
+// A materialized `type ⊨ interface` satisfaction fact.
+message SatPair {
+  string type_key     = 1;
+  string iface_key    = 2;
+  bool   pointer_only = 3; // *T satisfies but T does not
+}

@@ -1,0 +1,114 @@
+name: release
+
+# Releases are cut by release-please:
+#   1. Every push to main opens or updates a "chore(main): release X.Y.Z" PR
+#      that bumps the version and CHANGELOG.md from the Conventional Commit
+#      titles merged since the last release (see pr-title.yml).
+#   2. Merging that PR tags vX.Y.Z and publishes the GitHub Release; the build
+#      job below then attaches the artifacts to it.
+# A PR that edits this file runs the build job as a dry run: the artifacts are
+# kept on the workflow run and nothing is published.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths: [.github/workflows/release.yml]
+
+permissions: {}
+
+jobs:
+  release-please:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      # A PR opened with the default GITHUB_TOKEN does not trigger CI, so on a
+      # main that requires status checks the release PR could never merge.
+      # Setting the RELEASE_APP_CLIENT_ID variable and RELEASE_APP_PRIVATE_KEY
+      # secret makes release-please act as that GitHub App instead.
+      - uses: actions/create-github-app-token@v3
+        id: app
+        if: vars.RELEASE_APP_CLIENT_ID != ''
+        with:
+          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+
+      - uses: googleapis/release-please-action@v5
+        id: release
+        with:
+          token: ${{ steps.app.outputs.token || github.token }}
+
+  build:
+    name: build (${{ matrix.target }})
+    needs: release-please
+    if: ${{ !cancelled() && (needs.release-please.outputs.release_created == 'true' || github.event_name == 'pull_request') }}
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux builds run on 22.04 so the binaries need glibc >= 2.35
+          # rather than whatever the newest runner ships.
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-22.04 }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-22.04 }
+          - { target: aarch64-apple-darwin, os: macos-latest }
+          - { target: x86_64-apple-darwin, os: macos-latest }
+    env:
+      TAG: ${{ needs.release-please.outputs.tag_name }}
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.TAG }}
+
+      - name: install protoc (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends protobuf-compiler \
+            ${{ matrix.target == 'aarch64-unknown-linux-gnu' && 'gcc-aarch64-linux-gnu libc6-dev-arm64-cross' || '' }}
+
+      - name: install protoc (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # --locked also catches a release PR that bumped Cargo.toml but not Cargo.lock.
+      - name: build
+        run: cargo build --release --locked --manifest-path core/Cargo.toml --target ${{ matrix.target }}
+
+      - name: package
+        run: |
+          version=${TAG#v}
+          name=panopticode-${version:-dev}-${{ matrix.target }}
+          mkdir -p "dist/$name"
+          cp "core/target/${{ matrix.target }}/release/panopticode" LICENSE README.md catalog.example.toml "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          cd dist && shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256" && cat "$name.tar.gz.sha256"
+
+      - name: attach to release
+        if: env.TAG != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$TAG" dist/*.tar.gz dist/*.sha256 --clobber --repo "$GITHUB_REPOSITORY"
+
+      - name: keep dry-run artifacts
+        if: env.TAG == ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: dist-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          retention-days: 3

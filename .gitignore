@@ -1,0 +1,5 @@
+/output/
+core/target/
+*.pb.bin
+.DS_Store
+out/

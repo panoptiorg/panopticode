@@ -1,0 +1,21 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: panopticode-pg
+    environment:
+      POSTGRES_USER: panopticode
+      POSTGRES_PASSWORD: panopticode
+      POSTGRES_DB: panopticode
+    ports:
+      - "${PC_PG_PORT:-5433}:5432"
+    volumes:
+      - ./schema.sql:/docker-entrypoint-initdb.d/00-schema.sql:ro
+      - panopticode_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U panopticode -d panopticode"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  panopticode_pgdata:

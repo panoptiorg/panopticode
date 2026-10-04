@@ -1,0 +1,734 @@
+# catalog.example.toml — policy-as-data source/sink/sanitizer/propagator catalog.
+#
+# This is an EXAMPLE built on public Go and TypeScript libraries. It is also the
+# catalog the golden-CGF regression suite (`scripts/e2e-core.sh`) runs against,
+# so it is known to work end to end. It is NOT a complete policy for your fleet:
+# copy it, then add the wrappers your codebase actually uses.
+#
+# HONESTY NOTE ON THE `public Go baseline` SECTION (near the end of the Go part).
+# Those rules were derived from the *API shapes* of the libraries they name —
+# what `callee_fqn` the Go frontend emits for a call into that library — and are
+# verified only by a shape test (`core/src/catalog.rs`, `example_catalog_shapes`)
+# that feeds hand-written fqn samples through this file. They have NOT been
+# measured against a public corpus: nobody has counted how often they fire, how
+# many findings they produce, or how many of those are true. Treat them as a
+# starting vocabulary, not as a calibrated policy — fitting a catalog to your own
+# corpus is still the work, and is where the one recall number this project has
+# published came from.
+#
+#     cp catalog.example.toml catalog.toml   # then edit
+#     panopticode taint --cgf <dir> --catalog catalog.toml
+#
+# Only the Rust core reads this file. The frontends never classify anything —
+# they emit a language-neutral graph, and every security judgement is made here.
+#
+# Matching. `selector` is an exact string match, `selector_regex` a Rust regex;
+# both run against `CallSite.callee_fqn`. For Go that is a fully-qualified
+# selector — `(*example.com/app/store.DB).Selectx`, `os/exec.Command`,
+# `github.com/Masterminds/squirrel.Expr`. For TypeScript see the `--- ts ---`
+# section below, which documents its own callee_fqn vocabulary.
+#
+# `arg` selects which argument port a tainted fact must reach for a sink to fire:
+# an integer index (0-based over the call's arg ports; the receiver is port 0
+# when arg0_is_receiver) or "any".
+
+schema_version = 1
+
+# ---------------------------------------------------------------------------
+# SOURCES — untrusted input surfaces. A matched result port (a getter's return
+# value) or endpoint parameter becomes tainted.
+#
+# Note that endpoint-driven sourcing is STRUCTURAL and needs no rule here: the
+# core seeds `Endpoint.untrusted_input` (gRPC request params, gqlgen resolver
+# args) directly from the graph. The selectors below only catch accessor getters
+# used inside a handler body, and under structural field-path seeding
+# (`pc-fe --field-paths`, the default) the gRPC one is largely INERT — the
+# request parameter is already a source, and trivial protobuf getters are
+# canonicalized into field projections rather than call sites. It is kept
+# because it still fires on corpora extracted with `--field-paths=false`.
+# ---------------------------------------------------------------------------
+
+[[sources]]
+kind           = "grpc_request"
+# gRPC request-message getters, e.g. (*.../ledger.GetAccountRequest).GetNumber —
+# any getter on a *Request type, regardless of package path.
+selector_regex = 'Request\)\.Get[A-Za-z0-9_]+$'
+note           = "gRPC request message field getters (see the inertness note above)"
+
+# ---------------------------------------------------------------------------
+# SINKS — dangerous operations. When a tainted fact reaches `arg`, record a hit.
+#
+# READ THIS: a sink hit means "untrusted data reached this call", NOT "this call
+# is exploitable". Class `sqli` means a value the tool believes is attacker
+# controlled was passed to something that executes SQL. Whether it is injectable
+# depends on placeholders, driver behaviour and validation the tool cannot see.
+# ---------------------------------------------------------------------------
+
+# --- sqli ------------------------------------------------------------------
+
+[[sinks]]
+class          = "sqli"
+selector_regex = '\(\*database/sql\.(DB|Tx|Conn|Stmt)\)\.(Query|QueryRow|Exec)(Context)?$'
+arg            = "any"
+note           = "database/sql — the fqn carries the IMPORT PATH, not the package name: `(*database/sql.DB).Query`"
+
+[[sinks]]
+class          = "sqli"
+selector_regex = '^github\.com/jmoiron/sqlx\.|\(\*github\.com/jmoiron/sqlx\.(DB|Tx|Conn)\)\.'
+arg            = "any"
+note           = "jmoiron/sqlx"
+
+[[sinks]]
+class          = "sqli"
+selector_regex = 'github\.com/jackc/pgx.*\.(Query|QueryRow|Exec|SendBatch|CopyFrom)$'
+arg            = "any"
+note           = "jackc/pgx — SendBatch and CopyFrom execute too"
+
+[[sinks]]
+class          = "sqli"
+selector_regex = '\(\*github\.com/jackc/pgx/v[45]\.Batch\)\.Queue$'
+arg            = "any"
+note           = "jackc/pgx — Batch.Queue is where the SQL text enters the batch"
+
+[[sinks]]
+class          = "sqli"
+selector_regex = '^github\.com/Masterminds/squirrel\.'
+arg            = "any"
+note           = "squirrel raw expression building (sq.Expr etc.)"
+
+[[sinks]]
+class          = "sqli"
+selector_regex = '^\(github\.com/Masterminds/squirrel\.[A-Za-z]+Builder\)\.ToSql$'
+arg            = "any"
+note           = "squirrel builders have VALUE receivers, so the fqn is `(github.com/Masterminds/squirrel.SelectBuilder).ToSql` — no `*`, and not package-qualified, which the rule above cannot reach"
+
+[[sinks]]
+class          = "sqli"
+selector_regex = '\.(Getx|Selectx|Execx|Queryx|Getxx)$'
+arg            = "any"
+note           = """executor-wrapper style: an in-house pgx wrapper whose exec \
+methods are named Getx/Selectx/Execx/Queryx. Method-name-only rules like this \
+one are broad on purpose — most fleets have such a wrapper, and its methods are \
+where the queries actually run. Rename to match yours; delete it if you have none."""
+
+# --- log -------------------------------------------------------------------
+# Logging that carries user data is its own class: usually not a vulnerability,
+# frequently a compliance finding.
+
+[[sinks]]
+class          = "log"
+selector_regex = '^log/slog\.(Debug|Info|Warn|Error)(Context)?$|\(\*log/slog\.Logger\)\.'
+arg            = "any"
+note           = "log/slog"
+
+[[sinks]]
+class          = "log"
+selector_regex = '^log\.(Print|Printf|Println|Fatal|Fatalf|Fatalln|Panic|Panicf|Panicln)$|\(\*log\.Logger\)\.(Print|Printf|Println|Fatal|Fatalf|Panic|Panicf)$'
+arg            = "any"
+note           = "stdlib log — package helpers and the method form on a *log.Logger"
+
+[[sinks]]
+class          = "log"
+selector_regex = 'go\.uber\.org/zap.*\.(Debug|Info|Warn|Error|Debugf|Infof|Warnf|Errorf|Fatalf|Debugw|Infow|Warnw|Errorw|Fatalw)$'
+arg            = "any"
+note           = "uber-go/zap — including the SugaredLogger `*w` key/value forms"
+
+[[sinks]]
+class          = "log"
+selector_regex = 'go\.uber\.org/zap\.(String|Any|Int|Int64|Bool|Reflect|Strings|Error)$'
+arg            = "any"
+note           = "uber-go/zap field constructors — zap.String(k, acc) is where the value is captured; the Logger call itself only sees the built Field"
+
+[[sinks]]
+class          = "log"
+selector_regex = '(^|/)logger\.(Error|Warn|Info|Debug|Fatal)(f|w|KV)?$'
+arg            = "any"
+note           = "a package-level `logger` helper — the common in-house shape, in its printf (`Errorf`), plain (`Error`) and key/value (`Errorw`, `ErrorKV`) forms"
+
+# --- exec ------------------------------------------------------------------
+
+[[sinks]]
+class          = "exec"
+selector_regex = '^os/exec\.Command(Context)?$'
+arg            = "any"
+note           = "os/exec"
+
+# --- egress ----------------------------------------------------------------
+
+[[sinks]]
+class          = "egress"
+selector_regex = 'github\.com/segmentio/kafka-go.*\.(WriteMessages|Write)$'
+arg            = "any"
+note           = "segmentio/kafka-go"
+
+[[sinks]]
+class          = "egress"
+selector_regex = 'github\.com/twmb/franz-go.*\.(Produce|ProduceSync)$'
+arg            = "any"
+note           = "twmb/franz-go"
+
+[[sinks]]
+class          = "egress"
+selector_regex = '^net/http\.(Get|Post|PostForm|Head)$'
+arg            = "any"
+note           = "net/http convenience helpers"
+
+[[sinks]]
+class          = "egress"
+selector_regex = '\(\*net/http\.Client\)\.(Do|Get|Post|PostForm|Head)$'
+arg            = "any"
+note           = "net/http — the method form on an explicit *http.Client, which is what production code uses"
+
+[[sinks]]
+class          = "egress"
+selector_regex = '^net/http\.NewRequest(WithContext)?$'
+arg            = "any"
+note           = "net/http — the URL and the body are supplied here, one call before the Do"
+
+# ---------------------------------------------------------------------------
+# SANITIZERS — cut the flow (the core suppresses the summary edge arg -> out).
+#
+# There is deliberately no `__annotation__` rule here. A per-call-site comment
+# escape hatch (`// panopticode:sanitizer(...)`) is declared nowhere in the
+# frontends: no extractor emits such a call site, so the rule would never match.
+# Do not ship inert rules — they read as capability the tool does not have.
+# ---------------------------------------------------------------------------
+
+[[sanitizers]]
+kind           = "validation"
+selector_regex = 'go-ozzo/ozzo-validation.*\.Validate'
+note           = "ozzo-validation"
+
+# ---------------------------------------------------------------------------
+# ERROR WRAPPERS — the carve-out for `taint --no-error-leaf`.
+#
+# With `--no-error-leaf` (and a corpus extracted with `pc-fe --error-results`)
+# the default leaf does not taint an `error`-typed result port, because an error
+# value is almost never the request data — on one large corpus that pattern was
+# roughly a quarter of all findings. The calls listed here are the exception:
+# they BUILD an error out of their arguments, so `fmt.Errorf("… %s", account,
+# err)` genuinely carries `account` and must keep flowing.
+#
+# Every one of these returns exactly one result, which is what makes the
+# carve-out cheap.
+# ---------------------------------------------------------------------------
+
+[[error_wrappers]]
+selector_regex = '^fmt\.(Errorf|Sprintf|Sprint|Sprintln)$'
+note           = "stdlib formatting — Errorf is the canonical wrapper"
+
+[[error_wrappers]]
+selector_regex = '(^|/)errors\.(New|Wrap|Wrapf|WithMessage|WithMessagef|Join)$'
+note           = "stdlib errors + github.com/pkg/errors"
+
+[[error_wrappers]]
+selector_regex = '(^|/)status\.(Error|Errorf)$'
+note           = "google.golang.org/grpc/status"
+
+[[error_wrappers]]
+selector_regex = '\)\.(Wrap|Wrapf|WithMessage|WithMessagef|Annotate|Annotatef)$'
+note           = "method-form wrappers on a custom error type"
+
+# ---------------------------------------------------------------------------
+# --- public Go baseline ---
+#
+# A starting vocabulary of well-known public Go libraries. Derived from each
+# library's API shape (see the HONESTY NOTE at the top of this file): what the
+# Go frontend emits as `callee_fqn` for a call into it. Verified by the shape
+# test in core/src/catalog.rs, NOT by any corpus measurement.
+#
+# Two shape rules that cause most hand-written selectors to miss:
+#   * the fqn uses the IMPORT PATH, not the package name — `database/sql.DB`,
+#     `go.uber.org/zap.Logger`, never `sql.DB` or `zap.Logger`;
+#   * a method is `(<recv>).<Name>`, with a leading `*` only when the receiver
+#     is a POINTER — value receivers (squirrel builders, echo.Context) have none.
+#
+# Everything here is `arg = "any"`: an index would be a claim about a specific
+# signature, and these are shapes, not measurements.
+# ---------------------------------------------------------------------------
+
+# --- baseline sources: HTTP request surfaces ------------------------------
+
+[[sources]]
+kind           = "http_request"
+selector_regex = '\(\*net/http\.Request\)\.(FormValue|PostFormValue|FormFile|Cookie)$'
+note           = "net/http — request accessors that read attacker-supplied data"
+
+[[sources]]
+kind           = "http_query"
+selector_regex = '\(net/url\.Values\)\.Get$'
+note           = "net/url — r.URL.Query().Get(...); url.Values is a map type, so the receiver is a VALUE"
+
+[[sources]]
+kind           = "http_header"
+selector_regex = '\(net/http\.Header\)\.Get$'
+note           = "net/http — header reads; http.Header is a map type, value receiver"
+
+[[sources]]
+kind           = "http_route_param"
+selector_regex = '^github\.com/go-chi/chi(/v5)?\.URLParam$'
+note           = "go-chi — path parameters, package-level function"
+
+[[sources]]
+kind           = "http_request"
+selector_regex = '\(\*github\.com/gin-gonic/gin\.Context\)\.(Param|Query|PostForm|GetHeader|ShouldBind[A-Za-z]*|Bind[A-Za-z]*)$'
+note           = "gin — every request accessor and the whole Bind/ShouldBind family"
+
+[[sources]]
+kind           = "http_request"
+selector_regex = '\(github\.com/labstack/echo/v4\.Context\)\.(Param|QueryParam|FormValue)$'
+note           = "echo v4 — Context is an INTERFACE, so the receiver has no `*`"
+
+[[sources]]
+kind           = "http_route_param"
+selector_regex = '^github\.com/gorilla/mux\.Vars$'
+note           = "gorilla/mux — mux.Vars(r) returns the path variables map"
+
+# --- baseline sinks: sqli --------------------------------------------------
+
+[[sinks]]
+class          = "sqli"
+selector_regex = 'gorm\.io/gorm.*\)\.(Raw|Exec|Where|Order|Select|Group|Having|Joins)$'
+arg            = "any"
+note           = "gorm — the clause builders take SQL fragments, not just values; Order/Select/Group are the classic injection points"
+
+[[sinks]]
+class          = "sqli"
+selector_regex = 'go\.mongodb\.org/mongo-driver.*\)\.(Find|FindOne|Aggregate|UpdateMany|UpdateOne|DeleteMany|DeleteOne|InsertOne|InsertMany)$'
+arg            = "any"
+note           = "mongo-driver — NoSQL query injection via operator-bearing filter documents"
+
+[[sinks]]
+class          = "sqli"
+selector_regex = '\(\*github\.com/gocql/gocql\.Session\)\.Query$'
+arg            = "any"
+note           = "gocql — CQL statement text"
+
+[[sinks]]
+class          = "sqli"
+selector_regex = 'github\.com/ClickHouse/clickhouse-go/v2.*\)\.(Query|QueryRow|Exec|Select)$'
+arg            = "any"
+note           = "clickhouse-go v2"
+
+# --- baseline sinks: storage / cache --------------------------------------
+
+[[sinks]]
+class          = "storage"
+selector_regex = 'github\.com/(go-)?redis/(go-)?redis/v[89].*\)\.(Set|Get|HSet|HGet|Del|Publish|Eval|Do)$'
+arg            = "any"
+note           = "go-redis v8/v9 — the module moved from github.com/go-redis/redis to github.com/redis/go-redis, so both spellings"
+
+[[sinks]]
+class          = "storage"
+selector_regex = 'github\.com/bradfitz/gomemcache/memcache.*\)\.(Set|Get|Delete)$'
+arg            = "any"
+note           = "gomemcache"
+
+# --- baseline sinks: egress ------------------------------------------------
+
+[[sinks]]
+class          = "egress"
+selector_regex = 'github\.com/(Shopify|IBM)/sarama.*\)\.(SendMessage|SendMessages|Send)$'
+arg            = "any"
+note           = "sarama — maintenance moved from Shopify to IBM, so both module paths"
+
+[[sinks]]
+class          = "egress"
+selector_regex = '\(\*github\.com/nats-io/nats\.go\.Conn\)\.(Publish|Request)$'
+arg            = "any"
+note           = "nats.go"
+
+[[sinks]]
+class          = "egress"
+selector_regex = '\(\*github\.com/rabbitmq/amqp091-go\.Channel\)\.(Publish|PublishWithContext)$'
+arg            = "any"
+note           = "amqp091-go (RabbitMQ)"
+
+[[sinks]]
+class          = "egress"
+selector_regex = 'github\.com/aws/aws-sdk-go-v2/service/(s3|sqs|sns|dynamodb).*\)\.(PutObject|GetObject|DeleteObject|SendMessage|Publish|PutItem|GetItem|Query|Scan)$'
+arg            = "any"
+note           = "aws-sdk-go-v2 — S3 / SQS / SNS / DynamoDB client operations"
+
+[[sinks]]
+class          = "egress"
+selector_regex = 'github\.com/aws/aws-sdk-go-v2/feature/s3/manager.*\)\.Upload$'
+arg            = "any"
+note           = "aws-sdk-go-v2 — the S3 multipart upload manager"
+
+[[sinks]]
+class          = "egress"
+selector_regex = '\(\*cloud\.google\.com/go/storage\.Writer\)\.Write$'
+arg            = "any"
+note           = "GCS object writer"
+
+# --- baseline sinks: exec / file / path -----------------------------------
+
+[[sinks]]
+class          = "exec"
+selector_regex = '\(\*os/exec\.Cmd\)\.(Run|Start|Output|CombinedOutput)$'
+arg            = "any"
+note           = "os/exec — the execution itself, for the case where the Cmd was built out of view of the os/exec.Command rule above"
+
+[[sinks]]
+class          = "file"
+selector_regex = '^os\.(WriteFile|ReadFile|Create|Open|OpenFile|Remove|RemoveAll|Rename|MkdirAll)$'
+arg            = "any"
+note           = "os — attacker-controlled path or content (path traversal, arbitrary write)"
+
+[[sinks]]
+class          = "path"
+selector_regex = '^path/filepath\.Join$'
+arg            = "any"
+note           = "filepath.Join does NOT stop `..` from escaping a base directory — it only cleans; a separate class because on its own it is a lead, not a finding"
+
+# --- baseline sinks: xss / response headers -------------------------------
+
+[[sinks]]
+class          = "xss"
+selector_regex = '\(\*(html|text)/template\.Template\)\.(Execute|ExecuteTemplate)$'
+arg            = "any"
+note           = "html/template escapes contextually and text/template does not; both are listed because the data reaching either is worth seeing"
+
+[[sinks]]
+class          = "xss"
+selector_regex = '^html/template\.HTML$'
+arg            = "any"
+note           = "the HTML conversion is an explicit assertion that the value is already safe — exactly the call that turns tainted data into markup"
+
+[[sinks]]
+class          = "open_redirect"
+selector_regex = '^net/http\.Redirect$'
+arg            = "any"
+note           = "net/http — the redirect target"
+
+[[sinks]]
+class          = "open_redirect"
+selector_regex = '\(net/http\.Header\)\.(Set|Add)$'
+arg            = "any"
+note           = "response header writes — the Location case is an open redirect, the rest is header injection; http.Header is a map type, value receiver"
+
+# --- baseline sinks: log ---------------------------------------------------
+
+[[sinks]]
+class          = "log"
+selector_regex = 'github\.com/sirupsen/logrus.*\.(Debug|Info|Warn|Warning|Error|Fatal|Panic|Print)(f|ln)?$|\(\*github\.com/sirupsen/logrus\.(Entry|Logger)\)\.(WithField|WithFields|WithError)$'
+arg            = "any"
+note           = "logrus — the emit calls, plus the With* builders where the field value is actually captured"
+
+[[sinks]]
+class          = "log"
+selector_regex = '\(\*github\.com/rs/zerolog\.Event\)\.(Str|Strs|Int|Int64|Interface|Any|Msg|Msgf|Err|Bytes|RawJSON)$'
+arg            = "any"
+note           = "zerolog — the chained Event builders carry the values; Msg only closes the chain"
+
+[[sinks]]
+class          = "log"
+selector_regex = 'k8s\.io/klog/v2\.(Info|Infof|Warning|Warningf|Error|Errorf)$'
+arg            = "any"
+note           = "klog v2"
+
+# --- baseline sanitizers ---------------------------------------------------
+#
+# A sanitizer here is GLOBAL and class-blind: it cuts the flow for every sink
+# class at once. That is why parsing helpers are NOT shipped enabled below —
+# see the note on strconv.
+
+[[sanitizers]]
+kind           = "encoding"
+selector_regex = '^net/url\.(QueryEscape|PathEscape)$'
+note           = "net/url percent-encoding"
+
+[[sanitizers]]
+kind           = "encoding"
+selector_regex = '^html\.EscapeString$'
+note           = "html entity escaping"
+
+[[sanitizers]]
+kind           = "parse"
+selector_regex = '^github\.com/google/uuid\.(Parse|MustParse)$'
+note           = "a parsed UUID cannot carry an injection payload"
+
+[[sanitizers]]
+kind           = "validation"
+selector_regex = '\(\*github\.com/go-playground/validator/v10\.Validate\)\.(Struct|StructCtx|Var)$'
+note           = "go-playground/validator — struct/field validation"
+
+# strconv parsing (Atoi, ParseInt, ParseUint, ParseFloat, ParseBool) is the
+# obvious next sanitizer and is deliberately NOT enabled:
+#
+#   [[sanitizers]]
+#   kind           = "parse"
+#   selector_regex = '^strconv\.(Atoi|ParseInt|ParseUint|ParseFloat|ParseBool)$'
+#
+# Sanitizers in this catalog are class-blind. An integer parse really does end
+# an `sqli` or `exec` flow, but it does not end a `log` one — an account number
+# parsed to int64 and then logged is still the same PII leak — and enabling the
+# rule would silently delete those findings along with the injection ones.
+# Enable it if your policy is injection-only. (It is also load-bearing here:
+# the golden fixtures under testdata/cgf/ use strconv.Atoi as a plain conduit,
+# so turning it on drops the errorleaf suite from 8 chains to 6.)
+
+# ---------------------------------------------------------------------------
+# PROPAGATORS — library calls that move data somewhere other than their return
+# value: into the receiver (`sb.WriteString(s)`) or through a pointer argument
+# (`json.Unmarshal(b, &v)`). The core has no body for library code; its default
+# leaf sends a call's inputs to its RESULTS only, so without these the data in
+# sb / v was lost. A rule applies only where the callee has no summary, and only
+# ADDS flow (the leaf still runs). It needs the frontend's write-back edge
+# (pc-fe --library-writeback / pc-fe-ts, both default on) to reach the caller.
+#
+#   from / to: 0-based arg-port index (receiver is port 0 when the call has
+#   one, as for sinks), "receiver", "args" (every non-receiver port), "any",
+#   a comma list; `to` also takes "return", or "none" = reviewed, writes
+#   nothing (takes the callee off the `taint --unmodeled` report).
+#
+# Verification: the shapes exercised by the golden `libwrites` / `weblib`
+# fixtures (strings.Builder, bytes.Buffer, json.Unmarshal / Decoder.Decode,
+# fmt.Fprintf, io.Copy, url.Values.Set, maps.Copy, text/template Execute,
+# base64 Decode; Array.push, Map.set, Set.add, Object.assign,
+# URLSearchParams.append) are proven end to end by `scripts/e2e-core.sh`
+# (e2e-libwrites). The rest are API shapes checked by the shape test in
+# core/src/catalog.rs, NOT measured on a corpus — same status as the baseline.
+#
+# Not modelled yet: `rows.Scan(&a, &b)`, `fmt.Sscan*` — the pointers arrive
+# packed in a variadic slice the write-back cannot reach — and the `copy`
+# builtin (only under --heap-slots). `taint --unmodeled <file>` lists the calls
+# a corpus actually needs rules for.
+# ---------------------------------------------------------------------------
+
+[[propagators]]
+selector_regex = '^\(\*(strings\.Builder|bytes\.Buffer|bufio\.Writer)\)\.(Write|WriteString|WriteByte|WriteRune|ReadFrom)$'
+from           = "args"
+to             = "receiver"
+note           = "in-memory writers: the argument lands in the receiver"
+
+[[propagators]]
+selector_regex = '^\(\*(bytes\.Buffer|bytes\.Reader|strings\.Reader|bufio\.Reader)\)\.(Read|ReadAt)$'
+from           = "receiver"
+to             = "1"
+note           = "Read(p): the reader's data lands in p"
+
+[[propagators]]
+selector_regex = '^(encoding/json|encoding/xml|gopkg\.in/yaml\.v[23]|sigs\.k8s\.io/yaml|google\.golang\.org/protobuf/proto|google\.golang\.org/protobuf/encoding/protojson|github\.com/golang/protobuf/proto)\.Unmarshal$'
+from           = "0"
+to             = "1"
+note           = "Unmarshal(data, &v)"
+
+[[propagators]]
+selector_regex = '^\(google\.golang\.org/protobuf/(proto|encoding/protojson)\.UnmarshalOptions\)\.Unmarshal$'
+from           = "1"
+to             = "2"
+note           = "opts.Unmarshal(data, m) — value receiver is port 0"
+
+[[propagators]]
+selector_regex = '^\(\*(encoding/json|encoding/xml|encoding/gob|gopkg\.in/yaml\.v3)\.Decoder\)\.Decode$'
+from           = "receiver"
+to             = "1"
+note           = "json.NewDecoder(r).Decode(&v): the decoder carries r's data (NewDecoder's default leaf) into v"
+
+[[propagators]]
+selector_regex = '^(github\.com/mitchellh/mapstructure|github\.com/go-viper/mapstructure/v2)\.(Decode|WeakDecode)$'
+from           = "0"
+to             = "1"
+note           = "mapstructure.Decode(input, &out)"
+
+[[propagators]]
+selector_regex = '^github\.com/jinzhu/copier\.(Copy|CopyWithOption)$'
+from           = "1"
+to             = "0"
+note           = "copier.Copy(to, from)"
+
+[[propagators]]
+selector_regex = '^fmt\.Fprint(f|ln)?$'
+from           = "args"
+to             = "0"
+note           = "Fprintf(w, format, args...): everything formatted lands in w"
+
+[[propagators]]
+selector_regex = '^io\.(Copy|CopyN|CopyBuffer)$'
+from           = "1"
+to             = "0"
+note           = "io.Copy(dst, src)"
+
+[[propagators]]
+selector_regex = '^io\.(ReadFull|ReadAtLeast)$'
+from           = "0"
+to             = "1"
+note           = "io.ReadFull(r, buf)"
+
+[[propagators]]
+selector_regex = '^encoding/binary\.Read$'
+from           = "0"
+to             = "2"
+note           = "binary.Read(r, order, &data)"
+
+[[propagators]]
+selector_regex = '^\((net/url\.Values|net/http\.Header)\)\.(Set|Add)$'
+from           = "args"
+to             = "receiver"
+note           = "map-typed receivers: v.Set(k, val)"
+
+[[propagators]]
+selector_regex = '^(maps|golang\.org/x/exp/maps)\.Copy(\[|$)'
+from           = "1"
+to             = "0"
+note           = "maps.Copy(dst, src) — generic, so the fqn carries type args"
+
+[[propagators]]
+selector_regex = '^\(\*sync\.Map\)\.(Store|LoadOrStore|Swap)$'
+from           = "args"
+to             = "receiver"
+
+[[propagators]]
+selector_regex = '^\(\*(text|html)/template\.Template\)\.(Execute|ExecuteTemplate)$'
+from           = "args"
+to             = "1"
+note           = "t.Execute(w, data): data rendered into w"
+
+[[propagators]]
+selector_regex = '^\(\*encoding/(base64|base32)\.Encoding\)\.(Decode|Encode)$'
+from           = "2"
+to             = "1"
+note           = "enc.Decode(dst, src)"
+
+[[propagators]]
+selector_regex = '^encoding/hex\.(Decode|Encode)$'
+from           = "1"
+to             = "0"
+note           = "hex.Decode(dst, src)"
+
+# ---------------------------------------------------------------------------
+# --- test-only: rules the golden-fixture suite depends on; delete in your copy ---
+#
+# Not policy, and not a shape any real codebase shares. This block exists so
+# `scripts/e2e-core.sh` can prove that GraphQL sourcing is STRUCTURAL: the
+# e2e-graphql suite deletes the rule below from a copy of this file and asserts
+# the chain is still found. It is kept apart from everything above so it does
+# not read as a capability the tool has.
+# ---------------------------------------------------------------------------
+
+[[sources]]
+kind     = "graphql_input"
+# A getter on a gqlgen input/entity model, e.g. (*model.Account).GetAccountNumber.
+# There is no general shape for these — gqlgen model getters look like any other
+# method — so a real catalog lists the ones its schema actually exposes.
+selector = "GetAccountNumber"
+note     = "test-only: a gqlgen model getter for an untrusted GraphQL input field"
+
+# ---------------------------------------------------------------------------
+# --- ts ---  TypeScript / Svelte.
+#
+# Additive: every selector below is anchored on a callee_fqn shape the Go
+# frontend never emits (`read:`, `assign:`, `svelte:`, or a bare DOM type name),
+# so a Go-only corpus is unaffected by this whole section.
+#
+# The TS frontend's callee_fqn vocabulary:
+#   "<module>.<name>"        imported symbol      ($app/navigation.goto)
+#   "<Type>.<method>"        recognised receiver  (URLSearchParams.get)
+#   ".<method>"              unknown receiver
+#   "read:<path>"            a property READ that is an input surface
+#   "assign:<prop>"          a property WRITE that is a sink
+#   "svelte:<kind>"          a template fact ({@html}, bind:)
+#   "graphql:<Type>.<field>" an INVOKES_REMOTE operation field — a contract, not
+#                            a catalog rule; listed here only for orientation
+# ---------------------------------------------------------------------------
+
+[[sources]]
+kind           = "ts_url_query"
+selector_regex = '^(URLSearchParams|URL)\.(get|getAll)$'
+note           = "new URL(location.href).searchParams.get('q')"
+
+[[sources]]
+kind           = "ts_url"
+selector_regex = '^read:(URL\.searchParams|\$page\.url|location\.(href|search|hash)|document\.(cookie|referrer)|event\.target\.value)$'
+note           = "property reads that ARE the untrusted surface"
+
+[[sources]]
+kind           = "ts_request"
+selector_regex = '^(FormData\.(get|getAll)|Request\.(json|formData|text)|Headers\.get|Cookies\.get)$'
+note           = "SvelteKit server load/action request surfaces"
+
+[[sources]]
+kind     = "ts_bind"
+selector = "svelte:bind"
+note     = "bind:value={v} — v is a result port of the synthetic svelte:bind call"
+
+[[sources]]
+kind           = "ts_route"
+selector_regex = '^read:(route\.params|page\.data)$'
+note           = "a microfrontend's untrusted surface IS its route: a define({path:'/thing/[id]'}) → $props() shape, and SvelteKit's +page data/params"
+
+# --- sinks -----------------------------------------------------------------
+
+[[sinks]]
+class          = "xss"
+selector_regex = '^(svelte:html|assign:(innerHTML|outerHTML|srcdoc))$'
+arg            = "any"
+note           = "{@html e} and element.innerHTML = e"
+
+[[sinks]]
+class          = "open_redirect"
+# `.goto` is matched through ANY module path so in-repo re-export wrappers count
+# too — large SvelteKit apps typically route every goto call through a local
+# `$shared/helpers/navigation` rather than importing `$app/navigation` directly.
+selector_regex = '^(assign:location\.href|assign:href|location\.(assign|replace)|window\.open|[^\s]*\bnavigation\.goto|@sveltejs/kit\.goto)$'
+arg            = "any"
+
+[[sinks]]
+class          = "exec"
+selector_regex = '^(eval|Function|globalThis\.eval)$'
+arg            = "any"
+
+[[sinks]]
+class          = "egress"
+selector_regex = '^(fetch|XMLHttpRequest\.open|navigator\.sendBeacon)$'
+arg            = "any"
+note           = "outbound request URL/body"
+
+[[sinks]]
+class          = "storage"
+selector_regex = '^(localStorage|sessionStorage)\.setItem$'
+arg            = "any"
+
+[[sinks]]
+class          = "log"
+selector_regex = '^console\.(log|error|warn|info|debug)$'
+arg            = "any"
+
+# --- sanitizers ------------------------------------------------------------
+
+[[sanitizers]]
+kind           = "encoding"
+selector_regex = '^(encodeURIComponent|encodeURI)$'
+note           = "local escapeRedirect-style helpers are NOT recognised — list yours here"
+
+# JS built-ins (propagators; see the PROPAGATORS header above). pc-fe-ts names
+# a receiver's container type only when it can see it (`[]`, `T[]`,
+# `new Map()`, …); a bare `.push` on an unknown receiver is deliberately NOT
+# matched — it could be `router.push(url)`.
+[[propagators]]
+selector_regex = '^Array\.(push|unshift|splice|fill)$'
+from           = "args"
+to             = "receiver"
+
+[[propagators]]
+selector_regex = '^(Map|WeakMap)\.set$'
+from           = "args"
+to             = "receiver"
+
+[[propagators]]
+selector_regex = '^(Set|WeakSet)\.add$'
+from           = "args"
+to             = "receiver"
+
+[[propagators]]
+selector_regex = '^Object\.assign$'
+from           = "args"
+to             = "1, return"
+note           = "Object.assign(target, ...sources): port 0 is the `Object` receiver"
+
+[[propagators]]
+selector_regex = '^(URLSearchParams|FormData|Headers)\.(append|set)$'
+from           = "args"
+to             = "receiver"

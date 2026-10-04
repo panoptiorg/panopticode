@@ -1,0 +1,80 @@
+syntax = "proto3";
+
+// Summary — the IFDS procedure summary (the jump function) and the cross-repo
+// contract wire format. Content-addressed by summary_key. See docs/04.
+package panopticode.summary;
+
+option go_package = "github.com/panopticode/frontend/internal/summarypb;summarypb";
+
+// Mirror of cgf.VertexKind (kept independent so summary.proto stands alone).
+enum SlotKind {
+  SLOT_IN_PARAM        = 0;
+  SLOT_IN_RECEIVER     = 1;
+  SLOT_IN_GLOBAL       = 2;
+  SLOT_OUT_RETURN      = 3;
+  SLOT_OUT_PARAM_BYREF = 4;
+  SLOT_OUT_FIELD       = 5;
+  SLOT_SINK_CALL       = 6; // terminal sink position
+  SLOT_STREAM_IN       = 7; // data arriving from the peer over a gRPC stream
+  SLOT_STREAM_OUT      = 8; // data sent to the peer over a gRPC stream
+}
+
+message SlotRef {
+  SlotKind kind       = 1;
+  uint32   index      = 2;
+  repeated uint32 field_path = 3;
+  bytes    sym        = 4; // for globals
+}
+
+message Span {
+  string file = 1;
+  int32  line = 2;
+  int32  col  = 3;
+}
+
+enum Provenance {
+  PROV_ANALYZED = 0; // computed from real body
+  PROV_INFERRED = 1; // heuristic / cross-repo cycle break
+  PROV_DEFAULT  = 2; // conservative default leaf (missing contract)
+  PROV_OPAQUE   = 3; // unresolved callee
+}
+
+message TaintFlow {
+  SlotRef in_slot   = 1;
+  SlotRef out_slot  = 2;
+  uint64  label_set = 3; // MVP: bit 0 = tainted
+}
+
+message Sanitized {
+  SlotRef slot           = 1;
+  string  sanitizer_kind = 2;
+}
+
+message SinkHit {
+  SlotRef in_slot        = 1;
+  string  sink_class     = 2; // "sqli" | "log" | "exec" | "egress" | ...
+  Span    span           = 3;
+  bool    cross_boundary = 4; // hop crossed a service boundary
+}
+
+message Summary {
+  bytes  fn_iid        = 1;
+  bytes  bid           = 2; // structural body key
+  bytes  summary_key   = 3; // hash(bid + sorted[callee.contract_hash]) — cache key
+  bytes  contract_hash = 4; // behavior-only; drives caller cutoff + cross-repo diff
+
+  repeated TaintFlow flows     = 5;
+  repeated Sanitized sanitized = 6;
+  repeated SinkHit   sink_hits = 7;
+
+  float      confidence = 8;
+  Provenance provenance = 9;
+}
+
+// A published cross-repo contract bundle: one repo's public endpoint summaries.
+message ContractBundle {
+  string repo       = 1;
+  string commit_sha = 2;
+  // GrpcMethod.iid (hex) -> handler Summary
+  map<string, Summary> endpoint_summaries = 3;
+}
