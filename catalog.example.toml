@@ -22,15 +22,15 @@
 # Only the Rust core reads this file. The frontends never classify anything —
 # they emit a language-neutral graph, and every security judgement is made here.
 #
-# Matching. `selector` is an exact string match, `selector_regex` a Rust regex;
-# both run against `CallSite.callee_fqn`. For Go that is a fully-qualified
-# selector — `(*example.com/app/store.DB).Selectx`, `os/exec.Command`,
-# `github.com/Masterminds/squirrel.Expr`. For TypeScript see the `--- ts ---`
-# section below, which documents its own callee_fqn vocabulary.
+# Matching. `selector` matches a name equal to it or ending with it,
+# `selector_regex` is a Rust regex; both run against `CallSite.callee_fqn`. For
+# Go that is a fully-qualified selector — `(*example.com/app/store.DB).Selectx`,
+# `os/exec.Command`, `github.com/Masterminds/squirrel.Expr`. For TypeScript see
+# the `--- ts ---` section below, which documents its own callee_fqn vocabulary.
 #
 # `arg` selects which argument port a tainted fact must reach for a sink to fire:
-# an integer index (0-based over the call's arg ports; the receiver is port 0
-# when arg0_is_receiver) or "any".
+# an index written as a string ("1"; 0-based over the call's arg ports, the
+# receiver is port 0 when arg0_is_receiver) or "any".
 
 schema_version = 1
 
@@ -39,13 +39,14 @@ schema_version = 1
 # value) or endpoint parameter becomes tainted.
 #
 # Note that endpoint-driven sourcing is STRUCTURAL and needs no rule here: the
-# core seeds `Endpoint.untrusted_input` (gRPC request params, gqlgen resolver
-# args) directly from the graph. The selectors below only catch accessor getters
-# used inside a handler body, and under structural field-path seeding
-# (`pc-fe --field-paths`, the default) the gRPC one is largely INERT — the
-# request parameter is already a source, and trivial protobuf getters are
-# canonicalized into field projections rather than call sites. It is kept
-# because it still fires on corpora extracted with `--field-paths=false`.
+# frontends list gRPC request params and gqlgen resolver args in
+# `Function.source_params`, which the core seeds directly. The selectors below
+# only catch accessor getters used inside a handler body, and under structural
+# field-path seeding (`pc-fe --field-paths`, the default) the gRPC one is
+# largely INERT — the request parameter is already a source, and trivial
+# protobuf getters are canonicalized into field projections rather than call
+# sites. It is kept because it still fires on corpora extracted with
+# `--field-paths=false`.
 # ---------------------------------------------------------------------------
 
 [[sources]]

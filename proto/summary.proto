@@ -1,10 +1,12 @@
 syntax = "proto3";
 
-// Summary — the IFDS procedure summary (the jump function) and the cross-repo
-// contract wire format. Content-addressed by summary_key. See docs/04.
+// Summary — a procedure summary (the jump function) and the cross-repo
+// contract wire format. Content-addressed by summary_key. The core compiles
+// this file but does not use it: summaries are an internal Rust type stored
+// as JSON (docs/cgf.md, "Other protos").
 package panopticode.summary;
 
-option go_package = "github.com/panopticode/frontend/internal/summarypb;summarypb";
+option go_package = "github.com/panoptiorg/panoptife-go/internal/summarypb;summarypb";
 
 // Mirror of cgf.VertexKind (kept independent so summary.proto stands alone).
 enum SlotKind {

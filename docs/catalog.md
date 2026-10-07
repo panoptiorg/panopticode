@@ -137,7 +137,7 @@ through it is lost, and `--unmodeled` names the call:
 $ panopticode taint --cgf testdata/cgf/libwrites --catalog catalog.example.toml --unmodeled um.json > chains.json
 catalog-fit: 9/22 propagators match at least one call site
 unmodeled: 1 library call(s) receive tainted data and may write into another argument with no [[propagators]] rule -> um.json
-      1 routes     1 sites     1 sources  example.com/libwrites/thirdparty.Fill  e.g. .../libwrites/app/app.go:130
+      1 routes     1 sites     1 sources  example.com/libwrites/thirdparty.Fill  e.g. .../libwrites/app/app.go:123
 functions=19 summaries=32 contracts_linked=13 remote_leaves=0 chains=11 cache_hits=0 cache_misses=19
 ```
 
@@ -159,7 +159,7 @@ functions=19 summaries=32 contracts_linked=13 remote_leaves=0 chains=12 cache_hi
 ```
 
 The new chain is `(*example.com/libwrites/app.Impl).ThirdParty` to a `sqli`
-sink at `app.go:131`.
+sink at `app.go:124`.
 
 ## Diagnostics
 
@@ -170,7 +170,7 @@ catalog-fit: N/M rules match at least one call site (K distinct callees) — ine
 catalog-warn: inert rule <section>[<class or kind>] "<selector>" — no call site matches it (zero recall here)
 catalog-warn: sink rule [<class>] "<selector>" arg N never in range (max argc seen M) — it can never fire
 catalog-fit: N/M propagators match at least one call site
-opaque: X of Y call sites have no analysable body (default leaf; ...) — top modules: ...
+opaque: X of Y call sites into a Go module or func value have no loaded body (default leaf: ...) — top modules: ...
 ```
 
 `M` in the first line counts sources, sinks, sanitizers and error wrappers.
@@ -179,7 +179,9 @@ every new corpus. The arg-range warning covers a sink whose name matches but
 whose `arg` index exceeds every matching call's argument count. Inert
 propagators are counted but not listed. The `opaque` line names the modules
 where calls have no body, which is usually where the next scope change or rule
-belongs.
+belongs. `Y` counts every call site; `X` leaves out standard-library, builtin
+and remote calls and callees without a module path, which covers most
+TypeScript calls.
 
 Against the small fixtures in `testdata/cgf/`, the example catalog prints many
 inert-rule warnings because the fixtures do not import most of the libraries it

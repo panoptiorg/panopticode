@@ -24,10 +24,12 @@ the frontend commits here.
 `go/packages` reports absolute file paths and `pc-fe` records them in spans, so
 `regen-testdata.sh` first copies the fixture sources to a fixed staging path
 (`/tmp/panopticode-fixtures`, override with `STAGE`) and extracts from there.
-The committed spans read `/private/tmp/panopticode-fixtures/<fixture>/...`; on
-macOS `/tmp` is a symlink to `/private/tmp`, elsewhere set
-`STAGE=/private/tmp/panopticode-fixtures`. Re-running the script against the
-same frontend commits with the same Go release produces byte-identical output.
+The committed Go spans read `/private/tmp/panopticode-fixtures/<fixture>/...`,
+except in `libwrites` and `libwrites-off`, which read
+`/tmp/panopticode-fixtures/libwrites/...`; on macOS `/tmp` is a symlink to
+`/private/tmp`, elsewhere set `STAGE=/private/tmp/panopticode-fixtures`.
+Re-running the script against the same frontend commits with the same Go
+release produces byte-identical output.
 A different Go release can change callee ids, which hash standard-library
 signatures (go1.27.1 changes the `fmt.Errorf` id in `errorleaf-*`); any other
 diff after regeneration is a bug.

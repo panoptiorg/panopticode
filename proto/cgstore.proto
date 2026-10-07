@@ -1,14 +1,13 @@
 syntax = "proto3";
 
-// cgstore — the persisted call-graph snapshot (R4 Ph1, incremental_callgraph_spec
-// §4/§8). One Meta + one PkgShard per package, under
-// output/cgstore/<repo>/<hex12(storeKey)>/<commit12>/. Go frontend only — the
-// Rust core never reads this. Versioned separately from cgf.proto: any breaking
-// change bumps schema_version, which is folded into storeKey (old snapshots
-// simply miss and a full rebuild rewrites them).
+// cgstore — the persisted call-graph snapshot. One Meta + one PkgShard per
+// package, under output/cgstore/<repo>/<hex12(storeKey)>/<commit12>/. Go
+// frontend only — the Rust core never reads this. Versioned separately from
+// cgf.proto: any breaking change bumps schema_version, which is folded into
+// storeKey (old snapshots simply miss and a full rebuild rewrites them).
 package panopticode.cgstore;
 
-option go_package = "github.com/panopticode/frontend/internal/cgstorepb;cgstorepb";
+option go_package = "github.com/panoptiorg/panoptife-go/internal/cgstorepb;cgstorepb";
 
 // Meta is written LAST (after every shard), atomically with the whole snapshot
 // dir (temp dir + rename). Its shard list carries per-file content hashes —
@@ -44,7 +43,7 @@ message Meta {
   // enumeration (snapshot.go filters canonicalized calls when true).
   bool field_paths = 18;
 
-  // --closure-flow at capture time (W1d). Recorded for the same reason as
+  // --closure-flow at capture time. Recorded for the same reason as
   // field_paths: it changes CGF bytes. It does NOT change CallSite.Id alignment
   // — the synthetic binding sites are appended after every real one and
   // n_callsites counts only the real ones — so snapshot.go needs no filter for

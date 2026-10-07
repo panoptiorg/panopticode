@@ -32,7 +32,10 @@ CgfPackage            repo, language, package_path, commit_sha
   with `pc-fe --heap-slots`).
 - A call site's `callee_iids` lists resolved targets (several for virtual
   dispatch); `callee_fqn` is the name catalog rules match; `opaque` marks an
-  unresolved call. `INVOKES_REMOTE` sites name a contract's iid.
+  unresolved call (`pc-fe` sets it on a function-value call with no target and
+  on a dispatch site over its fan-out cap, not on other interface calls); the
+  core applies the default leaf to any call without a summary either way.
+  `INVOKES_REMOTE` sites name a contract's iid.
   `arg0_is_receiver`, `dispatch_confidence`, `stream_op`, `stream_client_side`,
   `error_results` (a bitmask of error-typed results) and `arg_names` (by-name
   GraphQL arguments from TypeScript) refine how the site is handled.

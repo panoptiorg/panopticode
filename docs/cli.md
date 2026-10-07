@@ -38,14 +38,15 @@ panopticode taint --cgf <dir> [--cgf <dir> ...] [--catalog <file>] [flags]
 
 stdout is a JSON array of chains, sorted so output is byte-stable across runs.
 stderr carries diagnostics and a final stats line. For the README quickstart
-(the inert-rule lines and the `opaque:` detail elided):
+(the inert-rule lines, the `opaque:` detail and the `route-stats:` line
+elided):
 
 ```
 normalize: 1 by-name callsite(s), 0 arg port(s) moved into contract position, 0 dangling name(s), 0 unknown contract(s)
 catalog-fit: 7/70 rules match at least one call site (47 distinct callees) — inert rules follow; ...
 catalog-warn: inert rule <section>[<class|kind>] "<selector>" — no call site matches it (zero recall here)
 catalog-fit: 0/22 propagators match at least one call site
-opaque: 5 of 75 call sites have no analysable body (default leaf; ...) — top modules: ...
+opaque: 5 of 75 call sites into a Go module or func value have no loaded body (default leaf: ...) — top modules: ...
 functions=56 summaries=63 contracts_linked=7 remote_leaves=0 chains=15 cache_hits=2 cache_misses=54
 ```
 
@@ -61,7 +62,7 @@ lines mean.
 | `--store <dir>` | none | filesystem summary cache: reuse cached summaries and write new ones. Warms the cache `impact` reads. Independent of Postgres |
 | `--trace <file>` | none | write one line per engine event |
 | `--trace-fn <substr>` | none | trace only functions whose fqn contains the substring |
-| `--trace-events <csv>` | all | trace only these kinds: `seed summary scc-start scc-iter apply leaf propagate sink-hit heap-hit heap-cell heap-narrow chain widen back back-step back-frame`. An unknown kind is an error. Has no effect without `--trace` |
+| `--trace-events <csv>` | all | trace only these kinds: `seed summary scc-start scc-iter apply leaf propagate sink-hit heap-hit heap-cell heap-narrow chain widen back back-step back-frame`. With `--trace`, an unknown kind is an error; without it the flag has no effect and is not checked |
 | `--no-error-leaf` | off | the default leaf stops tainting error-typed results. Needs CGF from `pc-fe --error-results` (warns if absent); catalog `[[error_wrappers]]` are exempt |
 | `--backward` | off | add a backward verdict to every chain; removes nothing |
 | `--backward-prune` | off | also drop refuted chains (implies `--backward`). The only flag that removes findings. A refutation whose walk crossed an unviewed contract is kept as `undecided` |
@@ -86,15 +87,15 @@ its first and last route hops:
   "source_repo": "webapp",
   "source_fn": "src/routes/search/+page.svelte:$script",
   "sink_class": "sqli",
-  "sink_span": {"file": "src/routes/search/+page.svelte", "line": 15},
+  "sink_span": {"file": "src/routes/search/+page.svelte", "line": 11},
   "hops": [...],
   "route": {
-    "id": "7915e4c2f0c8",
+    "id": "a956a2f72f24",
     "hops": [
       {"repo": "webapp", "func": "src/routes/search/+page.svelte:$script", "kind": "source", "confidence": 1.0},
       ...
       {"repo": "example.com/backend", "func": "(*example.com/backend/store.Storage).findBy",
-       "file": ".../backend/store/store.go", "line": 17, "kind": "sink",
+       "file": ".../backend/store/store.go", "line": 13, "kind": "sink",
        "callee": "(*example.com/backend/store.Storage).Selectx", "confidence": 1.0}
     ],
     "boundaries": 2
@@ -126,7 +127,9 @@ its first and last route hops:
 With `--backward` each chain also gets `backward`:
 `{"verdict": "confirmed|refuted|undecided", "exact", "source_fields", "terminal", "reason", "unviewed"}`.
 For `undecided`, `reason` is `walk_incomplete`, `unview_dropped_slot` or
-`unviewed_refutation_not_pruned`. stderr gets a summary line. On the fixture corpus from the README quickstart:
+`unviewed_refutation_not_pruned`; when the walk cannot start it is
+`heap_crossing`, `no_route`, `no_terminal` or `route_incomplete:<kind>` (e.g.
+`route_incomplete:HandlerNotLoaded`). stderr gets a summary line. On the fixture corpus from the README quickstart:
 
 ```
 $ panopticode taint ... --backward
@@ -211,7 +214,7 @@ panopticode query path  --pg <url> --from <substr> --to <substr> [--limit 5] [--
 |---|---|---|
 | `blast` | upstream repos and boundary endpoints that reach the changed files (repo-relative) | `--repo` is not in the database |
 | `reach` | upstream repos and boundary endpoints that reach functions matching `--fn` | nothing matches `--fn` |
-| `path` | shortest forward call paths between two fqn or contract substrings; `--max-depth` bounds the cost | |
+| `path` | shortest forward call paths between two fqn or contract substrings; `--max-depth` bounds the cost | `--from` or `--to` matches no function or contract |
 
 `scripts/blast.sh` wraps `query blast` with a `git diff` of a local checkout.
 

@@ -1,10 +1,11 @@
 // IFDS-style boolean taint. Per-function procedure summaries are computed
-// bottom-up over the call graph (callees before callers); the exploded
-// supergraph is formed from each function's LocalFlow (calls as barriers) plus
-// callee summaries composed at call sites. Recursive SCCs iterate to a fixpoint.
+// bottom-up over the call graph (callees before callers) by walking each
+// function's LocalFlow (calls as barriers) with callee summaries composed at
+// call sites; there is no exploded supergraph. Recursive SCCs iterate to a
+// fixpoint.
 //
 // Boolean taint is distributive, so this summary-composition reachability equals
-// the IFDS tabulation fixpoint at slot granularity (plan "Frontend↔core").
+// the IFDS tabulation fixpoint at slot granularity.
 use crate::catalog::{Catalog, SinkArg};
 use crate::graph::{hexid, IidHex, Program};
 use crate::ids;

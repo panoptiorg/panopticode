@@ -288,13 +288,12 @@ impl Catalog {
         })
     }
 
-    /// Catalog fit (measurements 2026-09-01, `scripts/catalog-fit.py`): every
-    /// rule that matches NO callee fqn in the loaded program. A catalog is
-    /// policy fitted to some corpus; on another corpus a rule that matches
-    /// nothing yields silent zero recall — 41 recall points on the broker
-    /// vertical hinged on exactly this. Returns `(section, class-or-kind,
-    /// selector)` per inert rule; the `__annotation__` escape hatch is not a
-    /// selector and is skipped.
+    /// Catalog fit: every rule that matches NO callee fqn in the loaded
+    /// program. A catalog is policy fitted to some corpus; on another corpus a
+    /// rule that matches nothing yields silent zero recall — 41 recall points
+    /// on the broker vertical hinged on exactly this. Returns `(section,
+    /// class-or-kind, selector)` per inert rule; the `__annotation__` escape
+    /// hatch is not a selector and is skipped.
     pub fn unmatched_rules<'a, I>(&self, fqns: I) -> Vec<(&'static str, String, String)>
     where
         I: IntoIterator<Item = &'a str>,

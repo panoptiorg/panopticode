@@ -23,7 +23,7 @@
 # The assertions below are ported, statement for statement, from the cross-repo
 # acceptance battery that drives the three repos together (a Go frontend, a TS
 # frontend and this core). Everything that can be decided from a CGF corpus plus
-# `panopticode` is reproduced here verbatim. Fourteen suites:
+# `panopticode` is reproduced here verbatim. Sixteen suites:
 #
 #   e2e          cross-repo unary / server-stream / client-stream chains
 #   e2e-multihop two service boundaries; a boundary inside a local helper
