@@ -55,10 +55,11 @@ reachable from each in-fact. Taint is boolean: there are no labels.
 
 `summarize` runs a worklist over one function's LocalFlow once per in-slot,
 once for source seeds and once for stream seeds. When taint reaches a call's
-argument port, the engine decides in this order:
+argument port, the engine checks in this order:
 
 1. the callee matches a sanitizer: stop;
-2. the callee matches a sink (and the `arg` rule): record a sink hit;
+2. the callee matches a sink (and the `arg` rule): record a sink hit and
+   continue, so taint still flows through the call;
 3. the callee has a summary: map the argument to the callee's slot and fire
    every row whose in-fact is compatible, tainting the mapped outputs;
 4. otherwise, apply matching `[[propagators]]`, then the default leaf: every
@@ -72,8 +73,10 @@ stream `Recv` results.
 
 The call graph of all loaded repos is split into strongly connected components
 with an iterative Tarjan pass, callees first. A non-recursive function is
-summarized once. A multi-function SCC, or a function that calls itself, starts
-from empty summaries and is recomputed Gauss–Seidel until nothing changes, so a
+summarized once. A multi-function SCC is recomputed Gauss–Seidel, each member
+against the others' latest summaries, until nothing changes; in the first
+round a member not yet summarized is a default leaf. A function that calls
+only itself starts from an empty summary and iterates the same way, so its
 recursive call site uses the least fixpoint rather than the default leaf. The
 loop is capped at `4 * |SCC| + 8` iterations and warns `SCC fixpoint hit
 iteration cap` if reached; that indicates a bug, and the test suite checks it
@@ -81,12 +84,19 @@ never happens.
 
 ## Identity and caching
 
-All ids are SHA-256 and computed the same way in Go, TypeScript and Rust.
+All ids are SHA-256 over parts that are each prefixed with their length as an
+8-byte little-endian integer. The frontends compute `iid`, `bid` and contract
+ids (`panoptife-go` `internal/hash/hash.go`, `panoptife-ts` `src/hash.ts`);
+the core computes `contract_hash`, `summary_key` and route ids the same way
+(`core/src/ids.rs`). A contract id, `H("", "", <name>, "grpc")`, is
+byte-identical in Go and TypeScript, for GraphQL names too. Function `iid`s
+and `bid`s follow each frontend's own recipe and are not comparable across
+languages.
 
 | id | hashes | property |
 |---|---|---|
-| `iid` | repo, package path, fqn, signature | stable across body edits |
-| `bid` | canonical LocalFlow (no spans) and sorted callee `iid`s | changes when the body or its call targets change |
+| `iid` | repo, package path, fqn, signature (`ts` in TypeScript) | stable across body edits |
+| `bid` | the LocalFlow and sorted callee `iid`s; Go hashes a deterministic protobuf encoding without spans, TypeScript a JSON encoding with spans | changes when the body or its call targets change |
 | `contract_hash` | a summary's flows and sink hits | same behaviour, same hash |
 | `summary_key` | `bid`, `source_params`, sorted callee `contract_hash`es | cache key for one summary |
 
@@ -103,8 +113,8 @@ field numbers where known). A summary row fires when the slots are equal and
 the paths are prefix-compatible. When a shorter row fires for a longer fact,
 the forward pass drops the unmatched tail: the result is sound but coarser,
 which can move taint onto sibling fields. Route reconstruction and the backward
-pass keep the tail. Paths are not extended past length 2. TypeScript CGF has no
-field paths.
+pass keep the tail. A path that is already two long is never extended, since
+the frontend may have truncated it. TypeScript CGF has no field paths.
 
 ## Heap cells
 
@@ -125,10 +135,11 @@ graph cannot see, at a precision cost. Optional interface-type narrowing uses
 A contract is keyed by a name both sides derive independently from generated
 code:
 
-- gRPC: `<proto package>.<Service>/<Method>` (e.g. `pb.Account/GetAccount`). The
+- gRPC: `<Go package of the generated code>.<Service>/<Method>` (e.g.
+  `pb.Account/GetAccount`): the Go package name, not the proto package. The
   client side derives it from the generated `<Svc>Client`; the server side from
-  the embedded `Unimplemented<Svc>Server`, which `protoc-gen-go-grpc` requires
-  every server to embed.
+  an embedded `Unimplemented<Svc>Server` or `Unsafe<Svc>Server`, one of which
+  `protoc-gen-go-grpc` requires every server to embed.
 - GraphQL: `graphql:<Type>.<field>`, from each side's SDL.
 
 A client call to a contract is an `INVOKES_REMOTE` call site whose callee is the
@@ -151,9 +162,10 @@ chain's route is re-derived top-down: propagate in the source function, follow
 the summary row that produced the sink hit into the callee, and across
 contracts into their handlers, until the sink. A route stops early with
 `incomplete` set to `depth_cap` (depth 32), `cycle`, `handler_not_loaded`,
-`callee_body_missing` (default leaf) or `not_reproduced`. When a dispatch site
-has several candidates, up to 8 are tried. If a descent with the precise field
-path fails it retries with the coarser one and prints `route-warn: ...`.
+`callee_body_missing` (a sink hit in a callee with no body) or
+`not_reproduced`. When a dispatch site has several candidates, up to 8 are
+tried. If a descent with the precise field path fails it retries with the
+coarser one and prints `route-warn: ...`.
 
 `route.id` is a 12-hex content hash over class and, per hop, repo, function,
 callee, line and kind (not file paths or confidences), so the same route has
@@ -169,8 +181,8 @@ their summaries, and keeping full field paths. Verdicts:
   an over-approximation such as the default leaf;
 - `refuted`: the walk finished without reaching a source;
 - `undecided`: the walk could not finish (recursion, stream ports, heap cells,
-  stored contract views, depth or demand limits), or it crossed a contract
-  whose view is not the handler's own frame.
+  stored contract views, the depth limit, an incomplete route), or it crossed
+  a contract whose view is not the handler's own frame.
 
 That last case covers streaming gRPC and GraphQL (whose resolver arguments are
 shifted by the context parameter). `--backward-unview` undoes the view remap so
@@ -188,7 +200,8 @@ a by-reference argument port to the caller's variable (`pc-fe
 reconstruction and backward confirmation, in addition to the default leaf.
 Without either half the flow is lost. `--unmodeled` reports calls that look
 like they need a rule. Pointers inside a variadic slice (`rows.Scan(&a, &b)`)
-and Go's `copy` builtin are not covered.
+and Go's `copy` builtin are not covered; `pc-fe --heap-slots` alone links
+`copy`'s source to its destination.
 
 ## Other frontend-side modelling
 
@@ -284,6 +297,7 @@ contract is counted, persisted and displayed as gRPC.
 [`deploy/schema.sql`](../deploy/schema.sql) stores `repos`, `nodes`, `edges`,
 `contracts`, `invokes`, `summaries` and `contract_summaries`. The binary does
 not apply the schema. Only the call graph (function and contract nodes; call,
-binds-to and invokes-remote edges) and contract views are written; dataflow is
-not. `summaries` is written but not read back; `contract_summaries` is read by
-`--pg` runs. The `query` subcommands ([cli.md](cli.md#query)) read this data.
+binds-to and invokes-remote edges), summaries and contract views are written;
+LocalFlow is not. `summaries` is written but not read back;
+`contract_summaries` is read by `--pg` runs. The `query` subcommands
+([cli.md](cli.md#query)) read this data.

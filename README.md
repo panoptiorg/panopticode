@@ -1,3 +1,5 @@
+<img src=".github/logo.svg" alt="panopticode logo" width="116" height="116">
+
 # panopticode
 
 **Compositional taint analysis across repositories and services, over a language-neutral code graph.**

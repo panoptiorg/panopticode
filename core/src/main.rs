@@ -1,5 +1,6 @@
-// panopticode — Rust analyst core. Loads CGF, runs IFDS taint tabulation,
-// composes summaries (incl. cross-repo), persists to Postgres, emits JSON.
+// panopticode — Rust analyst core. Loads CGF, computes bottom-up taint
+// summaries (Sharir–Pnueli), composes them across repositories, persists to
+// Postgres, emits JSON.
 mod proto;
 mod trace;
 mod ids;

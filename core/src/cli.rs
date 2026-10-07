@@ -543,7 +543,7 @@ fn catalog_fit_report(cat: &Catalog, prog: &Program) {
         total - inert.len(),
         total,
         fqns.len(),
-        if inert.is_empty() { "" } else { " — inert rules follow; scripts/catalog-fit.py shows what IS there" }
+        if inert.is_empty() { "" } else { " — inert rules follow; docs/catalog.md explains these lines" }
     );
     for (section, tag, label) in &inert {
         eprintln!("catalog-warn: inert rule {section}[{tag}] {label:?} — no call site matches it (zero recall here)");
@@ -601,8 +601,8 @@ fn opacity_report(prog: &Program) {
     top.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
     let shown: Vec<String> = top.iter().take(8).map(|(m, n)| format!("{m}={n}")).collect();
     eprintln!(
-        "opaque: {total} of {sites} call sites have no analysable body (default leaf; \
-         routes through them stop with incomplete=callee_body_missing) — top modules: {}{}",
+        "opaque: {total} of {sites} call sites into a Go module or func value have no loaded body \
+         (default leaf: taint passes through, sinks inside are not seen) — top modules: {}{}",
         shown.join(", "),
         if top.len() > 8 { ", …" } else { "" }
     );

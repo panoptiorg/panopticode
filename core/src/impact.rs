@@ -29,7 +29,7 @@ where
     Ok(Option::<Vec<T>>::deserialize(d)?.unwrap_or_default())
 }
 
-/// pc-fe's manifest.json (frontend/internal/emit/manifest.go).
+/// pc-fe's manifest.json (`internal/emit/manifest.go` in panoptife-go).
 #[derive(Deserialize)]
 pub struct Manifest {
     pub base: String,

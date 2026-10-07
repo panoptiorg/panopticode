@@ -34,8 +34,9 @@ leaf. Consequences:
 - a sink behind an out-of-scope wrapper is invisible;
 - a remote call made through an out-of-scope hand-written client wrapper loses
   its cross-service edge;
-- sources declared outside scope are never seeded;
-- a sanitizer outside scope is ignored, which produces false positives;
+- sources read only in out-of-scope code are never seeded;
+- a sanitizer called only from out-of-scope code is ignored, which produces
+  false positives;
 - sinks inside third-party dependencies are always out of reach.
 
 ## False negatives
@@ -49,7 +50,8 @@ leaf. Consequences:
 - Library calls that write into an argument (`sb.WriteString(q)`,
   `json.Unmarshal(b, &v)`, `arr.push(q)`) when no `[[propagators]]` rule covers
   the call. Pointers inside a variadic slice (`rows.Scan(&a, &b)`) and Go's
-  `copy` are not covered even with a rule.
+  `copy` are not covered even with a rule; `pc-fe --heap-slots` alone links
+  `copy`'s source to its destination.
 - A source read inside a helper does not start a chain in the caller: chains
   start only in functions that have source parameters or call a source
   themselves. This mostly affects TypeScript, where URL reads often sit in
