@@ -810,3 +810,127 @@ mod tests {
         assert!(e.heap_cells.is_empty());
     }
 }
+
+/// Coverage wave 1 §2.4: a Kafka topic is a heap cell with
+/// `sym = ContractIID("msg:kafka:<topic>")`, written by the producer
+/// (OUT_FIELD) and read by the consumer (IN_GLOBAL) — in DIFFERENT repos. The
+/// design claims this needs no engine change because the phase-2 join above is
+/// program-wide and every `--cgf` dir is merged into one program. This pins
+/// the claim through the same phase order `taint` runs.
+#[cfg(test)]
+mod topic_cell_tests {
+    use crate::catalog::Catalog;
+    use crate::graph::{hexid, Program};
+    use crate::ifds::cache_tests::{edge, vertex};
+    use crate::ifds::Engine;
+    use crate::proto::cgf;
+    use crate::witness::HopKind;
+    use std::collections::HashMap;
+
+    const CAT: &str = "[[sources]]\nkind = \"http_request\"\nselector = \"(*net/http.Request).FormValue\"\n\
+                       [[sinks]]\nclass = \"sqli\"\nselector = \"db.Exec\"\n";
+
+    fn cell_vertex(id: u32, kind: cgf::VertexKind, topic: &str) -> cgf::FlowVertex {
+        cgf::FlowVertex {
+            sym: crate::ids::hash_parts(&[format!("msg:kafka:{topic}").as_bytes()]).to_vec(),
+            sym_name: format!("kafka topic {topic}"),
+            ..vertex(id, kind, 0, 0)
+        }
+    }
+
+    fn func(iid: u8, fqn: &str, flow: cgf::LocalFlow) -> cgf::Function {
+        cgf::Function {
+            id: Some(cgf::Ident { iid: vec![iid; 32], bid: vec![iid; 32] }),
+            fqn: fqn.into(),
+            has_body: true,
+            flow: Some(flow),
+            ..Default::default()
+        }
+    }
+
+    /// repo `orders`: `w.WriteMessages(ctx, kafka.Message{Value: r.FormValue("q")})`
+    /// — the payload flows into the topic cell.
+    fn producer(topic: &str) -> cgf::Function {
+        func(
+            0x71,
+            "orders.Publish",
+            cgf::LocalFlow {
+                vertices: vec![
+                    vertex(1, cgf::VertexKind::CallResultPort, 0, 0),
+                    cell_vertex(2, cgf::VertexKind::OutField, topic),
+                ],
+                edges: vec![edge(1, 2)],
+                callsites: vec![cgf::CallSite {
+                    id: 0,
+                    callee_fqn: "(*net/http.Request).FormValue".into(),
+                    argc: 1,
+                    resultc: 1,
+                    arg0_is_receiver: true,
+                    ..Default::default()
+                }],
+            },
+        )
+    }
+
+    /// repo `billing`: `m, _ := r.ReadMessage(ctx); db.Exec(m.Value)`
+    fn consumer(topic: &str) -> cgf::Function {
+        func(
+            0x72,
+            "billing.Consume",
+            cgf::LocalFlow {
+                vertices: vec![
+                    cell_vertex(1, cgf::VertexKind::InGlobal, topic),
+                    vertex(2, cgf::VertexKind::CallArgPort, 0, 0),
+                ],
+                edges: vec![edge(1, 2)],
+                callsites: vec![cgf::CallSite { id: 0, callee_fqn: "db.Exec".into(), argc: 1, ..Default::default() }],
+            },
+        )
+    }
+
+    /// cli.rs `taint`, minus I/O: phase 1, heap join, compose, report.
+    fn taint(fns: Vec<(cgf::Function, &str)>) -> Vec<crate::report::Chain> {
+        let mut prog = Program { funcs: HashMap::new(), repo_of: HashMap::new(), packages: Vec::new() };
+        for (f, repo) in fns {
+            let h = hexid(&f.id.as_ref().unwrap().iid);
+            prog.repo_of.insert(h.clone(), repo.into());
+            prog.funcs.insert(h, f);
+            prog.packages.push(cgf::CgfPackage { repo: repo.into(), ..Default::default() });
+        }
+        let cat = Catalog::load_str(CAT).unwrap();
+        let mut eng = Engine::new(&prog, &cat);
+        eng.run();
+        let hs = super::fixpoint(&mut eng);
+        assert_eq!(hs.cells, 1, "one written cell: {hs:?}");
+        crate::compose::fixpoint_with_leaves(&mut eng, HashMap::new());
+        crate::report::intra_chains(&eng, None)
+    }
+
+    #[test]
+    fn a_topic_cell_joins_a_producer_and_a_consumer_in_two_repos() {
+        let chains = taint(vec![(producer("orders"), "orders"), (consumer("orders"), "billing")]);
+        assert_eq!(chains.len(), 1, "one cross-repo chain");
+        let c = &chains[0];
+        assert_eq!((c.source_repo.as_str(), c.source_fn.as_str(), c.sink_class.as_str()), ("orders", "orders.Publish", "sqli"));
+        let route = c.route.as_ref().unwrap();
+        assert_eq!(route.incomplete, None);
+        let hops: Vec<(HopKind, &str, &str)> =
+            route.hops.iter().map(|h| (h.kind, h.repo.as_str(), h.callee.as_str())).collect();
+        assert_eq!(
+            hops,
+            vec![
+                (HopKind::Source, "orders", ""),
+                (HopKind::Call, "orders", "(*net/http.Request).FormValue"),
+                // the crossing renders the cell's sym_name
+                (HopKind::Heap, "orders", "kafka topic orders"),
+                (HopKind::Sink, "billing", "db.Exec"),
+            ]
+        );
+    }
+
+    #[test]
+    fn different_topics_do_not_join() {
+        let chains = taint(vec![(producer("orders"), "orders"), (consumer("refunds"), "billing")]);
+        assert!(chains.is_empty(), "{:?}", chains.iter().map(|c| &c.source_fn).collect::<Vec<_>>());
+    }
+}

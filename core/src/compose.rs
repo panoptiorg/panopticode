@@ -17,6 +17,11 @@ pub enum ContractShape {
     /// GraphQL field (doc 36 §3.2): the resolver InParam index carrying each
     /// SDL argument, in SDL order. `args[j]` is the client's arg port j.
     Graphql(Vec<u32>),
+    /// HTTP route (coverage wave 1 §4.4): the handler InParam indices that
+    /// carry request data. A linked client site has ONE arg port, into which
+    /// every data-bearing argument of the real request call flows, so each of
+    /// these params is that port.
+    Http { request_params: Vec<u32> },
 }
 
 impl ContractShape {
@@ -29,6 +34,9 @@ impl ContractShape {
             ContractShape::Graphql(args) => {
                 args.iter().enumerate().all(|(j, &p)| j as u32 == p)
             }
+            // Never: the view drops returns and every non-request param, and
+            // folds the request params onto one port.
+            ContractShape::Http { .. } => false,
         }
     }
 
@@ -36,8 +44,63 @@ impl ContractShape {
         match self {
             ContractShape::Grpc(cs, ss) => contract_view(sum, *cs, *ss),
             ContractShape::Graphql(args) => contract_view_graphql(sum, args),
+            ContractShape::Http { request_params } => contract_view_http(sum, request_params),
         }
     }
+}
+
+/// Remap an HTTP route HANDLER's summary into the frame of a linked client
+/// site (coverage wave 1 §4.4).
+///
+/// The client site is synthetic: `argc 1, resultc 0`, no receiver, every
+/// data-bearing argument of the real request call (URL, body) flowing into
+/// arg port 0. So `Param(p) -> Param(0)` for every `p` in `request_params`,
+/// and every other positional slot is dropped — `w http.ResponseWriter`, a
+/// method receiver and by-ref writes are not client-addressable.
+///
+/// Every RETURN is dropped too: v1 is request-direction only. A response body
+/// does not reach the client's variables, because the client site has no
+/// result port to land it on, and the frontends do not model the response
+/// side (docs/limitations.md). Non-positional slots (Source, Global, stream)
+/// pass through, as for gRPC.
+pub fn contract_view_http(sum: &Summary, request_params: &[u32]) -> Summary {
+    let map_in = |s: &SlotP| -> Option<SlotP> {
+        match &s.slot {
+            Slot::Param(p) if request_params.contains(p) => {
+                Some(SlotP { slot: Slot::Param(0), path: s.path.clone() })
+            }
+            Slot::Param(_) | Slot::Receiver | Slot::ByRefParam(_) | Slot::ByRefReceiver => None,
+            _ => Some(s.clone()),
+        }
+    };
+    let map_out = |s: &SlotP| -> Option<SlotP> {
+        match &s.slot {
+            Slot::Return(_) | Slot::ByRefParam(_) | Slot::ByRefReceiver | Slot::Field(_) => None,
+            _ => Some(s.clone()),
+        }
+    };
+    let mut out = Summary {
+        confidence: sum.confidence,
+        ..Default::default()
+    };
+    for (isl, osl) in &sum.flows {
+        if let (Some(i), Some(o)) = (map_in(isl), map_out(osl)) {
+            out.flows.insert((i, o));
+        }
+    }
+    // Two request params with the same sink fold onto the same port: keep the
+    // view a set, as `summarize` keeps every summary (ifds `dedup_sink_hits`).
+    let mut seen = HashSet::new();
+    for sh in &sum.sink_hits {
+        if let Some(i) = map_in(&sh.in_slot) {
+            let mut h = sh.clone();
+            h.in_slot = i;
+            if seen.insert(format!("{h:?}")) {
+                out.sink_hits.push(h);
+            }
+        }
+    }
+    out
 }
 
 /// Remap a gqlgen RESOLVER summary into the frame a GraphQL client calls in.
@@ -200,32 +263,16 @@ pub fn fixpoint_with_leaves(
     engine: &mut Engine,
     leaves: HashMap<IidHex, Summary>,
 ) -> FixpointStats {
-    // (contract, handler, shape) from every repo — gRPC methods AND GraphQL
-    // fields (doc 36 §3.2: a resolver is a contract handler like any other).
+    // (contract, handler, shape) from every repo — gRPC methods, GraphQL
+    // fields (doc 36 §3.2: a resolver is a contract handler like any other) and
+    // HTTP routes (coverage wave 1 §4.4) — from the one enumeration witness and
+    // the backward pass also read, so all three agree on keys and shapes.
     let mut contracts: Vec<(IidHex, IidHex, ContractShape)> = Vec::new();
     // handler iid -> contracts it serves (republish targets on handler change).
     let mut handler_of: HashMap<IidHex, Vec<(IidHex, ContractShape)>> = HashMap::new();
-    for p in &engine.prog.packages {
-        for gm in &p.grpc_methods {
-            if gm.handler_iid.is_empty() {
-                continue;
-            }
-            let c = hexid(&gm.iid);
-            let h = hexid(&gm.handler_iid);
-            let shape = ContractShape::Grpc(gm.client_streaming, gm.server_streaming);
-            contracts.push((c.clone(), h.clone(), shape.clone()));
-            handler_of.entry(h).or_default().push((c, shape));
-        }
-        for gf in &p.graphql_fields {
-            if gf.resolver_iid.is_empty() || gf.iid.is_empty() {
-                continue;
-            }
-            let c = hexid(&gf.iid);
-            let h = hexid(&gf.resolver_iid);
-            let shape = ContractShape::Graphql(gf.args.iter().map(|a| a.param_idx).collect());
-            contracts.push((c.clone(), h.clone(), shape.clone()));
-            handler_of.entry(h).or_default().push((c, shape));
-        }
+    for c in crate::graph::contracts(engine.prog) {
+        contracts.push((c.key.clone(), c.handler.clone(), c.shape.clone()));
+        handler_of.entry(c.handler).or_default().push((c.key, c.shape));
     }
 
     // Reverse deps, built once. prog.callees drops contract iids (no body), so
@@ -430,6 +477,31 @@ mod tests {
         assert_eq!(v.flows.len(), 1, "obj/ctx in and the error return are dropped: {:?}", v.flows);
         let hits: Vec<Slot> = v.sink_hits.iter().map(|h| h.in_slot.slot.clone()).collect();
         assert_eq!(hits, vec![Slot::Param(1)], "b's sink moves to arg port 1; ctx's is dropped");
+    }
+
+    /// Coverage wave 1 §4.4: every request param lands on the client's one
+    /// port; the response writer, the receiver and every return are dropped
+    /// (request direction only); Source/Global pass through.
+    #[test]
+    fn http_view_folds_request_params_onto_port_zero_and_drops_returns() {
+        // Next route handler (request, ctx): both carry request data
+        let s = sum(
+            vec![
+                (Slot::Param(0), Slot::Return(0)),            // response: dropped
+                (Slot::Param(1), Slot::Global("ab".into())),  // into a heap cell: kept
+                (Slot::Receiver, Slot::Global("ab".into())),  // receiver: dropped
+            ],
+            vec![Slot::Param(0), Slot::Param(1), Slot::Param(2), Slot::Source],
+        );
+        let shape = ContractShape::Http { request_params: vec![0, 1] };
+        assert!(!shape.is_identity());
+        let v = shape.view(&s);
+        assert_eq!(
+            v.flows,
+            [(Slot::Param(0).into(), Slot::Global("ab".into()).into())].into_iter().collect(),
+        );
+        let hits: Vec<Slot> = v.sink_hits.iter().map(|h| h.in_slot.slot.clone()).collect();
+        assert_eq!(hits, vec![Slot::Param(0), Slot::Source], "two request params, one port, one hit");
     }
 
 }
@@ -857,5 +929,288 @@ arg = "any"
             "republished server-stream view must remap req to Param(1): {:?}",
             view.sink_hits
         );
+    }
+}
+
+/// Coverage wave 1 §4.3-4.4 end to end: a client in one repo, a route handler
+/// in another, the linker, phase 1, compose, witness and the backward pass.
+#[cfg(test)]
+mod http_tests {
+    use super::*;
+    use crate::catalog::Catalog;
+    use crate::graph::Program;
+    use crate::ifds::cache_tests::{edge, vertex};
+    use crate::witness::HopKind;
+
+    const CAT: &str = "[[sinks]]\nclass = \"sqli\"\nselector = \"db.Exec\"\n";
+
+    fn func(iid: u8, fqn: &str, flow: cgf::LocalFlow) -> cgf::Function {
+        cgf::Function {
+            id: Some(cgf::Ident { iid: vec![iid; 32], bid: vec![iid; 32] }),
+            fqn: fqn.into(),
+            has_body: true,
+            flow: Some(flow),
+            ..Default::default()
+        }
+    }
+
+    /// `web.Submit(q)`: `fetch(`${API}/api/users`, {method: "POST", body: q})`,
+    /// q untrusted. The ordinary `fetch` site is omitted — only the synthetic
+    /// one matters here.
+    fn client(method: &str, path: &str) -> cgf::Function {
+        let mut f = func(
+            0x0C,
+            "web.Submit",
+            cgf::LocalFlow {
+                vertices: vec![
+                    vertex(1, cgf::VertexKind::InParam, 0, 0),
+                    vertex(2, cgf::VertexKind::CallArgPort, 0, 0),
+                ],
+                edges: vec![edge(1, 2)],
+                callsites: vec![cgf::CallSite {
+                    id: 0,
+                    callee_fqn: format!("http:{method} {path}"),
+                    argc: 1,
+                    opaque: true,
+                    http_call: Some(cgf::HttpCall { method: method.into(), path: path.into() }),
+                    ..Default::default()
+                }],
+            },
+        );
+        f.source_params = vec![0];
+        f
+    }
+
+    /// `api.CreateUser(w http.ResponseWriter, r *http.Request)`: db.Exec(r…)
+    /// — the sink on handler param `sink_param`.
+    fn handler(sink_param: u32) -> cgf::Function {
+        func(
+            0x2D,
+            "api.CreateUser",
+            cgf::LocalFlow {
+                vertices: vec![
+                    vertex(1, cgf::VertexKind::InParam, sink_param, 0),
+                    vertex(2, cgf::VertexKind::CallArgPort, 0, 0),
+                ],
+                edges: vec![edge(1, 2)],
+                callsites: vec![cgf::CallSite { id: 0, callee_fqn: "db.Exec".into(), argc: 1, ..Default::default() }],
+            },
+        )
+    }
+
+    fn program(client_fn: cgf::Function) -> Program {
+        program_with(client_fn, vec![1], 1)
+    }
+
+    fn program_with(client_fn: cgf::Function, request_params: Vec<u32>, sink_param: u32) -> Program {
+        let route = cgf::HttpRoute {
+            iid: vec![0xE1; 32],
+            method: "POST".into(),
+            path: "/api/users".into(),
+            display: "/api/users".into(),
+            handler_iid: vec![0x2D; 32],
+            endpoint_iid: vec![0xE1; 32],
+            request_params,
+            framework: "chi".into(),
+        };
+        let mut prog = Program {
+            funcs: HashMap::new(),
+            repo_of: HashMap::new(),
+            packages: vec![
+                cgf::CgfPackage { repo: "web".into(), language: "ts".into(), ..Default::default() },
+                cgf::CgfPackage { repo: "api".into(), language: "go".into(), http_routes: vec![route], ..Default::default() },
+            ],
+        };
+        for (f, repo) in [(client_fn, "web"), (handler(sink_param), "api")] {
+            let h = hexid(&f.id.as_ref().unwrap().iid);
+            prog.repo_of.insert(h.clone(), repo.into());
+            prog.funcs.insert(h, f);
+        }
+        prog
+    }
+
+    /// cli.rs `taint`'s phase order
+    fn chains(prog: &mut Program, link: bool, cat: &Catalog) -> Vec<crate::report::Chain> {
+        crate::httplink::link_loaded(prog, link);
+        let mut eng = Engine::new(prog, cat);
+        eng.run();
+        crate::heap::fixpoint(&mut eng);
+        fixpoint_with_leaves(&mut eng, HashMap::new());
+        crate::report::intra_chains(&eng, None)
+    }
+
+    #[test]
+    fn a_linked_client_reaches_the_route_handlers_sink() {
+        let cat = Catalog::load_str(CAT).unwrap();
+        let mut prog = program(client("POST", "/{}/api/users"));
+        let chains = chains(&mut prog, true, &cat);
+        assert_eq!(chains.len(), 1, "one cross-repo chain");
+        let c = &chains[0];
+        assert_eq!((c.source_repo.as_str(), c.source_fn.as_str(), c.sink_class.as_str()), ("web", "web.Submit", "sqli"));
+        let route = c.route.as_ref().unwrap();
+        assert_eq!(route.incomplete, None);
+        assert_eq!(route.boundaries, 1);
+        let hops: Vec<(HopKind, &str, &str)> =
+            route.hops.iter().map(|h| (h.kind, h.repo.as_str(), h.callee.as_str())).collect();
+        assert_eq!(
+            hops,
+            vec![
+                (HopKind::Source, "web", ""),
+                // the crossing names the ROUTE it entered, not the client template
+                (HopKind::Boundary, "web", "http POST /api/users (chi)"),
+                (HopKind::Sink, "api", "db.Exec"),
+            ]
+        );
+    }
+
+    /// A Next route handler `(request, ctx)` carries request data in both
+    /// params; the view folds both onto the client's port, so the descent must
+    /// re-enter at the one whose rows actually reach the sink.
+    #[test]
+    fn the_descent_reenters_at_the_request_param_that_carries_the_sink() {
+        let cat = Catalog::load_str(CAT).unwrap();
+        let mut prog = program_with(client("POST", "/api/users"), vec![0, 1], 1);
+        let chains = chains(&mut prog, true, &cat);
+        assert_eq!(chains.len(), 1);
+        let route = chains[0].route.as_ref().unwrap();
+        assert_eq!(route.incomplete, None, "{:?}", route.hops);
+        assert_eq!(route.hops.last().unwrap().callee, "db.Exec");
+    }
+
+    /// The gin shape: `CreateUser(c *gin.Context) { c.ShouldBindJSON(&req);
+    /// db.ExecContext(c, req.Name) }`. The by-ref SOURCE makes the handler an
+    /// entry point of its own; the bind PROPAGATOR (receiver -> 1) is what lets
+    /// the client's data, arriving on `c`, reach `req` — without it the
+    /// cross-service chain does not exist. `c` also reaches the ctx port of
+    /// ExecContext, which `sink_ignore_arg_types` must keep silent.
+    #[test]
+    fn a_client_reaches_the_sink_behind_a_gin_bind() {
+        const BIND: &str = "(*github.com/gin-gonic/gin.Context).ShouldBindJSON";
+        let typed = |mut v: cgf::FlowVertex, t: &str| {
+            v.r#type = t.into();
+            v
+        };
+        let gin = func(
+            0x2D,
+            "api.CreateUser",
+            cgf::LocalFlow {
+                vertices: vec![
+                    vertex(1, cgf::VertexKind::InParam, 0, 0),                   // c
+                    vertex(2, cgf::VertexKind::CallArgPort, 0, 0),               // c.ShouldBindJSON
+                    vertex(3, cgf::VertexKind::CallArgPort, 1, 0),               // &req (write-back)
+                    typed(vertex(4, cgf::VertexKind::CallArgPort, 0, 1), "context.Context"),
+                    typed(vertex(5, cgf::VertexKind::CallArgPort, 1, 1), "string"),
+                ],
+                edges: vec![edge(1, 2), edge(1, 4), edge(3, 5)],
+                callsites: vec![
+                    cgf::CallSite { id: 0, callee_fqn: BIND.into(), argc: 2, resultc: 1, arg0_is_receiver: true, ..Default::default() },
+                    cgf::CallSite { id: 1, callee_fqn: "db.ExecContext".into(), argc: 2, ..Default::default() },
+                ],
+            },
+        );
+        let mk = || {
+            let mut prog = program_with(client("POST", "/{}/api/users"), vec![0], 0);
+            prog.funcs.insert(hexid(&[0x2D; 32]), gin.clone());
+            prog
+        };
+        let cat_src = |propagator: bool| {
+            format!(
+                "sink_ignore_arg_types = [\"context.Context\"]\n\
+                 [[sources]]\nkind = \"http_request\"\nselector = \"{BIND}\"\nto = \"1\"\n\
+                 [[sinks]]\nclass = \"sqli\"\nselector = \"db.ExecContext\"\n{}",
+                if propagator {
+                    format!("[[propagators]]\nselector = \"{BIND}\"\nfrom = \"receiver\"\nto = \"1\"\n")
+                } else {
+                    String::new()
+                }
+            )
+        };
+        let sources = |chains: &[crate::report::Chain]| -> Vec<String> {
+            chains.iter().map(|c| c.source_fn.clone()).collect()
+        };
+        let cat = Catalog::load_str(&cat_src(false)).unwrap();
+        let without = chains(&mut mk(), true, &cat);
+        assert_eq!(sources(&without), vec!["api.CreateUser"], "the bind source alone: the handler only");
+
+        let cat = Catalog::load_str(&cat_src(true)).unwrap();
+        let with = chains(&mut mk(), true, &cat);
+        assert_eq!(sources(&with), vec!["api.CreateUser", "web.Submit"]);
+        let route = with[1].route.as_ref().unwrap();
+        assert_eq!(route.incomplete, None);
+        let callees: Vec<&str> = route.hops.iter().map(|h| h.callee.as_str()).collect();
+        assert_eq!(callees, vec!["", "http POST /api/users (chi)", BIND, "db.ExecContext"]);
+    }
+
+    /// Two loaded services serve the same route (one iid) and only one has a
+    /// sink: the client fans out at 1/2, and the route descends into the one
+    /// whose summary carries it.
+    #[test]
+    fn a_route_two_services_serve_fans_out_and_routes_through_the_sink() {
+        let cat = Catalog::load_str(CAT).unwrap();
+        let mut prog = program(client("POST", "/api/users"));
+        let mut quiet = handler(1);
+        quiet.id = Some(cgf::Ident { iid: vec![0x3D; 32], bid: vec![0x3D; 32] });
+        quiet.fqn = "api2.CreateUser".into();
+        quiet.flow.as_mut().unwrap().edges.clear();
+        prog.repo_of.insert(hexid(&[0x3D; 32]), "api2".into());
+        prog.funcs.insert(hexid(&[0x3D; 32]), quiet);
+        let mut twin = prog.packages[1].http_routes[0].clone();
+        twin.handler_iid = vec![0x3D; 32];
+        prog.packages.push(cgf::CgfPackage { repo: "api2".into(), http_routes: vec![twin], ..Default::default() });
+
+        let chains = chains(&mut prog, true, &cat);
+        assert_eq!(chains.len(), 1);
+        let route = chains[0].route.as_ref().unwrap();
+        assert_eq!(route.incomplete, None);
+        assert_eq!(route.hops.last().unwrap().repo, "api", "the handler with the sink");
+        assert_eq!(chains[0].route_confidence, 0.5, "a two-way fan-out");
+    }
+
+    /// request_params [0, 1], the sink behind param 1 only: --backward-unview
+    /// lands the demand back on the client's one port and confirms.
+    #[test]
+    fn backward_unview_confirms_through_a_later_request_param() {
+        let cat = Catalog::load_str(CAT).unwrap();
+        let mut prog = program_with(client("POST", "/api/users"), vec![0, 1], 1);
+        crate::httplink::link_loaded(&mut prog, true);
+        let mut eng = Engine::new(&prog, &cat);
+        eng.run();
+        fixpoint_with_leaves(&mut eng, HashMap::new());
+        let mut chains = crate::report::intra_chains(&eng, None);
+        assert_eq!(chains.len(), 1);
+        crate::backward::set_opts(crate::backward::BackOpts { unview: true, ..Default::default() });
+        crate::report::backward_check(&eng, &mut chains, false);
+        crate::backward::set_opts(Default::default());
+        assert_eq!(chains[0].backward.as_ref().unwrap().verdict, crate::backward::Verdict::Confirmed);
+    }
+
+    #[test]
+    fn without_the_link_there_is_no_chain() {
+        let cat = Catalog::load_str(CAT).unwrap();
+        assert!(chains(&mut program(client("POST", "/{}/api/users")), false, &cat).is_empty());
+        // ... nor with a template no route serves
+        assert!(chains(&mut program(client("POST", "/{}/api/orders")), true, &cat).is_empty());
+    }
+
+    /// Not identity, so the backward pass gives up at the crossing unless
+    /// --backward-unview undoes the view — the permuted-GraphQL rule.
+    #[test]
+    fn backward_is_undecided_across_the_route_unless_unviewed() {
+        let cat = Catalog::load_str(CAT).unwrap();
+        let mut prog = program(client("POST", "/{}/api/users"));
+        crate::httplink::link_loaded(&mut prog, true);
+        let mut eng = Engine::new(&prog, &cat);
+        eng.run();
+        fixpoint_with_leaves(&mut eng, HashMap::new());
+        for (unview, want) in [
+            (false, crate::backward::Verdict::Undecided),
+            (true, crate::backward::Verdict::Confirmed),
+        ] {
+            let mut chains = crate::report::intra_chains(&eng, None);
+            crate::backward::set_opts(crate::backward::BackOpts { unview, ..Default::default() });
+            crate::report::backward_check(&eng, &mut chains, false);
+            assert_eq!(chains[0].backward.as_ref().unwrap().verdict, want, "unview={unview}");
+        }
+        crate::backward::set_opts(Default::default());
     }
 }

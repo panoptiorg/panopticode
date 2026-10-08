@@ -24,6 +24,7 @@ message CgfPackage {
   repeated GrpcMethod   grpc_methods   = 13;
   repeated GraphqlField graphql_fields = 14;
   repeated Endpoint     endpoints      = 15;
+  repeated HttpRoute    http_routes    = 16;
 }
 
 // ---------------------------------------------------------------------------
@@ -243,6 +244,20 @@ message CallSite {
   // call convention is by-name (GraphQL operations). Core: normalize.rs
   // rewrites CALL_ARG_PORT indices into the contract's positional frame.
   repeated string arg_names = 14;
+
+  // Set only on a synthetic HTTP client site (argc 1, resultc 0, every
+  // data-bearing argument of the real request call flowing into arg port 0).
+  // Unlinked, such a site is inert. The core links it to an HttpRoute by
+  // method + canonical path at load time and turns it into INVOKES_REMOTE.
+  HttpCall http_call = 15;
+}
+
+message HttpCall {
+  string method = 1; // upper-case; "" = unknown
+  // Canonical path template: params as "{}", catch-all tail as "{*}", no
+  // scheme/host/query. Leading "{}" segments = an unresolved base URL, so the
+  // path is only known as a suffix.
+  string path   = 2;
 }
 
 // ---------------------------------------------------------------------------
@@ -289,13 +304,28 @@ message GraphqlArg {
   uint32 param_idx = 2;
 }
 
-// Unifier over GrpcMethod/GraphqlField/HTTPRoute.
+// A server-side HTTP route: the contract a client HttpCall links to.
+message HttpRoute {
+  bytes  iid          = 1; // ContractIID("http:" + method + " " + path)
+  string method       = 2; // upper-case; "*" = any method
+  string path         = 3; // canonical template (see HttpCall.path), no "{}" base
+  string display      = 4; // as written, e.g. "/api/users/{id}" — reporting only
+  bytes  handler_iid  = 5;
+  bytes  endpoint_iid = 6; // == iid
+  // Handler InParam indices (receiver excluded) that carry request data; the
+  // contract view maps each onto the client site's arg port 0.
+  repeated uint32 request_params = 7;
+  string framework    = 8; // "net/http", "chi", "gin", "next-app", ... — reporting only
+}
+
+// Unifier over GrpcMethod/GraphqlField/HttpRoute and message consumers.
 message Endpoint {
   bytes iid = 1;
   enum Kind {
     GRPC    = 0;
     GRAPHQL = 1;
     HTTP    = 2;
+    MESSAGE = 3; // a message-queue consumer callback (e.g. a Kafka ConsumeClaim)
   }
   Kind kind            = 2;
   bool untrusted_input = 3; // catalog: is this a taint source surface?

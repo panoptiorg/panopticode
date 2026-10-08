@@ -29,6 +29,8 @@ contract instead of a local function.
    GraphQL calls carry arguments by name, and they are rewritten into the
    contract's positional frame using `GraphqlField.args`. This runs on the
    merged program because the contract may live in another directory.
+   Then link synthetic HTTP client sites to the loaded HTTP routes (see
+   [HTTP routes](#http-routes)), for the same reason.
 3. Print the catalog fit and opacity diagnostics.
 4. Phase 1: compute a summary for every function, bottom-up over SCCs.
 5. With `--pg`, load stored contract views for contracts no loaded CGF serves.
@@ -58,16 +60,23 @@ once for source seeds and once for stream seeds. When taint reaches a call's
 argument port, the engine checks in this order:
 
 1. the callee matches a sanitizer: stop;
-2. the callee matches a sink (and the `arg` rule): record a sink hit and
-   continue, so taint still flows through the call;
+2. the callee matches a sink (and the `arg` rule, and the port's type is not
+   in `sink_ignore_arg_types`): record a sink hit and continue, so taint still
+   flows through the call;
 3. the callee has a summary: map the argument to the callee's slot and fire
    every row whose in-fact is compatible, tainting the mapped outputs;
 4. otherwise, apply matching `[[propagators]]`, then the default leaf: every
    result port becomes tainted (except error results under `--no-error-leaf`).
 
 Source seeds, the only places a chain can start, are `Function.source_params`,
-call results whose callee matches a `[[sources]]` rule, and server-side gRPC
-stream `Recv` results.
+the ports a matching `[[sources]]` rule names in `to` — call results by
+default, or argument ports for a bind such as `c.ShouldBindJSON(&req)`, whose
+write-back edge carries the seed into `req`; such a seed leaves along that edge
+only and is never an input to its own call — and server-side gRPC stream
+`Recv` results. Route reconstruction and backward confirmation recognise an
+argument-port seed exactly like a result-port one. The same per-port sink
+predicate (`Catalog::sink_fires_on`) is used by propagation, route
+reconstruction and backward confirmation, so they agree on where a sink fires.
 
 ## SCC fixpoint
 
@@ -130,6 +139,15 @@ write site, shown in routes as a `heap` hop with confidence 0.5. This lets taint
 graph cannot see, at a precision cost. Optional interface-type narrowing uses
 `FlowVertex.iface_type`. Heap state is in memory only.
 
+A Kafka topic (`pc-fe --topic-cells`) is the same mechanism with a different
+key: the producer's payload flows into an `OUT_FIELD` vertex whose `sym` is the
+contract iid of `msg:kafka:<topic>`, and the consumer reads an `IN_GLOBAL`
+vertex with that `sym`. The join is program-wide, and every `--cgf` directory
+is merged into one program, so a producer and a consumer in different
+repositories join with no engine change; the route's `heap` hop renders the
+cell's `sym_name` (`kafka topic orders`). `heap.rs`'s `topic_cell_tests` pin
+this through the same phase order `taint` runs.
+
 ## Contracts and cross-repo composition
 
 A contract is keyed by a name both sides derive independently from generated
@@ -141,12 +159,16 @@ code:
   an embedded `Unimplemented<Svc>Server` or `Unsafe<Svc>Server`, one of which
   `protoc-gen-go-grpc` requires every server to embed.
 - GraphQL: `graphql:<Type>.<field>`, from each side's SDL.
+- HTTP: `http:<METHOD> <canonical path>`. The server side names the route; the
+  client side is linked to it by the core rather than named, see
+  [HTTP routes](#http-routes).
 
 A client call to a contract is an `INVOKES_REMOTE` call site whose callee is the
 contract's iid. For each contract with a loaded handler, the engine publishes a
 view: the handler's summary remapped into the client's frame (for gRPC,
 depending on client and server streaming; for GraphQL, through the resolver's
-argument positions). The client call resolves through the ordinary summary
+argument positions; for HTTP, every request parameter onto the client's one
+argument port, with every return dropped). The client call resolves through the ordinary summary
 lookup. Composition iterates: publish all views, re-summarize callers whose
 views changed and their local callers, republish, until stable (capped at
 number of contracts + 1, with a warning).
@@ -154,6 +176,50 @@ number of contracts + 1, with a warning).
 With `--pg`, a contract with no loaded handler can take its view from the
 `contract_summaries` table (`remote_leaves` in the stats line); a loaded
 handler always wins, and routes stop with `handler_not_loaded` there.
+
+## HTTP routes
+
+A server route is an `HttpRoute` (method, canonical path, handler, the handler
+parameters carrying request data). A client request is, in addition to its
+ordinary call site, a synthetic site with `http_call` set: one argument port
+into which the URL and body flow, no result port. Unlinked it is inert — the
+default leaf has nothing to taint.
+
+Right after `normalize`, `httplink.rs` links each such site over the routes of
+all loaded packages:
+
+1. **exact**: methods agree (or either side is `*` or unknown), same segment
+   count, a route `{}` takes any client segment, a client `{}` only a route
+   `{}`, `{*}` takes the tail. At least one literal segment must agree, so
+   `/api/users` is no match for `/{owner}/{repo}` and `/` links to nothing.
+   Only for a client without an unresolved base.
+2. else **suffix**: the client's leading `{}` (an unresolved base URL) is
+   dropped and the rest matched against a suffix of the route, or the route
+   against a suffix of the client (an unresolved mount or gateway prefix). At
+   least two literal segments must agree.
+3. Candidates are ranked by kind, then agreeing literal segments, then
+   one-for-one segment matches over a `{*}` that swallowed the same segments
+   (`/api/users/me` goes to `/api/users/{id}`, not also to `/api/users/{*}`),
+   then an exact method match. Every candidate tied for best is linked, up to
+   4, each with `dispatch_confidence` 1/n; more is `ambiguous` and stays
+   unlinked.
+
+A linked site becomes `INVOKES_REMOTE` with the routes as callees, and from
+there it is an ordinary contract call. A route's iid names the route, not the
+service, so two loaded services serving the same route would share one view;
+in that case each handler gets its own key and the client fans out.
+
+Linking does not change phase 1. The site has no result port, so linked or not
+the default leaf taints nothing; no summary exists under a contract key until
+compose publishes one; and `summary_key` counts only callees that are loaded
+functions. `bid` is the frontend's. `httplink.rs`'s
+`phase_one_is_identical_linked_or_not` pins that, so `--no-http-link` is not a
+store namespace flag.
+
+The witness renders a crossing as `http <METHOD> <display> (<framework>)` and
+re-enters the handler at the first request parameter whose rows carry the
+sink. The view is not identity, so `--backward` reports `undecided` across it
+unless `--backward-unview` is given. HTTP routes are not persisted to Postgres.
 
 ## Routes
 
@@ -184,8 +250,8 @@ their summaries, and keeping full field paths. Verdicts:
   stored contract views, the depth limit, an incomplete route), or it crossed
   a contract whose view is not the handler's own frame.
 
-That last case covers streaming gRPC and GraphQL (whose resolver arguments are
-shifted by the context parameter). `--backward-unview` undoes the view remap so
+That last case covers streaming gRPC, GraphQL (whose resolver arguments are
+shifted by the context parameter) and HTTP routes. `--backward-unview` undoes the view remap so
 the walk can continue. Nothing is removed unless `--backward-prune` is given,
 and a refutation that crossed an unviewed contract is pruned only with
 `--backward-prune-unviewed`.
@@ -197,7 +263,8 @@ flow into `v`. Two halves recover it. The frontend emits a write-back edge from
 a by-reference argument port to the caller's variable (`pc-fe
 --library-writeback`, on by default; `pc-fe-ts` likewise). The core applies
 `[[propagators]]` rules at body-less calls, in forward propagation, route
-reconstruction and backward confirmation, in addition to the default leaf.
+reconstruction and backward confirmation, in addition to the default leaf. A
+by-ref `[[sources]]` rule (`to = "1"`) uses the same write-back edge.
 Without either half the flow is lost. `--unmodeled` reports calls that look
 like they need a rule. Pointers inside a variadic slice (`rows.Scan(&a, &b)`)
 and Go's `copy` builtin are not covered; `pc-fe --heap-slots` alone links
@@ -246,25 +313,29 @@ one `<Svc>Client` satisfies.
 
 ### Core
 
-The core does not read contracts generically. Each of these enumerates
-`grpc_methods` and `graphql_fields` by name, so a third contract record is
-invisible until all of them are extended:
+Contract discovery is in one place: `graph.rs` `pkg_contracts` knows which
+package fields hold contracts (`grpc_methods`, `graphql_fields`,
+`http_routes`) and returns each with its key, handler, kind and
+`ContractShape`; `graph::contracts` turns that into the keyed list the analysis
+uses. A new contract record is one more block in `pkg_contracts`. Its readers:
 
 | where | uses the contract list for |
 |---|---|
-| `graph.rs` `pkg_contracts` | Postgres persistence and `missing_remote_contracts` |
 | `compose.rs` `fixpoint_with_leaves` | publishing each handler's summary as the contract's view |
-| `witness.rs` `contract_handlers` | route reconstruction descending into the handler |
-| `cli.rs` `graph-dump` | per-kind counts |
+| `witness.rs` `contract_handlers` (and so `backward.rs`) | route reconstruction and backward confirmation descending into the handler |
+| `httplink.rs` | the routes a client site can link to |
+| `storage.rs` `persisted_contracts` | Postgres persistence and `missing_remote_contracts` (gRPC and GraphQL only) |
+| `impact.rs` | whether a crossed contract's handler was recomputed |
+
+`cli.rs` `graph-dump` counts each package field itself, for display only.
 
 `Endpoint` plus `Function.binds_to` is not enough to replace them: an `Endpoint`
-carries no handler iid and no shape. That is why the HTTP endpoints `pc-fe-ts`
-emits are populated but never read.
+carries no handler iid and no shape, so endpoints are only counted.
 
-`ContractShape` (`compose.rs`) has two variants, `Grpc(client_streaming,
-server_streaming)` and `Graphql(arg → param index)`. Every shape is implemented
-in four places, and they must agree exactly — the view and unview functions are
-each other's inverse:
+`ContractShape` (`compose.rs`) has three variants, `Grpc(client_streaming,
+server_streaming)`, `Graphql(arg → param index)` and `Http { request_params }`.
+Every shape is implemented in four places, and they must agree exactly — the
+view and unview functions are each other's inverse:
 
 | where | direction |
 |---|---|
@@ -277,16 +348,17 @@ A unary request/response protocol whose handler takes what the client passes,
 in the same order, and returns what the client receives fits the existing
 identity shape, `Grpc(false, false)`. A protocol with a different frame needs a
 new variant in all four places, with round-trip tests like the existing
-`unview_*` ones. Two examples of a different frame: an HTTP handler that
-receives `(ResponseWriter, *Request)` when the client passed a URL and a body,
-and a message consumer that returns nothing to the producer.
+`unview_*` ones — as HTTP did: its handler receives `(ResponseWriter,
+*Request)` when the client passed a URL and a body. A message consumer that
+returns nothing to the producer needs no shape at all if it is modelled as a
+heap cell, as Kafka topics are.
 
 ### What a new protocol costs
 
 | the protocol | frontend | core |
 |---|---|---|
-| fits an existing shape | extractor + key | extend the four contract enumerations above |
-| needs its own frame mapping | extractor + key | the enumerations, plus a new `ContractShape` variant in all four places |
+| fits an existing shape | extractor + key | one block in `pkg_contracts` |
+| needs its own frame mapping | extractor + key | that block, plus a new `ContractShape` variant in all four places |
 
 There is a shortcut for the first row: emit the protocol as a `GrpcMethod` with
 both streaming flags off. The core then links it with no changes, but the
@@ -299,5 +371,7 @@ contract is counted, persisted and displayed as gRPC.
 not apply the schema. Only the call graph (function and contract nodes; call,
 binds-to and invokes-remote edges), summaries and contract views are written;
 LocalFlow is not. `summaries` is written but not read back;
-`contract_summaries` is read by `--pg` runs. The `query` subcommands
+`contract_summaries` is read by `--pg` runs. HTTP routes and linked HTTP
+client sites are not written at all (`storage.rs` `persisted_contracts`, `is_remote`):
+a link is made per run against the loaded routes only. The `query` subcommands
 ([cli.md](cli.md#query)) read this data.

@@ -30,9 +30,25 @@
 #
 # `arg` selects which argument port a tainted fact must reach for a sink to fire:
 # an index written as a string ("1"; 0-based over the call's arg ports, the
-# receiver is port 0 when arg0_is_receiver) or "any".
+# receiver is port 0 when arg0_is_receiver), "any", or "args" (every port except
+# the receiver — for a method whose receiver is a handle, not data).
+#
+# `to` (sources only) names the ports the untrusted data lands on, in the
+# propagator syntax below: "return" (the default — a getter's result), an index,
+# "receiver", "args", or a comma list. An argument port is a BIND:
+# `c.ShouldBindJSON(&req)` fills `req`. It needs the frontend's library
+# write-back (pc-fe --library-writeback / pc-fe-ts, both default on), which
+# gives that port an edge into the caller's variable.
 
 schema_version = 1
+
+# A sink never fires on an argument port whose static type is one of these.
+# A request object or `*gin.Context` that is tainted as a whole IS a
+# context.Context, and every `db.QueryContext(ctx, q)`, `client.Do(req)`,
+# `logger.InfoContext(ctx, …)` would otherwise report the ctx argument — a
+# finding about the context, not about the query. Only the Go frontend writes
+# arg-port types today; an untyped port is never filtered.
+sink_ignore_arg_types = ["context.Context"]
 
 # ---------------------------------------------------------------------------
 # SOURCES — untrusted input surfaces. A matched result port (a getter's return
@@ -177,8 +193,8 @@ note           = "net/http convenience helpers"
 [[sinks]]
 class          = "egress"
 selector_regex = '\(\*net/http\.Client\)\.(Do|Get|Post|PostForm|Head)$'
-arg            = "any"
-note           = "net/http — the method form on an explicit *http.Client, which is what production code uses"
+arg            = "args"
+note           = "net/http — the method form on an explicit *http.Client, which is what production code uses; the client is a handle, not data, hence `args`"
 
 [[sinks]]
 class          = "egress"
@@ -244,15 +260,17 @@ note           = "method-form wrappers on a custom error type"
 #   * a method is `(<recv>).<Name>`, with a leading `*` only when the receiver
 #     is a POINTER — value receivers (squirrel builders, echo.Context) have none.
 #
-# Everything here is `arg = "any"`: an index would be a claim about a specific
-# signature, and these are shapes, not measurements.
+# Every sink here is `arg = "any"`, or `"args"` where the receiver is a handle
+# rather than data: an index would be a claim about a specific signature, and
+# these are shapes, not measurements. A source's `to` IS such a claim, made only
+# where the signature was read (`go doc`) — the by-ref Bind family.
 # ---------------------------------------------------------------------------
 
 # --- baseline sources: HTTP request surfaces ------------------------------
 
 [[sources]]
 kind           = "http_request"
-selector_regex = '\(\*net/http\.Request\)\.(FormValue|PostFormValue|FormFile|Cookie)$'
+selector_regex = '\(\*net/http\.Request\)\.(FormValue|PostFormValue|FormFile|Cookie|PathValue)$'
 note           = "net/http — request accessors that read attacker-supplied data"
 
 [[sources]]
@@ -272,8 +290,22 @@ note           = "go-chi — path parameters, package-level function"
 
 [[sources]]
 kind           = "http_request"
-selector_regex = '\(\*github\.com/gin-gonic/gin\.Context\)\.(Param|Query|PostForm|GetHeader|ShouldBind[A-Za-z]*|Bind[A-Za-z]*)$'
-note           = "gin — every request accessor and the whole Bind/ShouldBind family"
+selector_regex = '^read:net/http\.Request\.(Body|Form|PostForm|MultipartForm|Header|Trailer|URL|Host|RequestURI)$'
+note           = """net/http — request field READS. A field load is not a call, so the Go \
+frontend surfaces each as a synthetic zero-arg `read:` call site (pc-fe \
+--surface-reads). `json.NewDecoder(r.Body).Decode(&v)` then needs no rule of its \
+own: the Decoder propagator below moves Body's taint into v."""
+
+[[sources]]
+kind           = "http_request"
+selector_regex = '\(\*github\.com/gin-gonic/gin\.Context\)\.(Param|Query|PostForm|GetHeader)$'
+note           = "gin — request accessors; the value is the result"
+
+[[sources]]
+kind           = "http_request"
+selector_regex = '\(\*github\.com/gin-gonic/gin\.Context\)\.(ShouldBind[A-Za-z]*|Bind[A-Za-z]*|MustBindWith)$'
+to             = "1"
+note           = "gin — the Bind/ShouldBind family is BY-REF: c.ShouldBindJSON(&req) fills req. `obj any` is port 1 (the *Context receiver is port 0); the result is only an error"
 
 [[sources]]
 kind           = "http_request"
@@ -281,9 +313,38 @@ selector_regex = '\(github\.com/labstack/echo/v4\.Context\)\.(Param|QueryParam|F
 note           = "echo v4 — Context is an INTERFACE, so the receiver has no `*`"
 
 [[sources]]
+kind           = "http_request"
+selector_regex = '\(github\.com/labstack/echo/v4\.Context\)\.Bind$'
+to             = "1"
+note           = "echo v4 — c.Bind(&req) fills req (path params, query and body); `i any` is port 1, the Context receiver port 0"
+
+[[sources]]
 kind           = "http_route_param"
 selector_regex = '^github\.com/gorilla/mux\.Vars$'
 note           = "gorilla/mux — mux.Vars(r) returns the path variables map"
+
+# --- baseline sources: consumed messages ----------------------------------
+#
+# A consumed message is untrusted whoever produced it — most producers of a
+# topic are outside any one analysis. These make the consumer a source on its
+# own. With pc-fe --topic-cells (default on) a producer and a consumer loaded
+# in the same run are ALSO joined through the topic, which reports the
+# producer-side chain end to end; the two are different findings.
+
+[[sources]]
+kind           = "message"
+selector_regex = '\(\*github\.com/segmentio/kafka-go\.Reader\)\.(ReadMessage|FetchMessage)$'
+note           = "kafka-go — the returned Message"
+
+[[sources]]
+kind           = "message"
+selector_regex = '\(github\.com/(IBM|Shopify)/sarama\.(ConsumerGroupClaim|PartitionConsumer)\)\.Messages$'
+note           = "sarama — both are INTERFACES (no `*`); Messages() is the channel the *ConsumerMessage values arrive on. Maintenance moved from Shopify to IBM, so both module paths"
+
+[[sources]]
+kind           = "message"
+selector_regex = '\(github\.com/twmb/franz-go/pkg/kgo\.Fetches\)\.(Records|RecordIter|RecordsAll)$|\(\*github\.com/twmb/franz-go/pkg/kgo\.FetchesRecordIter\)\.Next$'
+note           = "franz-go — Fetches is a slice type, so a VALUE receiver. EachRecord(fn) hands each record to a callback instead and is not covered"
 
 # --- baseline sinks: sqli --------------------------------------------------
 
@@ -406,8 +467,8 @@ note           = "net/http — the redirect target"
 [[sinks]]
 class          = "open_redirect"
 selector_regex = '\(net/http\.Header\)\.(Set|Add)$'
-arg            = "any"
-note           = "response header writes — the Location case is an open redirect, the rest is header injection; http.Header is a map type, value receiver"
+arg            = "args"
+note           = "response header writes — the Location case is an open redirect, the rest is header injection; http.Header is a map type, value receiver. The map is not the injected value, hence `args`"
 
 # --- baseline sinks: log ---------------------------------------------------
 
@@ -454,6 +515,14 @@ note           = "a parsed UUID cannot carry an injection payload"
 kind           = "validation"
 selector_regex = '\(\*github\.com/go-playground/validator/v10\.Validate\)\.(Struct|StructCtx|Var)$'
 note           = "go-playground/validator — struct/field validation"
+
+[[sanitizers]]
+kind           = "context"
+selector_regex = '^\(\*net/http\.Request\)\.Context$'
+note           = """r.Context() is cancellation and request-scoped values, not the request's \
+data. Without this, a request seeded whole (pc-fe --http-seed-request) taints \
+every ctx a handler passes on. Class-blind like every sanitizer: a value stored \
+with context.WithValue and read back later is lost with it."""
 
 # strconv parsing (Atoi, ParseInt, ParseUint, ParseFloat, ParseBool) is the
 # obvious next sanitizer and is deliberately NOT enabled:
@@ -527,6 +596,15 @@ selector_regex = '^\(\*(encoding/json|encoding/xml|encoding/gob|gopkg\.in/yaml\.
 from           = "receiver"
 to             = "1"
 note           = "json.NewDecoder(r).Decode(&v): the decoder carries r's data (NewDecoder's default leaf) into v"
+
+[[propagators]]
+selector_regex = '^\(\*github\.com/gin-gonic/gin\.Context\)\.(ShouldBind[A-Za-z]*|Bind[A-Za-z]*|MustBindWith)$|^\(github\.com/labstack/echo/v4\.Context\)\.Bind$'
+from           = "receiver"
+to             = "1"
+note           = """c.ShouldBindJSON(&req): the request is read out of c and written into req. \
+The by-ref [[sources]] rule above says req is untrusted; this says where it came \
+from, so a handler's summary carries `c -> req`, which is what a linked HTTP \
+client (or any caller passing c) composes against."""
 
 [[propagators]]
 selector_regex = '^(github\.com/mitchellh/mapstructure|github\.com/go-viper/mapstructure/v2)\.(Decode|WeakDecode)$'
@@ -621,8 +699,9 @@ note     = "test-only: a gqlgen model getter for an untrusted GraphQL input fiel
 # --- ts ---  TypeScript / Svelte.
 #
 # Additive: every selector below is anchored on a callee_fqn shape the Go
-# frontend never emits (`read:`, `assign:`, `svelte:`, or a bare DOM type name),
-# so a Go-only corpus is unaffected by this whole section.
+# frontend never emits (`read:` with no import path, `assign:`, `svelte:`,
+# `jsx:`, a bare DOM type name, an npm module specifier), so a Go-only corpus is
+# unaffected by this whole section.
 #
 # The TS frontend's callee_fqn vocabulary:
 #   "<module>.<name>"        imported symbol      ($app/navigation.goto)
@@ -631,8 +710,11 @@ note     = "test-only: a gqlgen model getter for an untrusted GraphQL input fiel
 #   "read:<path>"            a property READ that is an input surface
 #   "assign:<prop>"          a property WRITE that is a sink
 #   "svelte:<kind>"          a template fact ({@html}, bind:)
+#   "jsx:<kind>"             a JSX fact (`jsx:html`, `jsx:attr:<name>`)
 #   "graphql:<Type>.<field>" an INVOKES_REMOTE operation field — a contract, not
 #                            a catalog rule; listed here only for orientation
+#   "http:<METHOD> <path>"   a synthetic HTTP client site, linked to a route by
+#                            the core — likewise a contract, not a rule
 # ---------------------------------------------------------------------------
 
 [[sources]]
@@ -660,6 +742,21 @@ kind           = "ts_route"
 selector_regex = '^read:(route\.params|page\.data)$'
 note           = "a microfrontend's untrusted surface IS its route: a define({path:'/thing/[id]'}) → $props() shape, and SvelteKit's +page data/params"
 
+[[sources]]
+kind           = "ts_route"
+selector_regex = '^react-router(-dom)?\.(useSearchParams|useParams|useLocation)$'
+note           = "React Router hooks, under both specifiers (react-router-dom is still most of the installs). The hook CALL is the source; destructured results inherit it through the default leaf"
+
+[[sources]]
+kind           = "ts_route"
+selector_regex = '^next/navigation\.(useSearchParams|useParams|usePathname)$'
+note           = "Next.js App Router client hooks"
+
+# A `message` event's `data` (window.postMessage, any origin unless the
+# handler checks event.origin) is NOT a source here: pc-fe-ts has no name for
+# that read — it would need the DOM lib's MessageEvent type — and the catalog
+# ships no rule that matches nothing.
+
 # --- sinks -----------------------------------------------------------------
 
 [[sinks]]
@@ -667,6 +764,39 @@ class          = "xss"
 selector_regex = '^(svelte:html|assign:(innerHTML|outerHTML|srcdoc))$'
 arg            = "any"
 note           = "{@html e} and element.innerHTML = e"
+
+# --- JSX (React and any .tsx/.jsx). pc-fe-ts emits one synthetic call per
+# intrinsic-element attribute whose value is not a literal: `jsx:html` for
+# dangerouslySetInnerHTML, `jsx:attr:<name>` for a URL- or document-bearing
+# attribute. react-dom 19 rewrites a `javascript:` URL in href/src/action/
+# formAction/xlinkHref (and <object data>) into one that throws; react-dom 18
+# only warns. So the frontend ALSO emits `jsx:attr-unsanitized:<name>` when the
+# repo's React is older than 19 or its version is unknown — the version is a
+# fact, the class is decided here. First match wins, so the order matters.
+
+[[sinks]]
+class          = "xss"
+selector_regex = '^jsx:attr-unsanitized:(href|src|action|formAction|xlinkHref|data)$'
+arg            = "any"
+note           = "a `javascript:` URL in a URL attribute executes on React < 19 (or an unknown version)"
+
+[[sinks]]
+class          = "xss"
+selector_regex = '^jsx:attr(-unsanitized)?:srcDoc$'
+arg            = "any"
+note           = "<iframe srcDoc> is a whole document; no React version sanitises it"
+
+[[sinks]]
+class          = "xss"
+selector_regex = '^jsx:html$'
+arg            = "any"
+note           = "dangerouslySetInnerHTML={{__html: e}}"
+
+[[sinks]]
+class          = "open_redirect"
+selector_regex = '^jsx:attr:(href|action|formAction)$'
+arg            = "any"
+note           = "React 19 turns a `javascript:` URL into one that throws, but an attacker-chosen http(s) target is still a redirect / phishing link"
 
 [[sinks]]
 class          = "open_redirect"
@@ -696,6 +826,42 @@ arg            = "any"
 class          = "log"
 selector_regex = '^console\.(log|error|warn|info|debug)$'
 arg            = "any"
+
+# --- server side (Next.js route handlers, server actions, Node). pc-fe-ts
+# names an imported call `<module specifier as written>.<name>`, so both
+# `child_process` and `node:child_process` occur. A method on an untyped
+# receiver is `.<method>` — `pool.query(sql)` on a `new Pool()` is `.query`,
+# which no rule may match (Apollo's `client.query` is the same name), so pg is
+# covered only where the frontend can name the receiver's module.
+
+[[sinks]]
+class          = "exec"
+selector_regex = '^(node:)?child_process\.(exec|execSync|execFile|execFileSync|spawn|spawnSync)$'
+arg            = "any"
+
+[[sinks]]
+class          = "file"
+selector_regex = '^(node:)?fs(/promises)?\.(readFile|readFileSync|writeFile|writeFileSync|appendFile|appendFileSync|createReadStream|createWriteStream|open|openSync|unlink|unlinkSync|rm|rmSync)$'
+arg            = "any"
+note           = "attacker-controlled path or content, as for Go's os.* rule"
+
+[[sinks]]
+class          = "sqli"
+selector_regex = '^(pg|mysql2(/promise)?)(\.[A-Za-z_$][A-Za-z0-9_$]*)*\.(query|execute)$'
+arg            = "any"
+note           = "pg / mysql2, where the receiver is named through its module: `mysql.createConnection(…)` results are `mysql2/promise.mysql.createConnection.$ret.query`. NOT `.query` on an untyped receiver (see above)"
+
+[[sinks]]
+class          = "sqli"
+selector_regex = '(^|\.)\$(queryRawUnsafe|executeRawUnsafe)$'
+arg            = "args"
+note           = "Prisma's unsafe raw SQL — a name no other library uses, so any receiver. The tagged-template $queryRaw is parameterised and deliberately absent"
+
+[[sinks]]
+class          = "open_redirect"
+selector_regex = '^next/navigation\.(redirect|permanentRedirect)$'
+arg            = "any"
+note           = "Next.js — the docs state redirect() does not validate the URL"
 
 # --- sanitizers ------------------------------------------------------------
 

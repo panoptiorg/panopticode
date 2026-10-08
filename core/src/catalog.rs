@@ -6,6 +6,12 @@ use std::path::Path;
 
 #[derive(Debug, Deserialize)]
 pub struct RawCatalog {
+    /// Coverage wave 1 §4.2 (E3): a sink never fires on an arg port whose
+    /// vertex `type` is one of these exact strings (`"context.Context"`). A
+    /// request object seeded whole would otherwise turn every `ctx`-taking sink
+    /// into a finding. Absent = every port is eligible, exactly as before.
+    #[serde(default)]
+    pub sink_ignore_arg_types: Vec<String>,
     #[serde(default)]
     pub sources: Vec<RawRule>,
     #[serde(default)]
@@ -42,6 +48,9 @@ pub struct RawRule {
     pub selector: Option<String>,
     pub selector_regex: Option<String>,
     pub arg: Option<String>,
+    /// `[[sources]]` only: which ports of the matched call carry the untrusted
+    /// data (propagator `to` syntax). Absent = `"return"`.
+    pub to: Option<String>,
     #[allow(dead_code)]
     pub note: Option<String>,
 }
@@ -103,6 +112,10 @@ impl PropagatorRule {
 /// list of them. A malformed spec fails the load: a rule that silently never
 /// fires is exactly the zero-recall failure catalog-fit exists to catch.
 fn parse_ports(spec: &str, side: &str) -> Result<Vec<PortSpec>> {
+    parse_ports_in("propagator", spec, side)
+}
+
+fn parse_ports_in(section: &str, spec: &str, side: &str) -> Result<Vec<PortSpec>> {
     let spec = spec.trim();
     if side == "to" && spec == "none" {
         return Ok(Vec::new());
@@ -116,7 +129,7 @@ fn parse_ports(spec: &str, side: &str) -> Result<Vec<PortSpec>> {
             "return" if side == "to" => PortSpec::Return,
             t => PortSpec::Index(t.parse().map_err(|_| {
                 anyhow::anyhow!(
-                    "propagator `{side}` must be a 0-based arg index, receiver, args, any{} — got {tok:?}",
+                    "{section} `{side}` must be a 0-based arg index, receiver, args, any{} — got {tok:?}",
                     if side == "to" { ", return or none" } else { "" }
                 )
             })?),
@@ -184,13 +197,65 @@ fn matcher(section: &str, r: &RawRule) -> Result<Matcher> {
 pub struct SourceRule {
     pub kind: String,
     pub m: Matcher,
+    /// Coverage wave 1 §4.1 (E1): the ports of a matched call that the
+    /// untrusted data lands on. `[Return]` — the default — is a getter's result
+    /// (`r.FormValue("x")`). An arg port is a BIND: `c.ShouldBindJSON(&req)`
+    /// fills `req`, and the frontends' library write-back gives that arg port
+    /// out-edges into the caller's variable, so seeding the port seeds `req`.
+    pub to: Vec<PortSpec>,
 }
-/// Sink arg spec: "any", or a 0-based index over the call's arg-ports
+
+impl SourceRule {
+    /// Does this source taint the call's result ports?
+    pub fn seeds_results(&self) -> bool {
+        self.to.contains(&PortSpec::Return)
+    }
+
+    /// Does this source taint arg port `port` of a call with `argc` ports?
+    pub fn seeds_arg(&self, port: u32, argc: u32, recv: bool) -> bool {
+        self.to.iter().any(|p| p.ports(argc, recv).contains(&port))
+    }
+
+    /// True when the rule names any arg port at all (a by-ref bind).
+    pub fn writes_args(&self) -> bool {
+        self.to.iter().any(|p| *p != PortSpec::Return)
+    }
+}
+
+/// `[[sources]] to`: the propagator `to` syntax, minus `none` — a source that
+/// seeds nothing is inert by construction, so it fails the load.
+fn parse_source_to(spec: Option<&str>) -> Result<Vec<PortSpec>> {
+    match spec.map(str::trim) {
+        None | Some("") => Ok(vec![PortSpec::Return]),
+        Some("none") => Err(anyhow::anyhow!(
+            "source `to = \"none\"` seeds nothing — delete the rule instead"
+        )),
+        Some(s) => parse_ports_in("source", s, "to"),
+    }
+}
+
+/// Sink arg spec: "any", "args", or a 0-based index over the call's arg-ports
 /// (receiver is arg 0 when arg0_is_receiver) — catalog.toml header contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SinkArg {
     Any,
+    /// Coverage wave 1 §4.2: every port except the receiver. For a method
+    /// whose receiver is not data (`(net/http.Header).Set`, a client handle),
+    /// a tainted receiver is not the dangerous input.
+    Args,
     Index(u32),
+}
+
+impl SinkArg {
+    /// Does a fact on arg port `arg_idx` of a call whose port 0 is the receiver
+    /// iff `recv` satisfy this spec?
+    pub fn admits(self, arg_idx: u32, recv: bool) -> bool {
+        match self {
+            SinkArg::Any => true,
+            SinkArg::Args => !(recv && arg_idx == 0),
+            SinkArg::Index(i) => i == arg_idx,
+        }
+    }
 }
 
 pub struct SinkRule {
@@ -209,6 +274,8 @@ pub struct ErrorWrapperRule {
 }
 
 pub struct Catalog {
+    /// see `RawCatalog::sink_ignore_arg_types`
+    pub sink_ignore_arg_types: Vec<String>,
     pub sources: Vec<SourceRule>,
     pub sinks: Vec<SinkRule>,
     pub sanitizers: Vec<SanitizerRule>,
@@ -223,14 +290,30 @@ impl Catalog {
 
     pub fn load_str(toml_src: &str) -> Result<Catalog> {
         let raw: RawCatalog = toml::from_str(toml_src)?;
+        // `to` means something only on a source. Anywhere else it would be
+        // silently ignored, which reads as a capability the rule does not have.
+        for (section, rules) in [
+            ("sinks", &raw.sinks),
+            ("sanitizers", &raw.sanitizers),
+            ("error_wrappers", &raw.error_wrappers),
+        ] {
+            if let Some(r) = rules.iter().find(|r| r.to.is_some()) {
+                let label = r.selector.clone().or_else(|| r.selector_regex.clone()).unwrap_or_default();
+                anyhow::bail!("[[{section}]] rule {label:?}: `to` applies to [[sources]] only");
+            }
+        }
         Ok(Catalog {
+            sink_ignore_arg_types: raw.sink_ignore_arg_types.clone(),
             sources: raw
                 .sources
                 .iter()
                 .map(|r| {
+                    let label = r.selector.clone().or_else(|| r.selector_regex.clone()).unwrap_or_default();
                     Ok(SourceRule {
                         kind: r.kind.clone().unwrap_or_default(),
                         m: matcher("sources", r)?,
+                        to: parse_source_to(r.to.as_deref())
+                            .map_err(|e| anyhow::anyhow!("[[sources]] rule {label:?}: {e}"))?,
                     })
                 })
                 .collect::<Result<Vec<_>>>()?,
@@ -242,9 +325,10 @@ impl Catalog {
                     // become a sink that never fires.
                     let arg = match r.arg.as_deref() {
                         None | Some("") | Some("any") => SinkArg::Any,
+                        Some("args") => SinkArg::Args,
                         Some(s) => SinkArg::Index(s.parse().map_err(|_| {
                             anyhow::anyhow!(
-                                "sink arg must be \"any\" or a 0-based arg index, got {s:?}"
+                                "sink arg must be \"any\", \"args\" or a 0-based arg index, got {s:?}"
                             )
                         })?),
                     };
@@ -389,6 +473,40 @@ impl Catalog {
         out
     }
 
+    /// The same inertness for a by-ref source (`to` naming an arg port): the
+    /// name matches call sites, but no matched call is wide enough to have any
+    /// of the ports `to` names, so it can only ever seed its results — or
+    /// nothing. Takes distinct `(callee_fqn, argc, arg0_is_receiver)` triples.
+    /// Returns `(kind, selector, widest argc seen)` per such rule.
+    pub fn source_to_never_in_range<'a, I>(&self, calls: I) -> Vec<(String, String, u32)>
+    where
+        I: IntoIterator<Item = (&'a str, u32, bool)>,
+    {
+        let n = self.sources.len();
+        let mut matched = vec![false; n];
+        let mut in_range = vec![false; n];
+        let mut max_argc = vec![0u32; n];
+        for (fqn, argc, recv) in calls {
+            for (i, r) in self.sources.iter().enumerate() {
+                if !r.writes_args() || !r.m.matches(fqn) {
+                    continue;
+                }
+                matched[i] = true;
+                max_argc[i] = max_argc[i].max(argc);
+                if r.to.iter().any(|p| !p.ports(argc, recv).is_empty()) {
+                    in_range[i] = true;
+                }
+            }
+        }
+        let mut out = Vec::new();
+        for (i, r) in self.sources.iter().enumerate() {
+            if matched[i] && !in_range[i] && !r.m.label.starts_with("__") {
+                out.push((r.kind.clone(), r.m.label.clone(), max_argc[i]));
+            }
+        }
+        out
+    }
+
     pub fn rule_count(&self) -> usize {
         self.sources.len() + self.sinks.len() + self.sanitizers.len() + self.error_wrappers.len()
     }
@@ -422,6 +540,16 @@ impl Catalog {
     }
     pub fn sink_of(&self, fqn: &str) -> Option<&SinkRule> {
         self.sinks.iter().find(|s| s.m.matches(fqn))
+    }
+    /// Does `sink` fire on a fact arriving at arg port `arg_idx` of a call whose
+    /// port 0 is the receiver iff `recv`, the port vertex's static type being
+    /// `vtype` ("" = unknown, never filtered)? The ONE predicate for "a sink
+    /// fires on this arg port": `propagate`, the witness descent and the
+    /// backward pass all call it, because a forward hit the other two do not
+    /// reproduce is a route that ends nowhere (coverage wave 1 §4.2).
+    pub fn sink_fires_on(&self, sink: &SinkRule, arg_idx: u32, recv: bool, vtype: &str) -> bool {
+        sink.arg.admits(arg_idx, recv)
+            && (vtype.is_empty() || !self.sink_ignore_arg_types.iter().any(|t| t == vtype))
     }
     pub fn sanitizer_of(&self, fqn: &str) -> Option<&SanitizerRule> {
         self.sanitizers.iter().find(|s| s.m.matches(fqn))
@@ -514,6 +642,103 @@ to   = "none"
         }
         let bad_re = "[[propagators]]\nselector_regex = \"(\"\nfrom = \"0\"\nto = \"1\"\n";
         assert!(Catalog::load_str(bad_re).is_err(), "an invalid regex must fail, not silently never match");
+    }
+
+    /// Coverage wave 1 §4.1: a source names the ports its data lands on with
+    /// the propagator `to` syntax; absent means the result, as before.
+    #[test]
+    fn source_to_parses_and_defaults_to_the_result() {
+        let cat = Catalog::load_str(
+            r#"
+[[sources]]
+kind = "getter"
+selector = "x.Get"
+
+[[sources]]
+kind = "bind"
+selector = "x.Bind"
+to = "1"
+
+[[sources]]
+kind = "both"
+selector = "x.Both"
+to = "receiver, return"
+"#,
+        )
+        .unwrap();
+        let (get, bind, both) = (&cat.sources[0], &cat.sources[1], &cat.sources[2]);
+        assert_eq!(get.to, vec![PortSpec::Return]);
+        assert!(get.seeds_results() && !get.writes_args());
+        assert!(!bind.seeds_results() && bind.writes_args());
+        assert!(bind.seeds_arg(1, 2, true), "`c.Bind(&v)`: v is port 1");
+        assert!(!bind.seeds_arg(0, 2, true), "the receiver is not the bound value");
+        assert!(!bind.seeds_arg(1, 1, true), "a call with no port 1 seeds nothing");
+        assert!(both.seeds_results() && both.seeds_arg(0, 1, true));
+        assert!(!both.seeds_arg(0, 1, false), "`receiver` needs a receiver");
+    }
+
+    #[test]
+    fn source_to_junk_fails_load() {
+        for bad in ["none", "first", "1,nope"] {
+            let src = format!("[[sources]]\nkind = \"k\"\nselector = \"x.F\"\nto = \"{bad}\"\n");
+            let err = match Catalog::load_str(&src) {
+                Err(e) => format!("{e:#}"),
+                Ok(_) => panic!("must fail: to = {bad:?}"),
+            };
+            assert!(err.contains("x.F"), "the message names the rule: {err}");
+        }
+        // `to` anywhere but a source would be silently ignored: refuse it.
+        let sink = "[[sinks]]\nclass = \"sqli\"\nselector = \"x.F\"\nto = \"1\"\n";
+        assert!(Catalog::load_str(sink).is_err(), "`to` on a sink must fail the load");
+    }
+
+    #[test]
+    fn source_to_out_of_range_is_reported() {
+        let cat = Catalog::load_str(
+            "[[sources]]\nkind = \"bind\"\nselector = \"x.Bind\"\nto = \"2\"\n\
+             [[sources]]\nkind = \"ok\"\nselector = \"x.Fits\"\nto = \"1\"\n\
+             [[sources]]\nkind = \"getter\"\nselector = \"x.Get\"\n",
+        )
+        .unwrap();
+        let calls = [("x.Bind", 2u32, true), ("x.Fits", 2, true), ("x.Get", 1, true)];
+        let out = cat.source_to_never_in_range(calls.iter().copied());
+        assert_eq!(out, vec![("bind".to_string(), "x.Bind".to_string(), 2)]);
+    }
+
+    /// Coverage wave 1 §4.2: `arg = "args"` skips the receiver, and
+    /// `sink_ignore_arg_types` skips a port by its vertex type.
+    #[test]
+    fn sink_args_and_ignored_arg_types() {
+        let cat = Catalog::load_str(
+            r#"
+sink_ignore_arg_types = ["context.Context"]
+
+[[sinks]]
+class = "open_redirect"
+selector = "(net/http.Header).Set"
+arg = "args"
+
+[[sinks]]
+class = "sqli"
+selector = "(*database/sql.DB).QueryContext"
+"#,
+        )
+        .unwrap();
+        let hdr = cat.sink_of("(net/http.Header).Set").unwrap();
+        assert_eq!(hdr.arg, SinkArg::Args);
+        assert!(!cat.sink_fires_on(hdr, 0, true, ""), "a tainted map receiver is not the input");
+        assert!(cat.sink_fires_on(hdr, 1, true, "string"));
+        assert!(cat.sink_fires_on(hdr, 0, false, ""), "no receiver: port 0 is an argument");
+
+        let q = cat.sink_of("(*database/sql.DB).QueryContext").unwrap();
+        assert!(!cat.sink_fires_on(q, 1, true, "context.Context"), "ctx never fires");
+        assert!(cat.sink_fires_on(q, 2, true, "string"));
+        assert!(cat.sink_fires_on(q, 1, true, ""), "an untyped port is never filtered");
+
+        // absent = today: every port fires
+        let plain = Catalog::load_str("[[sinks]]\nclass = \"sqli\"\nselector = \"x.Q\"\n").unwrap();
+        assert!(plain.sink_ignore_arg_types.is_empty());
+        assert!(plain.sink_fires_on(plain.sink_of("x.Q").unwrap(), 1, true, "context.Context"));
     }
 
     #[test]
@@ -659,6 +884,25 @@ arg = "3"
             ("os.WriteFile", "file"),
             ("path/filepath.Join", "path"),
             ("(*github.com/redis/go-redis/v9.Client).Set", "storage"),
+            // -- TS (coverage wave 1 §4.5): JSX facts and server-side Node --
+            ("jsx:html", "xss"),
+            ("jsx:attr:srcDoc", "xss"),
+            ("jsx:attr-unsanitized:srcDoc", "xss"),
+            ("jsx:attr-unsanitized:href", "xss"),
+            ("jsx:attr-unsanitized:xlinkHref", "xss"),
+            ("jsx:attr-unsanitized:data", "xss"),
+            ("jsx:attr:href", "open_redirect"),
+            ("jsx:attr:formAction", "open_redirect"),
+            ("node:child_process.exec", "exec"),
+            ("child_process.spawn", "exec"),
+            ("fs.writeFile", "file"),
+            ("node:fs/promises.readFile", "file"),
+            ("mysql2/promise.mysql.createConnection.$ret.query", "sqli"),
+            ("mysql2.createPool.$ret.execute", "sqli"),
+            ("pg.Pool.query", "sqli"),
+            (".$queryRawUnsafe", "sqli"),
+            ("prisma.$executeRawUnsafe", "sqli"),
+            ("next/navigation.redirect", "open_redirect"),
         ] {
             let got = cat.sink_of(fqn);
             assert_eq!(
@@ -680,6 +924,8 @@ arg = "3"
             "google.golang.org/protobuf/proto.Unmarshal",
             "(google.golang.org/protobuf/encoding/protojson.UnmarshalOptions).Unmarshal",
             "(*encoding/json.Decoder).Decode",
+            "(*github.com/gin-gonic/gin.Context).ShouldBindJSON",
+            "(github.com/labstack/echo/v4.Context).Bind",
             "github.com/mitchellh/mapstructure.Decode",
             "github.com/jinzhu/copier.Copy",
             "fmt.Fprintf",
@@ -708,12 +954,35 @@ arg = "3"
 
         for fqn in [
             "(*net/http.Request).FormValue",
+            "(*net/http.Request).PathValue",
             "(net/url.Values).Get",
             "(net/http.Header).Get",
             "github.com/go-chi/chi/v5.URLParam",
             "(*github.com/gin-gonic/gin.Context).ShouldBindJSON",
             "(github.com/labstack/echo/v4.Context).QueryParam",
             "github.com/gorilla/mux.Vars",
+            // coverage wave 1 §4.5
+            "read:net/http.Request.Body",
+            "read:net/http.Request.Form",
+            "read:net/http.Request.PostForm",
+            "read:net/http.Request.MultipartForm",
+            "read:net/http.Request.Header",
+            "read:net/http.Request.Trailer",
+            "read:net/http.Request.URL",
+            "read:net/http.Request.Host",
+            "read:net/http.Request.RequestURI",
+            "(*github.com/segmentio/kafka-go.Reader).ReadMessage",
+            "(*github.com/segmentio/kafka-go.Reader).FetchMessage",
+            "(github.com/IBM/sarama.ConsumerGroupClaim).Messages",
+            "(github.com/Shopify/sarama.PartitionConsumer).Messages",
+            "(github.com/twmb/franz-go/pkg/kgo.Fetches).Records",
+            "(github.com/twmb/franz-go/pkg/kgo.Fetches).RecordIter",
+            "(*github.com/twmb/franz-go/pkg/kgo.FetchesRecordIter).Next",
+            "react-router.useSearchParams",
+            "react-router-dom.useParams",
+            "react-router-dom.useLocation",
+            "next/navigation.useSearchParams",
+            "next/navigation.usePathname",
         ] {
             assert!(cat.source_of(fqn).is_some(), "{fqn:?} must be a source");
             assert!(
@@ -722,11 +991,40 @@ arg = "3"
             );
         }
 
+        // By-ref binds seed the bound argument — `obj any` / `i any` is port 1,
+        // after the receiver (`go doc`: gin `(c *Context) ShouldBindJSON(obj
+        // any) error`, echo `Context.Bind(i any) error`) — and NOT the error.
+        for fqn in [
+            "(*github.com/gin-gonic/gin.Context).ShouldBindJSON",
+            "(*github.com/gin-gonic/gin.Context).ShouldBindBodyWith",
+            "(*github.com/gin-gonic/gin.Context).BindQuery",
+            "(*github.com/gin-gonic/gin.Context).MustBindWith",
+            "(github.com/labstack/echo/v4.Context).Bind",
+        ] {
+            let src = cat.source_of(fqn).unwrap_or_else(|| panic!("{fqn:?} must be a source"));
+            assert_eq!(src.to, vec![PortSpec::Index(1)], "{fqn:?} binds into port 1");
+            assert!(src.seeds_arg(1, 2, true) && !src.seeds_results(), "{fqn:?}");
+        }
+        // ... while the accessors stay result sources
+        for fqn in ["(*github.com/gin-gonic/gin.Context).Query", "read:net/http.Request.Body"] {
+            assert!(cat.source_of(fqn).unwrap().seeds_results(), "{fqn:?}");
+        }
+
+        // E3 (§4.2): a ctx argument never fires, and handle receivers are not data
+        assert_eq!(cat.sink_ignore_arg_types, vec!["context.Context".to_string()]);
+        for fqn in ["(net/http.Header).Set", "(net/http.Header).Add", "(*net/http.Client).Do"] {
+            assert_eq!(cat.sink_of(fqn).map(|s| s.arg), Some(SinkArg::Args), "{fqn:?}");
+        }
+        let q = cat.sink_of("(*database/sql.DB).QueryContext").unwrap();
+        assert!(!cat.sink_fires_on(q, 1, true, "context.Context"));
+        assert!(cat.sink_fires_on(q, 2, true, "string"));
+
         for fqn in [
             "net/url.QueryEscape",
             "html.EscapeString",
             "github.com/google/uuid.Parse",
             "(*github.com/go-playground/validator/v10.Validate).Struct",
+            "(*net/http.Request).Context",
         ] {
             assert!(cat.sanitizer_of(fqn).is_some(), "{fqn:?} must be a sanitizer");
         }
@@ -741,6 +1039,16 @@ arg = "3"
         // fmt.Sprintf builds strings, including error strings: it is an error
         // wrapper, never a terminal operation.
         assert!(cat.sink_of("fmt.Sprintf").is_none(), "fmt.Sprintf is not a sink");
+        // React 19 neutralises `javascript:` in these: an <img src> is no sink,
+        // and only the unsanitized form (React < 19 / unknown) is xss.
+        assert!(cat.sink_of("jsx:attr:src").is_none(), "jsx:attr:src on React 19 is not a sink");
+        assert_eq!(cat.sink_of("jsx:attr:href").map(|s| s.class.as_str()), Some("open_redirect"));
+        // An untyped `.query` is Apollo's `client.query` as often as pg's: never.
+        for fqn in [".query", "client.query", ".execute", ".$queryRaw", "apollo.client.query"] {
+            assert!(cat.sink_of(fqn).is_none(), "{fqn:?} must NOT be a sink");
+        }
+        // The new TS rules stay additive: nothing Go emits matches them.
+        assert!(cat.sink_of("io/fs.ReadFile").is_none());
         assert!(cat.is_error_wrapper("fmt.Sprintf"));
         assert!(cat.is_error_wrapper("fmt.Errorf"));
     }

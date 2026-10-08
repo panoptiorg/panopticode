@@ -102,6 +102,7 @@ go_fixture byrefout-off byrefout --dispatch vta
 # --- e2e-errorleaf: error-typed result ports --------------------------------
 go_fixture errorleaf-on  errorleaf --dispatch vta --error-results
 go_fixture errorleaf-off errorleaf --dispatch vta
+go_fixture errorleaf-strict errorleaf --dispatch vta --error-results --error-results-strict
 
 # --- e2e-miniledger: one CGF per dispatch mode ------------------------------
 for mode in vta cha off; do
@@ -123,6 +124,15 @@ go_fixture libwrites-off libwrites --scope "$LIBWRITES_SCOPE" --library-writebac
 # fixtures/webapp mimics an in-house BFF gateway whose helper lives in an
 # ADAPTER. The stand-in has no real dependency in its package.json, so
 # auto-detection cannot see it and the adapter is named explicitly.
+# coverage wave 1: HTTP routes / accessor reads / client sites, Kafka topic cells.
+# The kafka fixtures are nested modules; httpapi and kafka/* pull their real
+# libraries through the module proxy (or GOFLAGS=-mod=mod with a warm cache).
+go_fixture httpapi           httpapi
+go_fixture httpapi-nosurface httpapi --surface-reads=false
+go_fixture httpclient        httpclient
+go_fixture kafka-producer    kafka/producer
+go_fixture kafka-consumer    kafka/consumer
+
 echo ">> webapp (pc-fe-ts, adapter=$ADAPTER)" >&2
 rm -rf "$DEST/webapp"
 "$FE_TS" build --repo "$STAGE/webapp" --repo-id webapp --out "$DEST/webapp" \
@@ -134,6 +144,12 @@ rm -rf "$DEST/weblib" "$DEST/weblib-off"
 "$FE_TS" build --repo "$STAGE/weblib" --repo-id weblib --out "$DEST/weblib" --quiet
 "$FE_TS" build --repo "$STAGE/weblib" --repo-id weblib --out "$DEST/weblib-off" --quiet \
   --no-library-writeback
+
+echo ">> reactapp, reactapp-off (--no-jsx), nextapp (pc-fe-ts)" >&2
+rm -rf "$DEST/reactapp" "$DEST/reactapp-off" "$DEST/nextapp"
+"$FE_TS" build --repo "$STAGE/reactapp" --repo-id reactapp --out "$DEST/reactapp" --quiet
+"$FE_TS" build --repo "$STAGE/reactapp" --repo-id reactapp --out "$DEST/reactapp-off" --quiet --no-jsx
+"$FE_TS" build --repo "$STAGE/nextapp" --repo-id nextapp --out "$DEST/nextapp" --quiet
 
 echo
 rm -rf "$STAGE"

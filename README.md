@@ -27,8 +27,9 @@ cold at every network hop, losing the context of a threat that travels through
 several services.
 
 To solve that, panopticode can analyse all the repositories together. It
-matches each network call (gRPC or GraphQL today) to its handler in the other
-repository by contract name and treats it as an ordinary function call. A
+matches each network call (gRPC, GraphQL or HTTP today) to its handler in the
+other repository by contract name and treats it as an ordinary function call,
+and joins Kafka producers to consumers through the topic. A
 value's path from a web page, through a BFF, a GraphQL gateway and a gRPC call,
 to a SQL query two services away comes out as one finding with one route:
 
@@ -84,8 +85,8 @@ nothing and calls with no body. [Check it on every run](docs/cli.md#taint).
 
 | language | repository | boundaries it recognises |
 |---|---|---|
-| Go | [panoptife-go](https://github.com/panoptiorg/panoptife-go) | gRPC (`protoc-gen-go-grpc`), GraphQL (`gqlgen`) |
-| TypeScript, Svelte | [panoptife-ts](https://github.com/panoptiorg/panoptife-ts) | SvelteKit routes, GraphQL clients |
+| Go | [panoptife-go](https://github.com/panoptiorg/panoptife-go) | gRPC (`protoc-gen-go-grpc`), GraphQL (`gqlgen`), HTTP (`net/http`, chi, gin, echo, gorilla/mux) servers and clients, Kafka topics (kafka-go, sarama, franz-go) |
+| TypeScript, Svelte, React | [panoptife-ts](https://github.com/panoptiorg/panoptife-ts) | SvelteKit and Next.js routes, GraphQL and HTTP clients |
 | Python | [panoptife-py](https://github.com/panoptiorg/panoptife-py) | planned |
 
 Supporting a new language takes a new frontend and no engine changes. The

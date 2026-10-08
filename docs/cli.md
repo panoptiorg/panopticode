@@ -43,15 +43,34 @@ elided):
 
 ```
 normalize: 1 by-name callsite(s), 0 arg port(s) moved into contract position, 0 dangling name(s), 0 unknown contract(s)
-catalog-fit: 7/70 rules match at least one call site (47 distinct callees) — inert rules follow; ...
+catalog-fit: 7/88 rules match at least one call site (47 distinct callees) — inert rules follow; ...
 catalog-warn: inert rule <section>[<class|kind>] "<selector>" — no call site matches it (zero recall here)
-catalog-fit: 0/22 propagators match at least one call site
+catalog-fit: 0/23 propagators match at least one call site
 opaque: 5 of 75 call sites into a Go module or func value have no loaded body (default leaf: ...) — top modules: ...
 functions=56 summaries=63 contracts_linked=7 remote_leaves=0 chains=15 cache_hits=2 cache_misses=54
 ```
 
 See [catalog.md](catalog.md#diagnostics) for what the `catalog-*` and `opaque`
 lines mean.
+
+A corpus with HTTP routes or synthetic HTTP client sites (coverage wave 1)
+adds, right after the `normalize:` line:
+
+```
+http-link: sites=N linked=K (exact=a suffix=b fanout=f) ambiguous=c unlinked=d routes=R
+http-link: top unlinked templates: POST /{}/api/orders ×3, GET /health ×1, …
+```
+
+`sites` counts client sites, `routes` the HTTP route contracts loaded. A site
+is `exact` when its whole path matched with at least one literal segment in
+agreement, `suffix` when only a suffix did (an unresolved base URL or mount
+prefix; at least two literal segments must agree),
+`fanout` when it was linked to 2 to 4 equally good routes, `ambiguous` when more
+than 4 tied (left unlinked), `unlinked` when nothing matched. The second line
+lists the commonest templates that were not linked, ambiguous ones marked; it
+is where a missing route or an unresolved prefix shows up. Neither line
+appears on a corpus without HTTP facts. With `--no-http-link` the census is
+replaced by `http-link: off (--no-http-link) — N client site(s) left unlinked`.
 
 | flag | default | effect |
 |---|---|---|
@@ -70,9 +89,11 @@ lines mean.
 | `--backward-prune-unviewed` | off | let `--backward-prune` also drop refutations that crossed such a contract. Does nothing on its own |
 | `--pb-getters` | off | treat an out-of-scope protobuf getter as a projection of exactly its field, forward and backward |
 | `--unmodeled <file>` | none | write a JSON report of body-less library calls that tainted data reaches, that could write into another argument, and that no `[[propagators]]` rule covers; the top 15 also go to stderr. stdout is unchanged |
+| `--no-http-link` | off | do not link synthetic HTTP client sites to the loaded HTTP routes. Unlinked sites are inert, so the chains are those of a corpus without HTTP facts. Not a store namespace flag: linking leaves phase-1 summaries unchanged |
 
 All flags are off by default, so a default run is the plain analysis and any
-difference is attributable to the flag you added. `--no-error-leaf`,
+difference is attributable to the flag you added. HTTP linking is part of the
+plain analysis; `--no-http-link` is the one flag that turns something off. `--no-error-leaf`,
 `--pb-getters` and `--unmodeled` change results or add pseudo-sinks, so they
 also select a separate namespace in the `--store` cache.
 
@@ -112,7 +133,11 @@ its first and last route hops:
   location is the last entry of `route.hops`.
 - `route.hops[]` is the full route: `repo, func, file, line, kind, callee,
   field(s), confidence`, with `kind` one of `source call boundary sink heap`.
-- `route.boundaries` counts the contracts the route crosses.
+- `route.boundaries` counts the contracts the route crosses. A `boundary`
+  hop's `callee` is the client's callee name, except across an HTTP route,
+  where it names the route actually entered: `http POST /api/users (gin)`
+  (method, the path as the server wrote it, the framework). A `heap` hop's
+  `callee` names the cell; for a Kafka topic, `kafka topic <name>`.
 - `route.incomplete`, when present, says why the route stops early:
   `depth_cap`, `cycle`, `handler_not_loaded`, `callee_body_missing`,
   `not_reproduced`.
@@ -149,8 +174,12 @@ contracts. For the three repositories of the README quickstart:
 
 ```
 $ panopticode graph-dump --cgf testdata/cgf/webapp --cgf testdata/cgf/federation --cgf testdata/cgf/backend
-packages=11 functions=56 grpc_methods=4 graphql_fields=3 languages={go:8,ts:3}
+packages=11 functions=56 grpc_methods=4 graphql_fields=3 http_routes=0 endpoints={grpc:4,graphql:3,http:2,message:0} languages={go:8,ts:3}
 ```
+
+`endpoints` counts `Endpoint` facts by kind; an endpoint kind this core does not
+know is added as `unknown:N`. Like `taint`, `graph-dump` links HTTP client sites
+first, so its stderr carries the `http-link:` census when there is one.
 
 ## summary
 
@@ -197,6 +226,9 @@ scc_recomputed, reuse_pct}`. `pc-fe` output goes to stderr.
 - `--pg` resolves remote contract views from Postgres (making `--cgf`
   optional) and adds an upstream walk of the persisted call graph to the blast
   radius.
+- HTTP client sites are linked to the loaded routes as in `taint` (there is no
+  `--no-http-link` here). Postgres holds no HTTP routes, so a client of a
+  route outside the loaded CGF stays unlinked.
 
 ## query
 

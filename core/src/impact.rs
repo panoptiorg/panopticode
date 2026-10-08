@@ -176,6 +176,8 @@ pub fn impact(
         prog.packages.extend(p.packages);
     }
     normalize_loaded(&mut prog);
+    // coverage wave 1 §4.3 — as in `taint`: after normalize, before phase 1
+    crate::httplink::link_loaded(&mut prog, true);
 
     let cat_hash = catalog_file_hash(catalog)?;
     let mut store = SummaryStore::open(Some(store_dir), &cat_hash, 1_000_000)?;
@@ -270,11 +272,31 @@ pub fn build_report(
     // GraphQL fields too (doc 36 §3.3): their handler is the resolver and
     // their full_name is the SDL type_field, which is what a boundary hop's
     // `detail` carries.
-    let mut handler_recomputed: HashSet<&str> = HashSet::new();
+    let mut handler_recomputed: HashSet<String> = HashSet::new();
     for p in &prog.packages {
         for c in crate::graph::pkg_contracts(p) {
             if eng.recomputed.contains(&crate::graph::hexid(c.handler_iid)) {
-                handler_recomputed.insert(c.full_name);
+                handler_recomputed.insert(c.full_name.into_owned());
+            }
+        }
+    }
+    // Coverage wave 1 §4.3: a linked HTTP client's boundary hop carries the
+    // CLIENT's template (its `callee_fqn`), which need not be the route's name
+    // (a suffix match, an unknown method). Map it through the link instead.
+    let recomputed_keys: HashSet<String> = crate::graph::contracts(prog)
+        .into_iter()
+        .filter(|c| c.http.is_some() && eng.recomputed.contains(&c.handler))
+        .map(|c| c.key)
+        .collect();
+    if !recomputed_keys.is_empty() {
+        for f in prog.funcs.values() {
+            let Some(flow) = &f.flow else { continue };
+            for cs in &flow.callsites {
+                if cs.http_call.is_some()
+                    && cs.callee_iids.iter().any(|k| recomputed_keys.contains(&crate::graph::hexid(k)))
+                {
+                    handler_recomputed.insert(cs.callee_fqn.clone());
+                }
             }
         }
     }
@@ -287,7 +309,7 @@ pub fn build_report(
                 || c.hops.iter().any(|h| {
                     touches(&h.func)
                         || (h.crossed_service_boundary
-                            && handler_recomputed.contains(h.detail.as_str()))
+                            && handler_recomputed.contains(&h.detail))
                 })
         })
         .collect();

@@ -23,7 +23,7 @@
 # The assertions below are ported, statement for statement, from the cross-repo
 # acceptance battery that drives the three repos together (a Go frontend, a TS
 # frontend and this core). Everything that can be decided from a CGF corpus plus
-# `panopticode` is reproduced here verbatim. Sixteen suites:
+# `panopticode` is reproduced here verbatim. Twenty suites:
 #
 #   e2e          cross-repo unary / server-stream / client-stream chains
 #   e2e-multihop two service boundaries; a boundary inside a local helper
@@ -42,6 +42,14 @@
 #   e2e-recursion self-recursive SCC iteration, witness diamond + dispatch retry
 #   e2e-libwrites library calls that write into an argument (catalog propagators,
 #                 frontend write-back, --unmodeled)
+#   e2e-http      HTTP routes (net/http, chi, gin, echo, gorilla), accessor-level
+#                 sources (r.Body, ShouldBindJSON), the ctx sink filter, and a
+#                 Go client linked to a Go route
+#   e2e-kafka     a Kafka topic as a heap cell joined across two repos; a decoy
+#                 topic pair that must not join
+#   e2e-react     JSX props, an onClick body, and React → Go chains over HTTP
+#   e2e-next      Next.js route files, a server action, a fetch linked to its
+#                 own route
 #
 # WHAT IS DEPRIVED FROM THE FULL BATTERY (and why)
 #
@@ -1022,6 +1030,39 @@ print(f"PASS chains: {len(off)} without the rule / {len(fix)} with it "
       f"(the 2 that remain beyond the recall guards are the pinned port-0 leak)")
 PY
 
+# --error-results-strict on the CURRENT frontend (doc 31 §6a). Doc 31 measured
+# strict at "+79 FP keys removed, 2 real keys lost" and kept it off by default.
+# On today's builder the per-extract registration also builds the result-0 path
+# variants, so strict should close the leak with no recall cost on this fixture.
+# The pinned leak above stays pinned for the DEFAULT emission; this corpus must
+# close it without touching a single recall guard, and strict must change
+# nothing while the core rule is off. Whether the internal 2-key cost is gone is
+# a separate, pending measurement (tech-debt B1r) — this only pins the fixture.
+cgf_differs errorleaf-on errorleaf-strict || suite_fail "e2e-errorleaf (--error-results-strict CGF identical)"
+taint err-strict-off --cgf "$CGF/errorleaf-strict"
+taint err-strict     --cgf "$CGF/errorleaf-strict" --no-error-leaf
+python3 - "$OUT/err-onoff.json" "$OUT/err-fix.json" "$OUT/err-strict-off.json" "$OUT/err-strict.json" <<'PY' || suite_fail "e2e-errorleaf (strict)"
+import json, sys
+onoff, fix, soff, st = (json.load(open(p)) for p in sys.argv[1:5])
+def keys(cs):
+    return {(c["source_fn"].split(".")[-1], c["sink_class"],
+             (c["route"]["hops"][-1].get("callee") or "").split("/")[-1]) for c in cs}
+konoff, kfix, ksoff, kst = keys(onoff), keys(fix), keys(soff), keys(st)
+assert ksoff == konoff, f"strict without --no-error-leaf must be inert: lost {sorted(konoff - ksoff)}, gained {sorted(ksoff - konoff)}"
+print("PASS: strict is inert while the core rule is off")
+assert not (kst - konoff), f"strict + rule must only REMOVE, it added {sorted(kst - konoff)}"
+assert kfix >= kst, f"strict must remove everything the mask removes: {sorted(kst - kfix)}"
+handlers = lambda ks, h: {k for k in ks if k[0] == h}
+assert not handlers(kst, "HandleErrOnly"), "strict: the 2-result leaf (json.Marshal) must be closed"
+for h in ("HandleValueSurvives", "HandleWrapped", "HandleHelperWraps"):
+    assert handlers(kst, h), f"strict: recall guard {h} must survive"
+tb = {k[2] for k in handlers(kst, "HandleTieBreak")}
+assert any("MaskDB" in s for s in tb), "strict: HandleTieBreak lost its TRUE value sink (MaskDB)"
+assert not any("NoteDB" in s for s in tb), f"strict: the err.Error() sink must be closed, got {sorted(tb)}"
+print(f"PASS: strict closes the port-0 leak (HandleErrOnly, HandleTieBreak's err.Error()) "
+      f"and keeps every recall guard — {len(fix)} chains with the mask, {len(st)} with strict")
+PY
+
 # ===========================================================================
 echo
 echo "########## e2e-miniledger — dispatch-induced SCCs and the SCC fixpoint"
@@ -1387,6 +1428,148 @@ ts = load("wl")
 assert srcs(ts) == TS, f"TS with the shipped rules: want {TS}, got {srcs(ts)}"
 assert not load("wl-norules") and not load("wl-offwb"), "TS: rules and write-back are both required"
 print(f"PASS: e2e-libwrites TS — all {len(TS)} built-ins; cleanPush / untypedPush silent; 0 without rules or write-back")
+PY
+
+# ===========================================================================
+echo
+echo "########## e2e-http — HTTP routes, accessor sources, the client→route join"
+# ===========================================================================
+cgf_differs httpapi httpapi-nosurface || suite_fail "e2e-http (inert --surface-reads)"
+"$PC" graph-dump --cgf "$CGF/httpapi" > "$OUT/http-dump.txt"
+taint http-api        --cgf "$CGF/httpapi"
+taint http-nosurface  --cgf "$CGF/httpapi-nosurface"
+taint http-client     --cgf "$CGF/httpclient" --cgf "$CGF/httpapi"
+taint http-client-off --cgf "$CGF/httpclient" --cgf "$CGF/httpapi" --no-http-link
+grep -E '^http-link' "$OUT/http-client.err"
+python3 - "$OUT" <<'PY' || suite_fail e2e-http
+import json, os, re, sys
+OUT = sys.argv[1]
+load = lambda n: json.load(open(os.path.join(OUT, n + ".json")))
+def sqli_from(chains, src):
+    return [c for c in chains if src in c["source_fn"] and c["sink_class"] == "sqli"]
+def boundaries(c):
+    return [h.get("callee", "") for h in c["route"]["hops"] if h["kind"] == "boundary"]
+
+api = load("http-api")
+# one handler per framework reaches SQL from an accessor-level source
+for src, why in [
+    ("stdapi.Server).createUser", "E2: json.NewDecoder(r.Body).Decode(&req) — a field read is a source"),
+    ("stdapi.Server).getUser",    "net/http 1.22 r.PathValue"),
+    ("ginapi.itemHandler).create", "E1: c.ShouldBindJSON(&req) seeds req, not err"),
+    ("chiapi.Handler).CreateOrder", "chi, router passed into registerX(r)"),
+    ("gorillaapi.notes).create",  "gorilla subrouter"),
+    ("echoapi.New$1",             "echo"),
+]:
+    assert sqli_from(api, src), f"no sqli chain from {src} ({why}); have {[c['source_fn'] for c in api]}"
+assert not sqli_from(api, "stdapi.Server).stats"), "E3: a ctx-only QueryContext with a constant query must not fire"
+print(f"PASS: e2e-http in-repo — {len(api)} chains; E1 bind, E2 body read, E3 ctx filter all hold")
+
+nos = load("http-nosurface")
+assert not sqli_from(nos, "stdapi.Server).createUser"), "E2 chain must vanish with --surface-reads=false"
+print("PASS: e2e-http — the r.Body chain exists only with surface reads")
+
+dump = open(os.path.join(OUT, "http-dump.txt")).read()
+m = re.search(r"http_routes=(\d+)", dump)
+assert m and int(m.group(1)) == 19, f"http_routes in graph-dump: {m and m.group(0)}"
+print("PASS: e2e-http — 19 routes over net/http, chi, gin, echo, gorilla")
+
+cl = load("http-client")
+for route in ("http POST /api/users (net/http)", "http GET /api/users/{id} (net/http)"):
+    hit = [c for c in cl if c["source_repo"].endswith("httpclient") and c["sink_class"] == "sqli"
+           and any(route in b for b in boundaries(c))]
+    assert hit, f"no httpclient → {route} → sqli chain"
+    assert hit[0]["route"].get("incomplete") is None, hit[0]["route"]
+off = load("http-client-off")
+assert not [c for c in off if any(b.startswith("http ") for b in boundaries(c))], "--no-http-link must not cross HTTP"
+err = open(os.path.join(OUT, "http-client.err")).read()
+assert re.search(r"http-link: sites=4 linked=2 ", err), "census"
+print("PASS: e2e-http join — two cross-service chains through HTTP routes; none with --no-http-link")
+PY
+
+# ===========================================================================
+echo
+echo "########## e2e-kafka — a topic is a heap cell joined across repos"
+# ===========================================================================
+taint kafka      --cgf "$CGF/kafka-producer" --cgf "$CGF/kafka-consumer"
+taint kafka-prod --cgf "$CGF/kafka-producer"
+grep -E '^heap-cells' "$OUT/kafka.err"
+python3 - "$OUT" <<'PY' || suite_fail e2e-kafka
+import json, os, sys
+OUT = sys.argv[1]
+load = lambda n: json.load(open(os.path.join(OUT, n + ".json")))
+def cells(c):
+    return [h.get("callee", "") + h.get("label", "") for h in c["route"]["hops"] if h["kind"] == "heap"]
+ch = load("kafka")
+for src in ("producer.PlaceOrder", "producer.Enqueue"):
+    hit = [c for c in ch if c["source_fn"].endswith(src) and c["sink_class"] == "sqli"
+           and any("kafka topic orders" in x for x in cells(c))]
+    assert hit, f"no {src} → kafka topic orders → sqli chain; have {[(c['source_fn'], cells(c)) for c in ch]}"
+assert not [c for c in ch if any("audit" in x for x in cells(c))], "decoy topics audit-events / audit-log must not join"
+assert not [c for c in ch if c["source_fn"].endswith("producer.Audit") and c["sink_class"] == "sqli"]
+assert not [c for c in load("kafka-prod") if c["sink_class"] == "sqli"], "no consumer loaded ⇒ no sqli"
+print(f"PASS: e2e-kafka — PlaceOrder and Enqueue reach the consumer's SQL through 'orders'; the decoy pair stays apart")
+PY
+
+# ===========================================================================
+echo
+echo "########## e2e-react — JSX, components, and a React → Go chain over HTTP"
+# ===========================================================================
+cgf_differs reactapp reactapp-off || suite_fail "e2e-react (inert JSX flags)"
+taint react     --cgf "$CGF/reactapp"
+taint react-off --cgf "$CGF/reactapp-off"
+taint react-go  --cgf "$CGF/reactapp" --cgf "$CGF/httpapi"
+python3 - "$OUT" <<'PY' || suite_fail e2e-react
+import json, os, sys
+OUT = sys.argv[1]
+load = lambda n: json.load(open(os.path.join(OUT, n + ".json")))
+callees = lambda c: [h.get("callee", "") for h in c["route"]["hops"]]
+r = load("react")
+def one(pred, what):
+    hit = [c for c in r if pred(c)]
+    assert hit, f"{what}; have {[(c['source_fn'], c['sink_class'], callees(c)) for c in r]}"
+    return hit[0]
+one(lambda c: c["sink_class"] == "xss" and "SearchPage" in c["source_fn"]
+    and any("Results" in x for x in callees(c)) and callees(c)[-1] == "jsx:html",
+    "useSearchParams → props through Results → dangerouslySetInnerHTML")
+one(lambda c: c["sink_class"] == "open_redirect" and any(x == "assign:location.href" for x in callees(c)),
+    "onClick handler body → location.href")
+assert not [c for c in load("react-off") if c["sink_class"] == "xss"], "with JSX off nothing reaches jsx:html"
+print("PASS: e2e-react — prop drilling into dangerouslySetInnerHTML; an onClick body is analysed; nothing with JSX off")
+
+rg = load("react-go")
+for page, route in (("UserPage", "http GET /api/users/{id} (net/http)"), ("SignupPage", "http POST /api/users (net/http)")):
+    hit = [c for c in rg if page in c["source_fn"] and c["sink_class"] == "sqli"
+           and any(route in h.get("callee", "") for h in c["route"]["hops"] if h["kind"] == "boundary")]
+    assert hit, f"no {page} → {route} → Go sqli chain"
+    hops = hit[0]["route"]["hops"]
+    assert hit[0]["route"].get("incomplete") is None and hops[-1]["kind"] == "sink", hops
+    assert {h["repo"].split("/")[-1] for h in hops} >= {"reactapp", "httpapi"}, hops
+print("PASS: e2e-react → Go — two cross-language chains from React hooks to a Go SQL sink, routes complete")
+PY
+
+# ===========================================================================
+echo
+echo "########## e2e-next — Next.js route files, server actions, self-linking"
+# ===========================================================================
+"$PC" graph-dump --cgf "$CGF/nextapp" > "$OUT/next-dump.txt"
+taint next --cgf "$CGF/nextapp"
+grep -E '^http-link' "$OUT/next.err"
+python3 - "$OUT" <<'PY' || suite_fail e2e-next
+import json, os, re, sys
+OUT = sys.argv[1]
+ch = json.load(open(os.path.join(OUT, "next.json")))
+callees = lambda c: [h.get("callee", "") for h in c["route"]["hops"]]
+def has(src, cls, what):
+    hit = [c for c in ch if src in c["source_fn"] and c["sink_class"] == cls]
+    assert hit, f"{what}; have {[(c['source_fn'], c['sink_class']) for c in ch]}"
+has("api/run/route.ts:GET", "exec", "route handler: request.nextUrl.searchParams → child_process.exec")
+has("api/users/[id]/route.ts:GET", "sqli", "route handler: awaited params.id → pg query")
+has("app/actions.ts:renameUser", "sqli", "server action: every param is untrusted → pg query")
+err = open(os.path.join(OUT, "next.err")).read()
+assert re.search(r"http-link: sites=1 linked=1 \(exact=1", err), "client fetch links to its own route"
+dump = open(os.path.join(OUT, "next-dump.txt")).read()
+assert re.search(r"http_routes=6\b", dump), re.search(r"http_routes=\d+", dump)
+print("PASS: e2e-next — route.ts, a server action and a Pages-era app in one repo; the client fetch links to its own route")
 PY
 
 # ===========================================================================

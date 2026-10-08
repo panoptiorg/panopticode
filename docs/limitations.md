@@ -58,8 +58,30 @@ leaf. Consequences:
   helpers.
 - Client-side state stores and dynamically mounted route fragments in
   frontend frameworks.
-- Flows through HTTP/REST, connect, twirp, message queues, caches, cron, or a
-  database round trip.
+- Flows through connect, twirp, message queues other than Kafka topic cells,
+  caches, cron, or a database round trip.
+- HTTP is request-direction only: client data reaches the route's handler,
+  but the response does not flow back into the client's variables (the
+  synthetic client site has no result port).
+- An HTTP client site links only to routes in the same run, by method and
+  canonical path. A client whose base URL or a server whose mount prefix the
+  frontend could not resolve is matched by suffix, which needs two agreeing
+  literal segments: `${API}/users` alone links to nothing. More than four
+  equally good routes leave a site unlinked (`ambiguous`). A client path that
+  really starts with a dynamic segment (`/${tenant}/users`) reads as an unknown
+  base. An exact match needs one agreeing literal segment, so a call to `/`
+  never links. The `http-link:` census line lists what stayed unlinked.
+- Heap cells are joined before contracts are composed, so a chain that goes
+  producer → Kafka topic → consumer → a gRPC or HTTP call → a sink in that
+  call's handler is not reported from the producer's side. The same flow
+  rooted at the consumer's own catalog source (a consumed message is a source)
+  is still reported. This predates HTTP: it holds for gRPC too.
+- A `message` event's payload (`window.postMessage`) is not a source: the
+  TypeScript frontend has no name for that read.
+- Kafka topic cells (`pc-fe --topic-cells`) join a producer and a consumer only
+  when both are loaded in one run and the topic name resolves to the same
+  string (a constant, or the same `os.Getenv` variable name). They are joined
+  by the in-memory heap pass, which `impact` does not run.
 
 ## False positives
 
@@ -73,7 +95,21 @@ leaf. Consequences:
   it creates a false chain.
 - Value-destroying transforms (hashing, bucketing) are not modelled.
 - Heap cells are shared by every object of a type, so unrelated requests can be
-  joined.
+  joined. A Kafka topic cell joins every producer of the topic to every
+  consumer.
+- An HTTP route shared by two loaded services (`GET /health`) or a suffix
+  match against several routes links the client to all of them, each hop with
+  `dispatch_confidence` 1/n.
+- Canonicalisation drops the scheme and host, so a call to a third-party API
+  (`https://api.github.com/users/x`) links to a loaded route with the same
+  path shape (`GET /users/{id}`) as if it were a call to that service.
+- A linked handler's request parameter is tainted whole. For gin and echo that
+  parameter is the framework context, so values middleware stored in it (read
+  back with `c.Get`) carry the client's taint too.
+- When an HTTP route has more than one request parameter, the route rebuilt
+  for a chain can take a heap-cell crossing although a direct path through
+  another request parameter also exists. The chain is real; its route is not
+  the shortest one.
 - Virtual dispatch over-approximation.
 
 ## Precision limits
@@ -92,8 +128,9 @@ leaf. Consequences:
 ## Backward confirmation
 
 `--backward` leaves chains `undecided` across recursion, stream ports, heap
-cells and contract views loaded from Postgres. Streaming gRPC and GraphQL
-contracts also stay `undecided` unless `--backward-unview` is given.
+cells (including Kafka topic cells) and contract views loaded from Postgres.
+Streaming gRPC, GraphQL and HTTP route contracts also stay `undecided` unless
+`--backward-unview` is given.
 `--backward-prune` drops only refuted chains and, by default, keeps any
 refutation that crossed such a contract; `--backward-prune-unviewed` removes
 that guard. A wrong refutation deletes a real finding, so prune with care.
@@ -106,6 +143,10 @@ that guard. A wrong refutation deletes a real finding, so prune with care.
 - `impact` re-extracts the whole working tree, not only changed files.
 - Postgres holds the call graph and contract views, not dataflow; the `query`
   commands answer call-reachability questions only.
+- HTTP routes are not persisted: no contract row, node, edge, `invokes` row or
+  view goes to Postgres for them, so `--pg` leaves never carry an HTTP view and
+  the persisted graph has no edge from an HTTP client to its handler. Topic
+  cells are phase-2 and in memory only, like every heap cell.
 - The core's cost is dominated by the frontends: whole-program call-graph
   construction in `pc-fe` is the slowest step. On the fixtures in this repo the
   full e2e suite runs in about 3 seconds.

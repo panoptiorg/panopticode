@@ -115,6 +115,13 @@ enum Cmd {
         /// chains printed on stdout are unchanged.
         #[arg(long)]
         unmodeled: Option<PathBuf>,
+        /// Do not link synthetic HTTP client sites to the loaded HTTP routes
+        /// (coverage wave 1). Linked, a client request whose method and path
+        /// match a route becomes a cross-service call into its handler, like a
+        /// gRPC method; unlinked, the site is inert and the chains are exactly
+        /// those of a corpus without HTTP facts.
+        #[arg(long = "no-http-link")]
+        no_http_link: bool,
     },
     /// Dump the loaded function/contract counts.
     GraphDump {
@@ -242,6 +249,7 @@ pub fn run() -> Result<()> {
             backward_prune_unviewed,
             pb_getters,
             unmodeled,
+            no_http_link,
         } => taint(
             &cgf,
             &catalog,
@@ -258,6 +266,7 @@ pub fn run() -> Result<()> {
                 backward_unview,
                 backward_prune_unviewed,
                 pb_getters,
+                http_link: !no_http_link,
             },
             unmodeled.as_deref(),
         ),
@@ -315,7 +324,7 @@ fn extract(fe: &str, repo: &str, scope: Option<&str>, mode: &str, out: &PathBuf)
     Ok(())
 }
 
-fn load(cgf: &[PathBuf]) -> Result<Program> {
+fn load(cgf: &[PathBuf], http_link: bool) -> Result<Program> {
     let mut prog = Program {
         funcs: Default::default(),
         repo_of: Default::default(),
@@ -330,6 +339,10 @@ fn load(cgf: &[PathBuf]) -> Result<Program> {
     // doc 36 §3.1. Runs on the MERGED program, not per load_dir: a by-name
     // callsite in one --cgf dir routinely names a contract defined in another.
     normalize_loaded(&mut prog);
+    // coverage wave 1 §4.3: same reason — a client in one dir calls a route
+    // defined in another. Before any analysis: phase 1 is identical either way
+    // (httplink.rs), the link acts in phase 2 through the contract view.
+    crate::httplink::link_loaded(&mut prog, http_link);
     Ok(prog)
 }
 
@@ -342,6 +355,8 @@ struct TaintOpts {
     backward_unview: bool,
     backward_prune_unviewed: bool,
     pb_getters: bool,
+    /// `!--no-http-link`
+    http_link: bool,
 }
 
 fn taint(
@@ -358,7 +373,7 @@ fn taint(
     unmodeled: Option<&std::path::Path>,
 ) -> Result<()> {
     let cat = Catalog::load(catalog).with_context(|| format!("load catalog {catalog:?}"))?;
-    let prog = load(cgf)?;
+    let prog = load(cgf, opts.http_link)?;
     // Loud failures (measurements 2026-09-01, 00-report §4): a catalog rule
     // that matches nothing and a callee with no body both used to produce
     // "no finding" indistinguishable from "nothing there". stderr, once per
@@ -528,11 +543,14 @@ fn catalog_fit_report(cat: &Catalog, prog: &Program) {
     // (fqn, argc) — the arg-range check needs the width of the call, and
     // distinct pairs are enough for "was the index EVER in range".
     let mut calls: std::collections::HashSet<(&str, u32)> = std::collections::HashSet::new();
+    // … and whether port 0 is a receiver, for a by-ref source's `to` ports
+    let mut shapes: std::collections::HashSet<(&str, u32, bool)> = std::collections::HashSet::new();
     for f in prog.funcs.values() {
         if let Some(fl) = &f.flow {
             for cs in &fl.callsites {
                 fqns.insert(cs.callee_fqn.as_str());
                 calls.insert((cs.callee_fqn.as_str(), cs.argc));
+                shapes.insert((cs.callee_fqn.as_str(), cs.argc, cs.arg0_is_receiver));
             }
         }
     }
@@ -554,6 +572,14 @@ fn catalog_fit_report(cat: &Catalog, prog: &Program) {
         eprintln!(
             "catalog-warn: sink rule [{class}] {label:?} arg {arg} never in range \
              (max argc seen {max_argc}) — it can never fire"
+        );
+    }
+    // A by-ref source whose `to` ports no matched call has (coverage wave 1
+    // §4.1): it can never seed what it claims to.
+    for (kind, label, max_argc) in cat.source_to_never_in_range(shapes.iter().copied()) {
+        eprintln!(
+            "catalog-warn: source rule [{kind}] {label:?} `to` port never in range \
+             (max argc seen {max_argc}) — it can never seed it"
         );
     }
     if !cat.propagators.is_empty() {
@@ -634,7 +660,7 @@ fn module_of(fqn: &str) -> Option<String> {
 
 fn summary_dbg(cgf: &[PathBuf], catalog: &PathBuf, fnpat: &str) -> Result<()> {
     let cat = Catalog::load(catalog)?;
-    let prog = load(cgf)?;
+    let prog = load(cgf, true)?;
     let mut eng = Engine::new(&prog, &cat);
     eng.run();
     // same phase-2 order taint uses, so `summary --fn` shows what the report
@@ -689,24 +715,47 @@ fn summary_dbg(cgf: &[PathBuf], catalog: &PathBuf, fnpat: &str) -> Result<()> {
 }
 
 fn graph_dump(cgf: &[PathBuf]) -> Result<()> {
-    let prog = load(cgf)?;
+    use crate::proto::cgf::endpoint::Kind;
+    let prog = load(cgf, true)?;
     let mut grpc = 0;
     let mut gql = 0;
+    let mut http = 0;
+    // Endpoint.kind census (coverage wave 1 §1: HTTP routes and MESSAGE
+    // consumers joined gRPC and GraphQL). An undecodable kind is a newer
+    // frontend's — counted, never coerced into a known one.
+    let mut ep = [0usize; 5]; // grpc, graphql, http, message, unknown
     // packages per CgfPackage.language — the one place a mixed-language corpus
     // is visible at a glance (doc 36 §3.4). "" (pre-doc-36 CGF) reads as go.
     let mut langs: std::collections::BTreeMap<&str, usize> = Default::default();
     for p in &prog.packages {
         grpc += p.grpc_methods.len();
         gql += p.graphql_fields.len();
+        http += p.http_routes.len();
+        for e in &p.endpoints {
+            ep[match Kind::try_from(e.kind) {
+                Ok(Kind::Grpc) => 0,
+                Ok(Kind::Graphql) => 1,
+                Ok(Kind::Http) => 2,
+                Ok(Kind::Message) => 3,
+                Err(_) => 4,
+            }] += 1;
+        }
         let l = if p.language.is_empty() { "go" } else { p.language.as_str() };
         *langs.entry(l).or_default() += 1;
     }
     println!(
-        "packages={} functions={} grpc_methods={} graphql_fields={} languages={{{}}}",
+        "packages={} functions={} grpc_methods={} graphql_fields={} http_routes={} \
+         endpoints={{grpc:{},graphql:{},http:{},message:{}{}}} languages={{{}}}",
         prog.packages.len(),
         prog.funcs.len(),
         grpc,
         gql,
+        http,
+        ep[0],
+        ep[1],
+        ep[2],
+        ep[3],
+        if ep[4] > 0 { format!(",unknown:{}", ep[4]) } else { String::new() },
         langs
             .iter()
             .map(|(l, n)| format!("{l}:{n}"))

@@ -149,6 +149,10 @@ fn is_false(b: &bool) -> bool {
 ///                                  Param(p) not in args     DROPPED (ctx, obj)
 ///                                  Receiver, ByRef*         DROPPED
 ///                                  Source/Global/Stream*    itself
+///   HTTP {request_params}          Param(p), p in params    Param(0) (one port)
+///                                  any other Param,
+///                                  Receiver, ByRef*         DROPPED
+///                                  Source/Global/Stream*    itself
 /// ```
 ///
 /// Note the one asymmetry with `ContractShape::is_identity`: `Graphql(vec![])`
@@ -176,6 +180,13 @@ fn view_slot(s: &Slot, shape: &ContractShape) -> Option<Slot> {
             Slot::Receiver | Slot::ByRefParam(_) | Slot::ByRefReceiver => None,
             _ => Some(s.clone()),
         },
+        // `compose::contract_view_http`: every request param is the client's
+        // one port; any other positional slot is dropped.
+        ContractShape::Http { request_params } => match s {
+            Slot::Param(p) if request_params.contains(p) => Some(Slot::Param(0)),
+            Slot::Param(_) | Slot::Receiver | Slot::ByRefParam(_) | Slot::ByRefReceiver => None,
+            _ => Some(s.clone()),
+        },
     }
 }
 
@@ -195,6 +206,8 @@ fn view_slot(s: &Slot, shape: &ContractShape) -> Option<Slot> {
 ///                   Return(n>0)            -> DROPPED (the resolver's error)
 ///                   ByRefParam/ByRefReceiver -> DROPPED
 ///                   everything else        -> itself
+///   HTTP            Return(_)/ByRef*/Field -> DROPPED (request direction only)
+///                   everything else        -> itself
 /// ```
 ///
 /// `None` again means the demand is inexpressible on the other side of the
@@ -213,6 +226,11 @@ fn unview_out_slot(s: &Slot, shape: &ContractShape) -> Option<Slot> {
         ContractShape::Graphql(_) => match s {
             Slot::Return(0) => Some(Slot::Return(0)),
             Slot::Return(_) | Slot::ByRefParam(_) | Slot::ByRefReceiver => None,
+            _ => Some(s.clone()),
+        },
+        // request-direction only: the view publishes no return or write-back
+        ContractShape::Http { .. } => match s {
+            Slot::Return(_) | Slot::ByRefParam(_) | Slot::ByRefReceiver | Slot::Field(_) => None,
             _ => Some(s.clone()),
         },
     }
@@ -384,6 +402,12 @@ struct St {
     /// this state was reached through a contract whose view had to be
     /// un-remapped (`--backward-unview`); without the flag it would not exist
     uv: bool,
+    /// the state sits on an arg port as an INPUT to that port's call (a sink
+    /// start, a demand landed through the call's summary, propagator or
+    /// default leaf), not as the value the call wrote back through it. A
+    /// by-ref source seed is only ever the latter in `propagate`, so only the
+    /// latter may meet it here (coverage wave 1 §4.1).
+    into_call: bool,
 }
 
 /// A demand on a callee-side in-slot (or, after `land`, a caller-side port).
@@ -729,13 +753,20 @@ impl<'a, 'e> Back<'a, 'e> {
             if term.map_or(true, |t| *iid == t.fn_iid && cs_idx == t.callsite) {
                 if let Some(sink) = cat.sink_of(&cs.callee_fqn) {
                     if sink.class == class {
-                        let ports: Vec<u32> = match sink.arg {
-                            crate::catalog::SinkArg::Any => (0..cs.argc).collect(),
+                        // The same per-port predicate `propagate` fired on
+                        // (`arg`, the receiver, `sink_ignore_arg_types`), so a
+                        // start exists exactly where a forward hit could.
+                        let mut ports: Vec<u32> = match sink.arg {
                             crate::catalog::SinkArg::Index(i) => vec![i],
+                            _ => (0..cs.argc).collect(),
                         };
+                        ports.retain(|&p| sink.arg.admits(p, cs.arg0_is_receiver));
                         for p in ports {
                             for &v in b.arg_ports.get(&(cs_idx, p)).into_iter().flatten() {
-                                starts.push(St { v, resid: Path::default(), exact: true, uv: false });
+                                if !cat.sink_fires_on(sink, p, cs.arg0_is_receiver, &b.verts[&v].r#type) {
+                                    continue;
+                                }
+                                starts.push(St { v, resid: Path::default(), exact: true, uv: false, into_call: true });
                             }
                         }
                     }
@@ -887,7 +918,13 @@ impl<'a, 'e> Back<'a, 'e> {
                     // uv starts false inside a sub-frame: the memo key does
                     // not carry it, and whether a remap was crossed on the way
                     // in is the CALLER's fact, OR-ed back in at `land_viewed`.
-                    starts.push(St { v, resid: residual_of(&out.path, &vp), exact: out.exact && ex, uv: false });
+                    starts.push(St {
+                        v,
+                        resid: residual_of(&out.path, &vp),
+                        exact: out.exact && ex,
+                        uv: false,
+                        into_call: false,
+                    });
                 }
                 self.walk(&b, starts, depth, &mut fo);
                 FlowSum {
@@ -980,7 +1017,7 @@ impl<'a, 'e> Back<'a, 'e> {
         for &v in b.arg_ports.get(&(cs_idx, port)).into_iter().flatten() {
             let vp = Path::from_vertex(b.verts[&v]);
             let Some(ex) = comparable(&vp, path) else { continue };
-            out.push(St { v, resid: residual_of(path, &vp), exact: exact && ex, uv });
+            out.push(St { v, resid: residual_of(path, &vp), exact: exact && ex, uv, into_call: true });
         }
     }
 
@@ -1090,7 +1127,7 @@ impl<'a, 'e> Back<'a, 'e> {
             for spec in &rule.from {
                 for port in spec.ports(cs.argc, recv) {
                     for &v in b.arg_ports.get(&(cs_idx, port)).into_iter().flatten() {
-                        states.push(St { v, resid: Path::default(), exact: false, uv: out.uv });
+                        states.push(St { v, resid: Path::default(), exact: false, uv: out.uv, into_call: true });
                     }
                 }
             }
@@ -1119,7 +1156,7 @@ impl<'a, 'e> Back<'a, 'e> {
         fo.widened = true;
         for port in 0..cs.argc {
             for &v in b.arg_ports.get(&(cs_idx, port)).into_iter().flatten() {
-                states.push(St { v, resid: Path::default(), exact: false, uv: out.uv });
+                states.push(St { v, resid: Path::default(), exact: false, uv: out.uv, into_call: true });
             }
         }
     }
@@ -1130,11 +1167,11 @@ impl<'a, 'e> Back<'a, 'e> {
     fn walk(&self, b: &BCtx<'e>, starts: Vec<St>, depth: usize, fo: &mut FrameOut) {
         // Keyed on the FULL residual (ids and names): two name-only residuals
         // share the NAME_ID sentinel and differ only by name.
-        let mut seen: HashSet<(u32, Path, bool, bool)> = HashSet::new();
+        let mut seen: HashSet<(u32, Path, bool, bool, bool)> = HashSet::new();
         let mut work = starts;
         let tr = self.engine.trace.filter(|t| t.on_ev("back-step", &b.fqn));
         while let Some(st) = work.pop() {
-            if !seen.insert((st.v, st.resid.clone(), st.exact, st.uv)) {
+            if !seen.insert((st.v, st.resid.clone(), st.exact, st.uv, st.into_call)) {
                 continue;
             }
             let Some(vx) = b.verts.get(&st.v).copied() else { continue };
@@ -1176,7 +1213,22 @@ impl<'a, 'e> Back<'a, 'e> {
                 | cgf::VertexKind::OutReceiverByref
                 | cgf::VertexKind::OutField => {
                     for &u in b.radj.get(&st.v).into_iter().flatten() {
-                        work.push(St { v: u, resid: resid.clone(), exact, uv });
+                        // an arg port reached backwards along its own out-edge is
+                        // the value its call wrote back, not an input to it
+                        work.push(St { v: u, resid: resid.clone(), exact, uv, into_call: false });
+                    }
+                    // Coverage wave 1 §4.1 (E1): a by-ref catalog source seeds
+                    // this arg port itself (`c.ShouldBindJSON(&req)`), so a
+                    // demand that arrives along its write-back edge has met a
+                    // forward seed — exactly like a source getter's result
+                    // port below. One that arrives as an input to the call
+                    // (the bind's `err`, through the default leaf) has not:
+                    // `propagate` never feeds the seed into its own call.
+                    if kind == cgf::VertexKind::CallArgPort
+                        && !st.into_call
+                        && b.source_seeds.contains(&st.v)
+                    {
+                        fo.seeds.push((declared.concat(&resid), exact, uv));
                     }
                     // W1a: an arg port with out-edges is a by-ref SOURCE — the
                     // callee wrote through it. Demand the callee's by-ref out.
@@ -1439,6 +1491,83 @@ mod tests {
         assert_eq!(unview_out_slot(&Slot::Return(1), &shape), None); // the error
         assert_eq!(unview_out_slot(&Slot::ByRefReceiver, &shape), None);
         assert_eq!(unview_out_slot(&Slot::StreamOut, &shape), Some(Slot::StreamOut));
+    }
+
+    /// Coverage wave 1 §4.1: `err := c.ShouldBindJSON(&req); db.Exec(req);
+    /// db.Exec(err)` under a by-ref source. Forward, the seed leaves only along
+    /// the `&req` write-back, so only the `req` sink is a chain. Backward must
+    /// agree: the `err` sink reaches the seeded port as an INPUT of the bind
+    /// (through the default leaf), which is not the seed.
+    #[test]
+    fn a_bind_seed_is_met_only_along_its_write_back() {
+        use crate::ifds::cache_tests::{edge, vertex};
+        const BIND: &str = "(*github.com/gin-gonic/gin.Context).ShouldBindJSON";
+        let call = |id: u32, fqn: &str, argc: u32, resultc: u32, recv: bool| cgf::CallSite {
+            id,
+            callee_fqn: fqn.into(),
+            argc,
+            resultc,
+            arg0_is_receiver: recv,
+            ..Default::default()
+        };
+        let f = cgf::Function {
+            id: Some(cgf::Ident { iid: vec![0x61; 32], bid: vec![0x61; 32] }),
+            fqn: "app.Create".into(),
+            has_body: true,
+            flow: Some(cgf::LocalFlow {
+                vertices: vec![
+                    vertex(1, cgf::VertexKind::CallArgPort, 0, 0),    // c (receiver)
+                    vertex(2, cgf::VertexKind::CallArgPort, 1, 0),    // &req
+                    vertex(3, cgf::VertexKind::CallResultPort, 0, 0), // err
+                    vertex(4, cgf::VertexKind::CallArgPort, 0, 1),    // db.Exec(req)
+                    vertex(5, cgf::VertexKind::CallArgPort, 0, 2),    // db.Exec(err)
+                ],
+                edges: vec![edge(2, 4), edge(3, 5)],
+                callsites: vec![call(0, BIND, 2, 1, true), call(1, "db.Exec", 1, 0, false), call(2, "db.Exec", 1, 0, false)],
+            }),
+            ..Default::default()
+        };
+        let h = hexid(&[0x61; 32]);
+        let prog = Program {
+            funcs: [(h.clone(), f)].into_iter().collect(),
+            repo_of: [(h.clone(), "t".to_string())].into_iter().collect(),
+            packages: Vec::new(),
+        };
+        let cat = Catalog::load_str(&format!(
+            "[[sources]]\nkind = \"b\"\nselector = \"{BIND}\"\nto = \"1\"\n{CAT}"
+        ))
+        .unwrap();
+        let mut eng = Engine::new(&prog, &cat);
+        eng.run();
+        let sites: Vec<usize> = eng.summaries[&h].sink_hits.iter().map(|x| x.callsite).collect();
+        assert_eq!(sites, vec![1], "forward: only the req sink");
+        set_opts(BackOpts::default());
+        let handlers = crate::witness::ContractHandlers::new();
+        let back = Back::new(&eng, &handlers);
+        let req = back.top_frame(&h, "sqli", 1, None);
+        assert!(!req.seeds.is_empty(), "the req sink meets the seed along the write-back");
+        let err = back.top_frame(&h, "sqli", 2, None);
+        assert!(err.seeds.is_empty() && !err.incomplete, "the err sink must refute: {err:?}");
+    }
+
+    /// Coverage wave 1 §4.4: every request param is the client's port 0;
+    /// the response writer and every return are not client-addressable.
+    #[test]
+    fn http_inverse_folds_request_params_and_drops_the_response() {
+        let shape = ContractShape::Http { request_params: vec![1, 2] };
+        assert!(!shape.is_identity());
+        assert_eq!(view_slot(&Slot::Param(1), &shape), Some(Slot::Param(0)));
+        assert_eq!(view_slot(&Slot::Param(2), &shape), Some(Slot::Param(0)));
+        assert_eq!(view_slot(&Slot::Param(0), &shape), None, "w http.ResponseWriter");
+        assert_eq!(view_slot(&Slot::Receiver, &shape), None);
+        assert_eq!(view_slot(&Slot::Source, &shape), Some(Slot::Source));
+        // round trip through the forward descent's remap
+        let handler = unview_slot(&sp(Slot::Param(0)), &shape).slot;
+        assert_eq!(view_slot(&handler, &shape), Some(Slot::Param(0)));
+        // request direction only
+        assert_eq!(unview_out_slot(&Slot::Return(0), &shape), None);
+        assert_eq!(unview_out_slot(&Slot::ByRefParam(0), &shape), None);
+        assert_eq!(unview_out_slot(&Slot::Global("g".into()), &shape), Some(Slot::Global("g".into())));
     }
 
     #[test]

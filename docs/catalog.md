@@ -8,25 +8,35 @@ runs against.
 
 ## Format
 
-Five optional arrays of tables. These are the only keys the core reads:
+Five optional arrays of tables and one top-level key. These are the only keys
+the core reads:
 
 | table | keys |
 |---|---|
-| `[[sources]]` | `kind`, `selector`, `selector_regex` |
+| top level | `sink_ignore_arg_types` (a list of type strings) |
+| `[[sources]]` | `kind`, `selector`, `selector_regex`, `to` |
 | `[[sinks]]` | `class`, `selector`, `selector_regex`, `arg` |
 | `[[sanitizers]]` | `kind`, `selector`, `selector_regex` |
 | `[[error_wrappers]]` | `selector`, `selector_regex` |
 | `[[propagators]]` | `selector`, `selector_regex`, `from` (required), `to` (required) |
 
-`note` is accepted anywhere and ignored. Any other key or table, including
+`note` is accepted anywhere and ignored. `to` on anything but a source fails
+the load. Any other key or table, including
 `schema_version` and misspellings such as `[[sink]]` or `selecter`, is
 silently ignored. A misspelled table name therefore removes all its rules
 without an error; check the `catalog-fit` line (below) after editing.
 
 ```toml
+sink_ignore_arg_types = ["context.Context"]
+
 [[sources]]
 kind           = "ts_url_query"         # free text, never matched on
 selector_regex = '^(URLSearchParams|URL)\.(get|getAll)$'
+
+[[sources]]
+kind           = "http_request"
+selector_regex = '\(\*github\.com/gin-gonic/gin\.Context\)\.ShouldBind[A-Za-z]*$'
+to             = "1"                    # c.ShouldBindJSON(&req) fills req
 
 [[sinks]]
 class          = "sqli"                 # any string; lands on the chain as sink_class
@@ -65,15 +75,28 @@ to             = "receiver"
 
 What each table does:
 
-- `[[sources]]` matches at a call's result: the value returned by the call is
-  tainted. Request parameters of gRPC handlers, GraphQL resolvers and SvelteKit
-  server endpoints are sources without any rule: frontends mark them in
-  `Function.source_params`. Chains start only in functions that have source
+- `[[sources]]` matches at a call and taints the ports `to` names, in the
+  propagator port syntax below: `return` (the default) is the call's result,
+  an index, `receiver` or `args` is an argument the call writes into — a bind
+  such as `c.ShouldBindJSON(&req)`, which taints `req`. An argument needs the
+  frontend's library write-back edge, exactly like a propagator's `to`: the
+  seed leaves along that edge only and is not fed into its own call, so the
+  bind's `err` stays clean and, without the edge, the rule seeds nothing. `to = "none"` fails the load: a source that seeds nothing is inert
+  by construction. Request parameters of gRPC handlers, GraphQL resolvers and
+  SvelteKit server endpoints are sources without any rule: frontends mark them
+  in `Function.source_params`. Chains start only in functions that have source
   parameters or call a source themselves.
 - `[[sinks]]` matches at a tainted argument of the call. `arg` absent, `""` or
-  `"any"` accepts any argument; otherwise it is a 0-based argument index, where
-  the receiver is index 0 when the call has one. A non-numeric value fails the
-  load.
+  `"any"` accepts any argument; `"args"` any argument except the receiver (for
+  a method whose receiver is a handle, such as `(net/http.Header).Set` or
+  `(*net/http.Client).Do`); otherwise it is a 0-based argument index, where
+  the receiver is index 0 when the call has one. Anything else fails the load.
+- `sink_ignore_arg_types` stops every sink from firing on an argument port
+  whose vertex type is one of the listed strings, compared exactly. The
+  example catalog lists `context.Context`: a tainted context passed to
+  `db.QueryContext(ctx, q)` is not a finding about the query. Only the Go
+  frontend writes argument types; an untyped port is never filtered. Absent,
+  every port is eligible.
 - `[[sanitizers]]` matches at a tainted argument and stops the taint there.
   Nothing is recorded, so the chain simply does not appear (and `sanitized` in
   the output is always `false`).
@@ -135,7 +158,7 @@ through it is lost, and `--unmodeled` names the call:
 
 ```console
 $ panopticode taint --cgf testdata/cgf/libwrites --catalog catalog.example.toml --unmodeled um.json > chains.json
-catalog-fit: 9/22 propagators match at least one call site
+catalog-fit: 9/23 propagators match at least one call site
 unmodeled: 1 library call(s) receive tainted data and may write into another argument with no [[propagators]] rule -> um.json
       1 routes     1 sites     1 sources  example.com/libwrites/thirdparty.Fill  e.g. .../libwrites/app/app.go:123
 functions=19 summaries=32 contracts_linked=13 remote_leaves=0 chains=11 cache_hits=0 cache_misses=19
@@ -153,7 +176,7 @@ to       = "0"
 and rerun with that catalog:
 
 ```console
-catalog-fit: 10/23 propagators match at least one call site
+catalog-fit: 10/24 propagators match at least one call site
 unmodeled: 0 library call(s) receive tainted data and may write into another argument with no [[propagators]] rule -> um.json
 functions=19 summaries=32 contracts_linked=13 remote_leaves=0 chains=12 cache_hits=0 cache_misses=19
 ```
@@ -169,6 +192,7 @@ Every `taint` run prints, on stderr:
 catalog-fit: N/M rules match at least one call site (K distinct callees) — inert rules follow; ...
 catalog-warn: inert rule <section>[<class or kind>] "<selector>" — no call site matches it (zero recall here)
 catalog-warn: sink rule [<class>] "<selector>" arg N never in range (max argc seen M) — it can never fire
+catalog-warn: source rule [<kind>] "<selector>" `to` port never in range (max argc seen M) — it can never seed it
 catalog-fit: N/M propagators match at least one call site
 opaque: X of Y call sites into a Go module or func value have no loaded body (default leaf: ...) — top modules: ...
 ```
@@ -176,7 +200,9 @@ opaque: X of Y call sites into a Go module or func value have no loaded body (de
 `M` in the first line counts sources, sinks, sanitizers and error wrappers.
 An inert rule produces no findings and no other signal, so read these lines on
 every new corpus. The arg-range warning covers a sink whose name matches but
-whose `arg` index exceeds every matching call's argument count. Inert
+whose `arg` index exceeds every matching call's argument count; the `to`
+warning is the same for a source whose `to` names argument ports no matching
+call has. Inert
 propagators are counted but not listed. The `opaque` line names the modules
 where calls have no body, which is usually where the next scope change or rule
 belongs. `Y` counts every call site; `X` leaves out standard-library, builtin
@@ -194,6 +220,30 @@ covers. That is expected.
   more). Its rules were written from each library's API shape and are checked
   only by the `example_catalog_shapes` unit test in `core/src/catalog.rs`; they
   have not been measured against a real corpus.
+- Coverage wave 1 added, from API shapes and equally unmeasured: `read:`
+  sources on `net/http.Request`'s fields (`Body`, `Form`, `PostForm`,
+  `MultipartForm`, `Header`, `Trailer`, `URL`, `Host`, `RequestURI`; needs
+  `pc-fe --surface-reads`); the gin `Bind*`/`ShouldBind*` family and echo
+  `Bind` as by-ref sources (`to = "1"`), with a propagator from the context
+  into the bound value so a caller passing the request — a linked HTTP client
+  — composes through the bind; Kafka consume sources (kafka-go
+  `Reader.ReadMessage`/`FetchMessage`, sarama `ConsumerGroupClaim.Messages` /
+  `PartitionConsumer.Messages`, franz-go `Fetches.Records`/`RecordIter`/
+  `RecordsAll` and `FetchesRecordIter.Next`); `(*net/http.Request).Context` as
+  a `context` sanitizer; `sink_ignore_arg_types = ["context.Context"]`; and
+  `arg = "args"` on `(net/http.Header).Set|Add` and the `*http.Client`
+  methods. On the TypeScript side: `jsx:html` and `jsx:attr(-unsanitized)?:
+  srcDoc` as `xss`; `jsx:attr-unsanitized:<url attribute>` as `xss` (the
+  frontend emits it when the repo's React is older than 19 or unknown —
+  react-dom 19 neutralises `javascript:` URLs); `jsx:attr:(href|action|
+  formAction)` as `open_redirect`; React Router and `next/navigation` hooks as
+  sources; and Node server sinks for route
+  handlers (`child_process`, `fs`, `pg`/`mysql2` query where the receiver is
+  named through its module, Prisma `$queryRawUnsafe`/`$executeRawUnsafe`,
+  `next/navigation.redirect`). An untyped `.query` (a `new Pool()` receiver)
+  is deliberately not a sink: Apollo's `client.query` has the same name. A
+  `postMessage` payload (`event.data`) is not a source yet: the TypeScript
+  frontend has no name for that read.
 - The `test-only` section holds one `graphql_input` source that exists so
   `scripts/e2e-core.sh` can delete it and show GraphQL sourcing is structural.
   Delete it in your copy.
