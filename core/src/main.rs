@@ -7,6 +7,7 @@ mod ids;
 mod catalog;
 mod graph;
 mod normalize;
+mod httplink;
 mod ifds;
 mod summarystore;
 mod compose;

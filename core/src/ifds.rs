@@ -6,7 +6,7 @@
 //
 // Boolean taint is distributive, so this summary-composition reachability equals
 // the IFDS tabulation fixpoint at slot granularity.
-use crate::catalog::{Catalog, SinkArg};
+use crate::catalog::Catalog;
 use crate::graph::{hexid, IidHex, Program};
 use crate::ids;
 use crate::proto::cgf;
@@ -365,6 +365,11 @@ impl<'a> Engine<'a> {
             return false;
         }
         if self.cat.propagators_for(&cs.callee_fqn).next().is_some() {
+            return false;
+        }
+        // A by-ref source (`[[sources]] to = "1"`, coverage wave 1 §4.1) IS the
+        // model of what this call writes into its other arguments — reviewed.
+        if self.cat.source_of(&cs.callee_fqn).is_some_and(|s| s.writes_args()) {
             return false;
         }
         (0..cs.argc).filter(|&q| q != arg_idx).any(|q| {
@@ -820,6 +825,17 @@ impl<'a> Engine<'a> {
                 work.push(*s);
             }
         }
+        // Coverage wave 1 §4.1: a by-ref source seed is data the call WROTE
+        // through its arg port. It leaves along the port's write-back edges
+        // only — it is not an input to its own call, so no sink check, no
+        // callee summary and no default leaf (which would taint the bind's
+        // `err`) at that call. Only when it was seeded in THIS run: the same
+        // port reached by ordinary taint is an input like any other.
+        let writeback: HashSet<u32> = if ctx.writeback_seeds.is_empty() {
+            HashSet::new()
+        } else {
+            seeds.iter().copied().filter(|s| ctx.writeback_seeds.contains(s)).collect()
+        };
         while let Some(v) = work.pop() {
             if let Some(adj) = ctx.adj.get(&v) {
                 for &(w, _alias) in adj {
@@ -828,6 +844,9 @@ impl<'a> Engine<'a> {
                         work.push(w);
                     }
                 }
+            }
+            if writeback.contains(&v) {
+                continue;
             }
             if let Some(&(cs_idx, arg_idx, ref arg_path)) = ctx.arg_port.get(&v) {
                 let cs = &flow.callsites[cs_idx];
@@ -838,7 +857,8 @@ impl<'a> Engine<'a> {
                     continue;
                 }
                 if let Some(sink) = self.cat.sink_of(&cs.callee_fqn) {
-                    if sink_matches_arg(sink.arg, arg_idx) {
+                    let vtype = ctx.vtype.get(&v).map_or("", String::as_str);
+                    if self.cat.sink_fires_on(sink, arg_idx, cs.arg0_is_receiver, vtype) {
                         if let Some(t) = tr.filter(|t| t.wants("sink-hit")) {
                             t.log(format_args!(
                                 "sink-hit  fn={} cs={} class={} arg={} callee={} via=catalog",
@@ -1146,6 +1166,10 @@ pub struct FnCtx {
     pub result_port: HashMap<(usize, u32), Vec<(FieldPath, u32)>>,
     pub arg_port_of: HashMap<(usize, u32), Vec<(FieldPath, u32)>>,
     pub source_seeds: Vec<u32>,
+    /// the subset of `source_seeds` that are arg ports a by-ref source
+    /// (`[[sources]] to = "1"`) writes through: they contribute their
+    /// write-back out-edges only (see `propagate`)
+    pub writeback_seeds: HashSet<u32>,
     /// server-side stream Recv result-port vertices (contract StreamIn)
     pub stream_in_seeds: Vec<u32>,
     /// contract iid -> client-side stream Recv result-port vertices
@@ -1172,6 +1196,7 @@ impl FnCtx {
             result_port: HashMap::new(),
             arg_port_of: HashMap::new(),
             source_seeds: Vec::new(),
+            writeback_seeds: HashSet::new(),
             stream_in_seeds: Vec::new(),
             stream_recv: HashMap::new(),
             vspan: HashMap::new(),
@@ -1257,9 +1282,21 @@ impl FnCtx {
                         .entry((v.callsite_id as usize, v.index))
                         .or_default()
                         .push((vpath(), v.id));
+                    let cs = &flow.callsites[v.callsite_id as usize];
+                    // Coverage wave 1 §4.1 (E1): a by-ref source writes the
+                    // untrusted data THROUGH this port (`c.ShouldBindJSON(&req)`).
+                    // The frontend's library write-back gives the port out-edges
+                    // into the caller's variable — the same vertices a
+                    // propagator's `to` reaches — so the port is the seed.
+                    if cat
+                        .source_of(&cs.callee_fqn)
+                        .is_some_and(|s| s.seeds_arg(v.index, cs.argc, cs.arg0_is_receiver))
+                    {
+                        ctx.source_seeds.push(v.id);
+                        ctx.writeback_seeds.insert(v.id);
+                    }
                     // server-side stream Send data arg = contract StreamOut
                     // (whole-message: stream ports never carry paths)
-                    let cs = &flow.callsites[v.callsite_id as usize];
                     if let Some((cgf::call_site::StreamOp::Send, false)) = stream_of(cs) {
                         if v.index >= 1 {
                             ctx.out_of.insert(v.id, Slot::StreamOut.into());
@@ -1273,7 +1310,7 @@ impl FnCtx {
                         .push((vpath(), v.id));
                     let cs = &flow.callsites[v.callsite_id as usize];
                     // catalog source getter => unconditional source seed
-                    if cat.source_of(&cs.callee_fqn).is_some() {
+                    if cat.source_of(&cs.callee_fqn).is_some_and(|s| s.seeds_results()) {
                         ctx.source_seeds.push(v.id);
                     }
                     // stream Recv message (result 0): server side = untrusted
@@ -1404,13 +1441,6 @@ pub fn arg_to_callee_slot(cs: &cgf::CallSite, arg_idx: u32, path: &[u32]) -> Slo
         Slot::Param(arg_idx)
     };
     SlotP { slot, path: path.to_vec() }
-}
-
-fn sink_matches_arg(spec: SinkArg, arg_idx: u32) -> bool {
-    match spec {
-        SinkArg::Any => true,
-        SinkArg::Index(i) => i == arg_idx,
-    }
 }
 
 /// Drop exact-duplicate SinkHits, keeping first-seen order (propagation order
@@ -3142,5 +3172,233 @@ to   = "none"
         assert!(run(&format!("{SINK}{REVIEWED}"), true).is_empty(), "`none`: reviewed, no flow, no report");
         // and the flag off never reports
         assert!(run(SINK, false).is_empty());
+    }
+}
+
+/// Coverage wave 1 §4.1 (E1) and §4.2 (E3), end to end through summary,
+/// witness and the backward pass — the three places a source seed or a sink
+/// port is interpreted, which must agree.
+#[cfg(test)]
+mod catalog_port_tests {
+    use super::cache_tests::{edge, vertex};
+    use super::*;
+    use crate::graph::Program;
+
+    const GIN_BIND: &str = "(*github.com/gin-gonic/gin.Context).ShouldBindJSON";
+    const QUERY: &str = "(*database/sql.DB).QueryContext";
+
+    fn prog_of(f: cgf::Function) -> Program {
+        let mut prog = Program { funcs: HashMap::new(), repo_of: HashMap::new(), packages: Vec::new() };
+        let h = hexid(&f.id.as_ref().unwrap().iid);
+        prog.repo_of.insert(h.clone(), "test".into());
+        prog.funcs.insert(h, f);
+        prog
+    }
+
+    fn func(iid: u8, fqn: &str, flow: cgf::LocalFlow) -> cgf::Function {
+        cgf::Function {
+            id: Some(cgf::Ident { iid: vec![iid; 32], bid: vec![iid; 32] }),
+            fqn: fqn.into(),
+            has_body: true,
+            flow: Some(flow),
+            ..Default::default()
+        }
+    }
+
+    fn call(id: u32, fqn: &str, argc: u32, resultc: u32, recv: bool) -> cgf::CallSite {
+        cgf::CallSite {
+            id,
+            callee_fqn: fqn.into(),
+            argc,
+            resultc,
+            arg0_is_receiver: recv,
+            ..Default::default()
+        }
+    }
+
+    /// ```go
+    /// func Create(c *gin.Context) { var req Req; err := c.ShouldBindJSON(&req); db.Exec(req) }
+    /// ```
+    /// Vertex 3 -> 5 is the frontend's library write-back: the `&req` arg port
+    /// flows into the next use of `req`.
+    fn bind_handler() -> cgf::Function {
+        func(
+            0x61,
+            "app.Create",
+            cgf::LocalFlow {
+                vertices: vec![
+                    vertex(1, cgf::VertexKind::InParam, 0, 0),        // c
+                    vertex(2, cgf::VertexKind::CallArgPort, 0, 0),    // c (receiver)
+                    vertex(3, cgf::VertexKind::CallArgPort, 1, 0),    // &req
+                    vertex(4, cgf::VertexKind::CallResultPort, 0, 0), // err
+                    vertex(5, cgf::VertexKind::CallArgPort, 0, 1),    // db.Exec(req)
+                ],
+                edges: vec![edge(1, 2), edge(3, 5)],
+                callsites: vec![call(0, GIN_BIND, 2, 1, true), call(1, "db.Exec", 1, 0, false)],
+            },
+        )
+    }
+
+    fn cat_with(to: &str) -> Catalog {
+        Catalog::load_str(&format!(
+            "[[sources]]\nkind = \"http_bind\"\nselector = \"{GIN_BIND}\"\n{to}\n\
+             [[sinks]]\nclass = \"sqli\"\nselector = \"db.Exec\"\n"
+        ))
+        .unwrap()
+    }
+
+    fn source_hits(eng: &Engine, iid: u8) -> Vec<String> {
+        eng.summaries[&hexid(&[iid; 32])]
+            .sink_hits
+            .iter()
+            .filter(|h| h.in_slot == Slot::Source)
+            .map(|h| h.class.clone())
+            .collect()
+    }
+
+    #[test]
+    fn a_bind_source_seeds_the_bound_variable_not_the_error() {
+        let prog = prog_of(bind_handler());
+        // today's rule shape: the result (err) is the source, req is not
+        let old = cat_with("");
+        let mut eng = Engine::new(&prog, &old);
+        eng.run();
+        assert!(source_hits(&eng, 0x61).is_empty(), "with to = return only err is tainted");
+
+        let new = cat_with("to = \"1\"");
+        let f = &prog.funcs[&hexid(&[0x61; 32])];
+        let ctx = FnCtx::build(f, &new);
+        assert_eq!(ctx.source_seeds, vec![3], "the seed is the &req arg port, nothing else");
+        let mut eng = Engine::new(&prog, &new);
+        eng.run();
+        assert_eq!(source_hits(&eng, 0x61), vec!["sqli".to_string()]);
+        // The seed leaves along the write-back only: it is not an input to the
+        // bind call, so the default leaf never taints the bind's `err`.
+        let r = eng.propagate(f, &ctx, &ctx.source_seeds);
+        assert!(r.tainted.contains(&5), "req's use is tainted");
+        assert!(!r.tainted.contains(&4), "err (result port 0 of the bind) must stay clean");
+        // ... while the same port reached by ordinary taint is an input as
+        // before: from the receiver `c`, the default leaf taints err.
+        let r = eng.propagate(f, &ctx, &[1]);
+        assert!(r.tainted.contains(&4));
+    }
+
+    /// Review finding: `err := c.ShouldBindJSON(&req); db.Exec(err)` — no use
+    /// of req at all — reported a Source chain through the bind's `err`.
+    #[test]
+    fn a_bind_source_never_reaches_a_sink_through_the_error() {
+        let f = func(
+            0x63,
+            "app.CreateErr",
+            cgf::LocalFlow {
+                vertices: vec![
+                    vertex(1, cgf::VertexKind::InParam, 0, 0),
+                    vertex(2, cgf::VertexKind::CallArgPort, 0, 0),
+                    vertex(3, cgf::VertexKind::CallArgPort, 1, 0),
+                    vertex(4, cgf::VertexKind::CallResultPort, 0, 0),
+                    vertex(5, cgf::VertexKind::CallArgPort, 0, 1),
+                ],
+                edges: vec![edge(1, 2), edge(4, 5)],
+                callsites: vec![call(0, GIN_BIND, 2, 1, true), call(1, "db.Exec", 1, 0, false)],
+            },
+        );
+        let prog = prog_of(f);
+        let cat = cat_with("to = \"1\"");
+        let mut eng = Engine::new(&prog, &cat);
+        eng.run();
+        assert!(source_hits(&eng, 0x63).is_empty(), "no Source hit through err");
+        // c itself (Param(0)) still reaches err through the default leaf
+        let hits: Vec<SlotP> = eng.summaries[&hexid(&[0x63; 32])].sink_hits.iter().map(|h| h.in_slot.clone()).collect();
+        assert_eq!(hits, vec![SlotP::from(Slot::Param(0))]);
+    }
+
+    #[test]
+    fn a_bind_chain_has_a_complete_route_and_is_confirmed_backward() {
+        let prog = prog_of(bind_handler());
+        let cat = cat_with("to = \"1\"");
+        let mut eng = Engine::new(&prog, &cat);
+        eng.run();
+        let mut chains = crate::report::intra_chains(&eng, None);
+        assert_eq!(chains.len(), 1, "one sqli chain");
+        let route = chains[0].route.as_ref().unwrap();
+        assert_eq!(route.incomplete, None);
+        let shape: Vec<(crate::witness::HopKind, &str)> =
+            route.hops.iter().map(|h| (h.kind, h.callee.as_str())).collect();
+        use crate::witness::HopKind::*;
+        assert_eq!(shape, vec![(Source, ""), (Call, GIN_BIND), (Sink, "db.Exec")]);
+        crate::backward::set_opts(Default::default());
+        let st = crate::report::backward_check(&eng, &mut chains, false);
+        assert_eq!(st.confirmed, 1, "the demand must land on the arg-port seed: {:?}", chains[0].backward);
+    }
+
+    /// ```go
+    /// func Q(ctx context.Context, q string) { db.QueryContext(ctx, q) }   // source_params = [0, 1]
+    /// ```
+    /// `ctx_only` drops the `q` edge: the shape that made every ctx-taking sink
+    /// a finding once a whole request object was seeded (E3).
+    fn query_fn(ctx_only: bool) -> cgf::Function {
+        let typed = |mut v: cgf::FlowVertex, t: &str| {
+            v.r#type = t.into();
+            v
+        };
+        let mut edges = vec![edge(1, 4)];
+        if !ctx_only {
+            edges.push(edge(2, 5));
+        }
+        let mut f = func(
+            0x62,
+            "app.Q",
+            cgf::LocalFlow {
+                vertices: vec![
+                    typed(vertex(1, cgf::VertexKind::InParam, 0, 0), "context.Context"),
+                    typed(vertex(2, cgf::VertexKind::InParam, 1, 0), "string"),
+                    typed(vertex(3, cgf::VertexKind::CallArgPort, 0, 0), "*database/sql.DB"),
+                    typed(vertex(4, cgf::VertexKind::CallArgPort, 1, 0), "context.Context"),
+                    typed(vertex(5, cgf::VertexKind::CallArgPort, 2, 0), "string"),
+                ],
+                edges,
+                callsites: vec![call(0, QUERY, 3, 2, true)],
+            },
+        );
+        f.source_params = vec![0, 1];
+        f
+    }
+
+    fn query_cat(ignore: bool) -> Catalog {
+        Catalog::load_str(&format!(
+            "{}[[sinks]]\nclass = \"sqli\"\nselector = \"{QUERY}\"\narg = \"args\"\n",
+            if ignore { "sink_ignore_arg_types = [\"context.Context\"]\n" } else { "" }
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_tainted_context_alone_is_not_a_sql_finding() {
+        let prog = prog_of(query_fn(true));
+        let cat = query_cat(false);
+        let mut eng = Engine::new(&prog, &cat);
+        eng.run();
+        assert_eq!(source_hits(&eng, 0x62), vec!["sqli".to_string()], "absent = today: ctx fires");
+
+        let cat = query_cat(true);
+        let mut eng = Engine::new(&prog, &cat);
+        eng.run();
+        assert!(source_hits(&eng, 0x62).is_empty(), "context.Context ports never fire");
+    }
+
+    #[test]
+    fn an_ignored_port_does_not_change_the_route_or_the_verdict_of_a_real_one() {
+        let prog = prog_of(query_fn(false));
+        let cat = query_cat(true);
+        let mut eng = Engine::new(&prog, &cat);
+        eng.run();
+        let mut chains = crate::report::intra_chains(&eng, None);
+        assert_eq!(chains.len(), 1);
+        let route = chains[0].route.as_ref().unwrap();
+        assert_eq!(route.incomplete, None, "the witness fires on the same port propagate did");
+        crate::backward::set_opts(Default::default());
+        let st = crate::report::backward_check(&eng, &mut chains, false);
+        assert_eq!(st.confirmed, 1, "{:?}", chains[0].backward);
+        assert_eq!(chains[0].backward.as_ref().unwrap().terminal, Some(crate::backward::Verdict::Confirmed));
     }
 }

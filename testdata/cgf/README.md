@@ -1,7 +1,7 @@
 # Golden CGF corpus
 
 Pre-extracted CGF for every analysis fixture. It lets `scripts/e2e-core.sh`
-(16 suites) run the whole engine with only a Rust toolchain: no Go, Node,
+(20 suites) run the whole engine with only a Rust toolchain: no Go, Node,
 Postgres, Docker or network. Total size is about 0.9 MB.
 
 The fixture sources live in the frontend repositories
@@ -33,6 +33,24 @@ release produces byte-identical output.
 A different Go release can change callee ids, which hash standard-library
 signatures (go1.27.1 changes the `fmt.Errorf` id in `errorleaf-*`); any other
 diff after regeneration is a bug.
+
+Known, unexplained: regenerating on go1.27.1 with the frontends at panoptife-go
+`6601c74` adds `v -> v` self-edges to some `LocalFlow`s (`dispatch-*`,
+`fieldpath-*`, `heapslots-*`, `errorleaf-*`, `miniledger-*`) and two arg-port
+field-path variants in `fieldpath-on`; `libwrites*` differ only in the staging
+prefix noted above. Whether the Go release or a frontend commit since `02a89e7`
+causes them has not been bisected. The committed directories are kept as they
+were; every suite passes on both.
+
+Coverage wave 1 added the `httpapi*`, `httpclient`, `kafka-*`, `reactapp*` and
+`nextapp` directories and regenerated `weblib` / `weblib-off` (each gains one
+inert `http:GET /api` client site), from the `feat/coverage-wave-1` working
+trees of panoptife-go and panoptife-ts with go1.27.1. Every other directory was
+left at its earlier provenance: regenerating it reproduced the bytes the
+pre-wave-1 frontends produce on the same machine, so the only differences were
+the Go-release ones above (and, for `webapp`, a pre-existing difference from the
+SvelteKit route-file fix in panoptife-ts `189d6e7`). Record the frontend commits
+here once the branch lands.
 
 ## The commands
 
@@ -71,6 +89,7 @@ pc-fe-ts build --repo $STAGE/webapp --repo-id webapp --adapter bff-gateway --qui
 | `byrefout-off` | `byrefout` | `--dispatch vta` | e2e-byrefout |
 | `errorleaf-on` | `errorleaf` | `--dispatch vta --error-results` | e2e-errorleaf |
 | `errorleaf-off` | `errorleaf` | `--dispatch vta` | e2e-errorleaf |
+| `errorleaf-strict` | `errorleaf` | `--dispatch vta --error-results --error-results-strict` | e2e-errorleaf |
 | `miniledger-vta` | `miniledger` | `--dispatch vta` | e2e-miniledger |
 | `miniledger-cha` | `miniledger` | `--dispatch cha` | e2e-miniledger |
 | `miniledger-off` | `miniledger` | `--dispatch off` | e2e-miniledger |
@@ -80,6 +99,14 @@ pc-fe-ts build --repo $STAGE/webapp --repo-id webapp --adapter bff-gateway --qui
 | `webapp` | `webapp` (TS) | `--adapter bff-gateway` | e2e-ts, e2e-backward |
 | `weblib` | `weblib` (TS) | — | e2e-libwrites |
 | `weblib-off` | `weblib` (TS) | `--no-library-writeback` | e2e-libwrites |
+| `httpapi` | `httpapi` | defaults (`--surface-reads`, `--http-routes`, `--http-calls`, `--topic-cells` on) | e2e-http, e2e-react |
+| `httpapi-nosurface` | `httpapi` | `--surface-reads=false` | e2e-http |
+| `httpclient` | `httpclient` | defaults | e2e-http |
+| `kafka-producer` | `kafka/producer` | defaults | e2e-kafka |
+| `kafka-consumer` | `kafka/consumer` | defaults | e2e-kafka |
+| `reactapp` | `reactapp` (TS) | defaults | e2e-react |
+| `reactapp-off` | `reactapp` (TS) | `--no-jsx` | e2e-react |
+| `nextapp` | `nextapp` (TS) | defaults | e2e-next |
 
 `-on` / `-off` pairs let a suite compare the same fixture with and without one
 frontend flag, so any difference is attributable to that flag.
@@ -120,6 +147,24 @@ frontend flag, so any difference is attributable to that flag.
   rule *and* the frontend's library write-back edge; clean cases in each
   language that must stay silent; and (Go) a stand-in dependency, extracted
   out of scope, that only `--unmodeled` can point at.
+
+- **`httpapi`** — one module serving routes through `net/http` (Go 1.22
+  patterns), chi (`Route`, `Mount`, a router passed into a helper), gin
+  (`Group`, `ShouldBindJSON`), echo and gorilla (`Subrouter`), with JSON bodies
+  reaching SQL, plus `stats`, which passes only `r.Context()` to a constant
+  query and must stay silent under `sink_ignore_arg_types`.
+- **`httpclient`** — a second service whose handler calls `httpapi` through
+  `http.NewRequestWithContext` and `http.Get`, with an unresolved base URL, so
+  the join can only be made by suffix.
+- **`kafka/producer`** / **`kafka/consumer`** — kafka-go and franz-go producers,
+  a sarama consumer group and a kafka-go reader; topic `orders` joins, the decoy
+  pair `audit-events` / `audit-log` must not.
+- **`reactapp`** — a React Router SPA: `useSearchParams` drilled through two
+  components into `dangerouslySetInnerHTML`, an `onClick` body, and `fetch` /
+  `axios` calls to `httpapi`'s routes.
+- **`nextapp`** — a Next.js App Router repo: a `route.ts` into `child_process`,
+  a dynamic `[id]` route and a server action into a `pg` pool, a Pages API file,
+  and a client `fetch` that links to the repo's own route.
 
 `webapp`, `federation`, `backend` and `downstream` together form the example
 system; [The example system](../../docs/example.md) maps their code to the 18

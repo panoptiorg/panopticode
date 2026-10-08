@@ -41,39 +41,16 @@ use std::rc::Rc;
 /// The inverse of the `handler_of` map compose::fixpoint_with_leaves builds
 /// internally (compose.rs). Rebuilt here from the packages rather than
 /// threaded out of compose, so witness reconstruction stays independent of the
-/// composer's internals. Covers gRPC methods and GraphQL fields alike — the
-/// descent has to undo whichever view compose published.
+/// composer's internals — but from the SAME enumeration (`graph::contracts`),
+/// so the two agree on every key. Covers gRPC methods, GraphQL fields and HTTP
+/// routes alike — the descent has to undo whichever view compose published.
 pub type ContractHandlers = HashMap<IidHex, (IidHex, ContractShape)>;
 
 pub fn contract_handlers(prog: &Program) -> ContractHandlers {
-    let mut out: ContractHandlers = HashMap::new();
-    for pkg in &prog.packages {
-        for gm in &pkg.grpc_methods {
-            if gm.handler_iid.is_empty() || gm.iid.is_empty() {
-                continue;
-            }
-            out.insert(
-                hexid(&gm.iid),
-                (
-                    hexid(&gm.handler_iid),
-                    ContractShape::Grpc(gm.client_streaming, gm.server_streaming),
-                ),
-            );
-        }
-        for gf in &pkg.graphql_fields {
-            if gf.resolver_iid.is_empty() || gf.iid.is_empty() {
-                continue;
-            }
-            out.insert(
-                hexid(&gf.iid),
-                (
-                    hexid(&gf.resolver_iid),
-                    ContractShape::Graphql(gf.args.iter().map(|a| a.param_idx).collect()),
-                ),
-            );
-        }
-    }
-    out
+    crate::graph::contracts(prog)
+        .into_iter()
+        .map(|c| (c.key, (c.handler, c.shape)))
+        .collect()
 }
 
 #[derive(Serialize, Clone, Copy, PartialEq, Eq, Debug)]
@@ -254,6 +231,11 @@ pub struct Walk<'a, 'e> {
     /// hits in practice and makes the memo provably route-identical.
     props: RefCell<HashMap<(IidHex, String), Rc<PropResult>>>,
     stats: Cell<WalkStats>,
+    /// HTTP contract key -> how its crossing renders (`http GET /x/{id} (chi)`).
+    /// The client site's own `callee_fqn` is its TEMPLATE, which after a suffix
+    /// or fan-out link is not the route the descent actually enters
+    /// (coverage wave 1 §4.4).
+    http_labels: HashMap<IidHex, String>,
 }
 
 impl<'a, 'e> Walk<'a, 'e> {
@@ -267,7 +249,30 @@ impl<'a, 'e> Walk<'a, 'e> {
             ctxs: RefCell::new(HashMap::new()),
             props: RefCell::new(HashMap::new()),
             stats: Cell::new(WalkStats::default()),
+            http_labels: crate::graph::contracts(engine.prog)
+                .into_iter()
+                .filter_map(|c| Some((c.key, c.http?.label)))
+                .collect(),
         }
+    }
+
+    /// `unview_slot`, except that an HTTP view folded SEVERAL handler params
+    /// onto the client's one port: re-enter at the first request param whose
+    /// rows actually carry a `class` sink for this fact, so the descent starts
+    /// where the summary says the sink is. `unview_slot` alone takes the first
+    /// request param, which is right whenever there is only one.
+    fn unview_for(&self, s: &SlotP, shape: &ContractShape, handler: &IidHex, class: &str) -> SlotP {
+        if let (ContractShape::Http { request_params }, Slot::Param(0)) = (shape, &s.slot) {
+            if let Some(sum) = self.engine.summaries.get(handler) {
+                for &p in request_params {
+                    let cand = SlotP { slot: Slot::Param(p), path: s.path.clone() };
+                    if sum.sink_hits.iter().any(|h| h.class == class && slot_compat(&h.in_slot, &cand)) {
+                        return cand;
+                    }
+                }
+            }
+        }
+        unview_slot(s, shape)
     }
 
     /// Routes that fell back to the widened fact — see `Walk::widened`.
@@ -551,7 +556,10 @@ impl<'a, 'e> Walk<'a, 'e> {
 
         // Is the sink AT this call site (catalog), or inside the callee?
         if let Some(sink) = self.engine.cat.sink_of(&cs.callee_fqn) {
-            if sink.class == class && sink_arg_matches(sink.arg, arg_idx) {
+            let vtype = ctx.vtype.get(&ps.last).map_or("", String::as_str);
+            if sink.class == class
+                && self.engine.cat.sink_fires_on(sink, arg_idx, cs.arg0_is_receiver, vtype)
+            {
                 out.push(RouteHop {
                     repo: repo.clone(),
                     func: f.fqn.clone(),
@@ -657,7 +665,10 @@ impl<'a, 'e> Walk<'a, 'e> {
                     file: cs.span.as_ref().map(|s| s.file.clone()),
                     line: cs.span.as_ref().map(|s| s.line),
                     kind: if boundary { HopKind::Boundary } else { HopKind::Call },
-                    callee: cs.callee_fqn.clone(),
+                    callee: match self.http_labels.get(&callee_iid) {
+                        Some(label) if boundary => label.clone(),
+                        _ => cs.callee_fqn.clone(),
+                    },
                     field: field_of(flow, ps.last, resid),
                     fields: Vec::new(),
                     confidence: conf_of(cs),
@@ -669,7 +680,7 @@ impl<'a, 'e> Walk<'a, 'e> {
                 // remap.
                 let (target_iid, target_slot) = if boundary {
                     match self.handlers.get(&callee_iid) {
-                        Some((h, shape)) => (h.clone(), unview_slot(&callee_in, shape)),
+                        Some((h, shape)) => (h.clone(), self.unview_for(&callee_in, shape, h, class)),
                         // No local handler: the summary came from a PG leaf, so
                         // the route legitimately ends at the boundary in THIS
                         // analysis.
@@ -847,13 +858,6 @@ fn conf_of(cs: &cgf::CallSite) -> f32 {
     }
 }
 
-fn sink_arg_matches(spec: crate::catalog::SinkArg, arg_idx: u32) -> bool {
-    match spec {
-        crate::catalog::SinkArg::Any => true,
-        crate::catalog::SinkArg::Index(i) => i == arg_idx,
-    }
-}
-
 /// Reporting names declared on vertex `v` (empty when absent or truncated —
 /// the proto's own convention, which `Residual::compose` mirrors).
 fn field_names_of(flow: &cgf::LocalFlow, v: u32) -> &[String] {
@@ -946,6 +950,15 @@ pub(crate) fn unview_slot(s: &SlotP, shape: &ContractShape) -> SlotP {
                     path: s.path.clone(),
                 },
                 None => s.clone(),
+            },
+            _ => s.clone(),
+        },
+        // The client's one port is the first request param (`Walk::unview_for`
+        // picks a later one when only that one carries the sink).
+        ContractShape::Http { request_params } => match (&s.slot, request_params.first()) {
+            (Slot::Param(0), Some(&p)) => SlotP {
+                slot: Slot::Param(p),
+                path: s.path.clone(),
             },
             _ => s.clone(),
         },
@@ -1249,6 +1262,15 @@ mod tests {
     // --- unview_slot: the inverse of compose::contract_view's in-slot remap.
     // No fixture covers a STREAMING chain that continues past the boundary, so
     // this is the only guard on the streaming descent.
+
+    /// Coverage wave 1 §4.4: the client's one port re-enters the handler at
+    /// its first request param.
+    #[test]
+    fn unview_http_maps_the_port_to_the_first_request_param() {
+        let shape = ContractShape::Http { request_params: vec![1, 2] };
+        assert_eq!(unview_slot(&sp(Slot::Param(0), &[4]), &shape), sp(Slot::Param(1), &[4]));
+        assert_eq!(unview_slot(&sp(Slot::Source, &[]), &shape), sp(Slot::Source, &[]));
+    }
 
     #[test]
     fn unview_unary_is_identity() {

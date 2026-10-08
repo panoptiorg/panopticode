@@ -1,0 +1,35 @@
+{
+  "note": "Canonical HTTP path vectors (plans: coverage wave 1, design §1.1). Every frontend and the core must map `in` to `out` exactly. A hole the frontend could not resolve is written into the input as the two characters {} before canonicalising.",
+  "vectors": [
+    {"in": "/api/users/{id}", "out": "/api/users/{}"},
+    {"in": "/api/users/:id", "out": "/api/users/{}"},
+    {"in": "/api/users/{id:[0-9]+}", "out": "/api/users/{}"},
+    {"in": "/users/[id]/posts", "out": "/users/{}/posts"},
+    {"in": "/files/{path...}", "out": "/files/{*}"},
+    {"in": "/static/*filepath", "out": "/static/{*}"},
+    {"in": "/static/*", "out": "/static/{*}"},
+    {"in": "/blog/[...slug]", "out": "/blog/{*}"},
+    {"in": "/docs/[[...slug]]", "out": "/docs/{*}"},
+    {"in": "/a/{*}/b", "out": "/a/{*}"},
+    {"in": "/users/{$}", "out": "/users"},
+    {"in": "/v{}.json", "out": "/{}"},
+    {"in": "https://api.example.com/v1/users?x=1#frag", "out": "/v1/users"},
+    {"in": "HTTP://localhost:8080", "out": "/"},
+    {"in": "//cdn.example.com/a", "out": "/a"},
+    {"in": "{}/api/users/{}", "out": "/{}/api/users/{}"},
+    {"in": "{}", "out": "/{}"},
+    {"in": "/api//users/", "out": "/api/users"},
+    {"in": "api/users", "out": "/api/users"},
+    {"in": "/search?q={}", "out": "/search"},
+    {"in": "", "out": "/"},
+    {"in": "/", "out": "/"}
+  ],
+  "rules": [
+    "1. If the input starts with a scheme (case-insensitive http:// or https://) or with //, drop the scheme and the authority up to the next /; nothing left means /.",
+    "2. Cut at the first ? or #.",
+    "3. Split on /, drop empty segments.",
+    "4. Per segment, first match wins: `{$}` -> dropped; `{*}` -> {*}; `*` or a segment starting with `*` -> {*}; `{name...}` -> {*}; `[...x]` or `[[...x]]` -> {*}; contains { or [ , or starts with : -> {}; else the literal, case preserved.",
+    "5. Everything after the first {*} is dropped.",
+    "6. Result is / followed by the segments joined by /, or / when there are none."
+  ]
+}

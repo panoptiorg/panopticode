@@ -111,8 +111,28 @@ pub fn persist(prog: &Program, eng: &Engine<'_>, pg_url: &str) -> Result<Persist
     rt.block_on(async { persist_async(prog, eng, pg_url).await })
 }
 
+/// A call into a contract this store can resolve: an INVOKES_REMOTE site,
+/// except a linked HTTP client site (`http_call` set). Coverage wave 1 §4.3:
+/// that link is made at LOAD time against the routes of this run only, and its
+/// callee is never in `contracts`/`contract_summaries` (see
+/// `persisted_contracts`), so treating it as remote would look its route up in
+/// Postgres, record it in `invokes` and draw an edge to a node that is never
+/// written. It persists as nothing — stated in docs/limitations.md.
 fn is_remote(cs: &cgf::CallSite) -> bool {
-    cs.kind == cgf::call_site::Kind::InvokesRemote as i32
+    cs.kind == cgf::call_site::Kind::InvokesRemote as i32 && cs.http_call.is_none()
+}
+
+/// The contracts this store persists: gRPC methods and GraphQL fields. HTTP
+/// routes are an in-memory, per-run contract in wave 1 — persisting their
+/// views to `contract_summaries` is out of scope (design §6), and a node or a
+/// registry row without the view would let a later PG-backed run believe it
+/// can resolve a route it cannot. Filtering here, at the one enumeration
+/// storage reads, keeps every table consistent with that.
+fn persisted_contracts(p: &cgf::CgfPackage) -> Vec<crate::graph::ContractDef<'_>> {
+    crate::graph::pkg_contracts(p)
+        .into_iter()
+        .filter(|c| c.kind != crate::graph::CONTRACT_KIND_HTTP)
+        .collect()
 }
 
 /// Contract iids referenced by invokes_remote callsites but not defined by any
@@ -123,7 +143,7 @@ pub fn missing_remote_contracts(prog: &Program) -> Vec<Vec<u8>> {
     let local: HashSet<IidHex> = prog
         .packages
         .iter()
-        .flat_map(|p| crate::graph::pkg_contracts(p).into_iter().map(|c| hexid(c.iid)))
+        .flat_map(|p| persisted_contracts(p).into_iter().map(|c| hexid(c.iid)))
         .collect();
     let mut missing: Vec<Vec<u8>> = Vec::new();
     let mut seen: HashSet<IidHex> = HashSet::new();
@@ -157,7 +177,7 @@ async fn persist_async(prog: &Program, eng: &Engine<'_>, pg_url: &str) -> Result
     // contract nodes for every contract defined in this run (gRPC + GraphQL)
     for p in &prog.packages {
         let rid = *repo_ids.get(&p.repo).unwrap_or(&0);
-        for c in crate::graph::pkg_contracts(p) {
+        for c in persisted_contracts(p) {
             rows.insert(
                 (rid, KIND_CONTRACT, c.full_name.to_string()),
                 NodeRow {
@@ -237,14 +257,14 @@ async fn upsert_contracts(tx: &mut Transaction<'_, Postgres>, prog: &Program) ->
         // gRPC methods (kind 0) and GraphQL fields (kind 1, doc 36 §3.3) —
         // `kind` is what distinguishes them; a field's full_name is its
         // SDL type_field and it has no input/output message.
-        for c in crate::graph::pkg_contracts(p) {
+        for c in persisted_contracts(p) {
             sqlx::query(
                 "INSERT INTO contracts(iid, kind, full_name, repo, input_msg, output_msg)
                  VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT (iid) DO NOTHING",
             )
             .bind(c.iid)
             .bind(c.kind)
-            .bind(c.full_name)
+            .bind(c.full_name.as_ref())
             .bind(&p.repo)
             .bind(c.input_msg)
             .bind(c.output_msg)
@@ -505,7 +525,7 @@ async fn refresh_edges(
     // contract -> handler (SQL traversal continues into the defining repo)
     for p in &prog.packages {
         let rid = *repo_ids.get(&p.repo).unwrap_or(&0);
-        for c in crate::graph::pkg_contracts(p) {
+        for c in persisted_contracts(p) {
             let (Some(&from), Some(&to)) = (
                 contract_node.get(&hexid(c.iid)),
                 fn_node.get(&hexid(c.handler_iid)),
@@ -663,7 +683,7 @@ async fn persist_summaries(
     // iterated — contracts merely consumed as PG leaves are never re-published
     // (write-back guard, doc 18 B.3).
     for p in &prog.packages {
-        for gm in crate::graph::pkg_contracts(p) {
+        for gm in persisted_contracts(p) {
             if gm.handler_iid.is_empty() {
                 continue; // consumed-only contract: no local handler, skip
             }
@@ -761,6 +781,54 @@ mod tests {
         assert_eq!(h.callsite, 0, "callsite is not persisted");
         assert_eq!(h.span.as_ref().unwrap().file, "store/store.go");
         assert_eq!(h.span.as_ref().unwrap().line, 12);
+    }
+
+    /// Coverage wave 1: HTTP routes are not persisted, and a linked HTTP
+    /// client site is not a remote call this store could resolve — so a
+    /// `--pg` run neither writes a route nor goes looking for one.
+    #[test]
+    fn http_routes_and_linked_http_sites_stay_out_of_postgres() {
+        let pkg = cgf::CgfPackage {
+            repo: "api".into(),
+            grpc_methods: vec![cgf::GrpcMethod {
+                iid: vec![0x01; 32],
+                full_name: "pb.Svc/M".into(),
+                handler_iid: vec![0xA1; 32],
+                ..Default::default()
+            }],
+            http_routes: vec![cgf::HttpRoute {
+                iid: vec![0x02; 32],
+                method: "GET".into(),
+                path: "/x".into(),
+                handler_iid: vec![0xA2; 32],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let kinds: Vec<i16> = persisted_contracts(&pkg).iter().map(|c| c.kind).collect();
+        assert_eq!(kinds, vec![crate::graph::CONTRACT_KIND_GRPC]);
+
+        let remote = |iid: u8, http: bool| cgf::CallSite {
+            kind: cgf::call_site::Kind::InvokesRemote as i32,
+            callee_iids: vec![vec![iid; 32]],
+            http_call: http.then(|| cgf::HttpCall { method: "GET".into(), path: "/x".into() }),
+            ..Default::default()
+        };
+        let f = cgf::Function {
+            id: Some(cgf::Ident { iid: vec![0xC0; 32], bid: vec![0xC0; 32] }),
+            flow: Some(cgf::LocalFlow {
+                callsites: vec![remote(0x02, true), remote(0x09, false)],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let prog = Program {
+            funcs: [(hexid(&[0xC0; 32]), f)].into_iter().collect(),
+            repo_of: HashMap::new(),
+            packages: vec![pkg],
+        };
+        // only the genuinely foreign gRPC/GraphQL contract is looked up
+        assert_eq!(missing_remote_contracts(&prog), vec![vec![0x09; 32]]);
     }
 
     #[test]
