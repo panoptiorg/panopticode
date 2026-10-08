@@ -1,6 +1,6 @@
 [package]
 name = "panopticode"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Compositional cross-repo taint analysis over a language-neutral code graph (CGF)"
 license = "Apache-2.0"
