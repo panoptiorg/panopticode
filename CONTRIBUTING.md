@@ -5,9 +5,8 @@
 - Rust stable. CI uses the latest stable; the [Dockerfile](Dockerfile) uses 1.90.
 - `protoc`, the Protocol Buffers compiler. [`core/build.rs`](core/build.rs)
   compiles `proto/` with prost-build, and without `protoc` the build fails with
-  ``Could not find `protoc`.`` Install it with `apt-get install protobuf-compiler`
-  (Debian, Ubuntu) or `brew install protobuf` (macOS), or set `PROTOC` to the
-  binary's path.
+  ``Could not find `protoc`.`` See [Build from source](README.md#build-from-source)
+  for how to install it.
 - `python3` and `perl`, which `scripts/e2e-core.sh` uses for its assertions.
 
 Building and testing need no Go, Node, Postgres or Docker.
