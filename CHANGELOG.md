@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.3.0](https://github.com/panoptiorg/panopticode/compare/v0.2.0...v0.3.0) (2026-10-14)
+
+
+### Features
+
+* --fail-on &lt;class,...|any&gt; exits 3 when a finding matches ([5fed8da](https://github.com/panoptiorg/panopticode/commit/5fed8dadade8c113dc2424cec1c7b9f803222551))
+* hops carry col; the source hop carries the source function's location ([5fed8da](https://github.com/panoptiorg/panopticode/commit/5fed8dadade8c113dc2424cec1c7b9f803222551))
+* inert-rule warnings collapse into one line; --verbose lists them ([5fed8da](https://github.com/panoptiorg/panopticode/commit/5fed8dadade8c113dc2424cec1c7b9f803222551))
+* optional [severity] catalog table sets the SARIF level per sink class ([5fed8da](https://github.com/panoptiorg/panopticode/commit/5fed8dadade8c113dc2424cec1c7b9f803222551))
+* route.fingerprint, a route id without line numbers, for baselines across commits ([5fed8da](https://github.com/panoptiorg/panopticode/commit/5fed8dadade8c113dc2424cec1c7b9f803222551))
+* taint --format text|sarif; SARIF 2.1.0 with each route as a code flow ([5fed8da](https://github.com/panoptiorg/panopticode/commit/5fed8dadade8c113dc2424cec1c7b9f803222551))
+* the example catalog is built into the binary; --catalog is optional ([5fed8da](https://github.com/panoptiorg/panopticode/commit/5fed8dadade8c113dc2424cec1c7b9f803222551))
+
+
+### Bug Fixes
+
+* a --cgf directory with no .pb files is an error instead of zero findings ([5fed8da](https://github.com/panoptiorg/panopticode/commit/5fed8dadade8c113dc2424cec1c7b9f803222551))
+* extract and impact name a missing pc-fe ([5fed8da](https://github.com/panoptiorg/panopticode/commit/5fed8dadade8c113dc2424cec1c7b9f803222551))
+
 ## [0.2.0](https://github.com/panoptiorg/panopticode/compare/v0.1.0...v0.2.0) (2026-10-08)
 
 
