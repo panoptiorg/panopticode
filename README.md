@@ -49,7 +49,6 @@ This repository is the **engine**. It never reads source code. Per-language
 and the engine joins any number of them into one program.
 
 **More details, with visual explanations: [panopti.org](https://panopti.org)**
-· **Using it on your system: [the user guide](https://panopti.org/guide/)**
 
 ## Install
 
@@ -131,7 +130,6 @@ format a frontend writes is described in [docs/cgf.md](docs/cgf.md).
 | [Architecture](docs/architecture.md) | how the engine works |
 | [CGF](docs/cgf.md) | the input format, for frontend authors |
 | [Limitations](docs/limitations.md) | what it misses, and why |
-| [User guide](https://panopti.org/guide/) | install, run it on your repositories, check what a run missed, fit the catalog, run it in CI |
 | [Example system](docs/example.md) | the system pictured above, mapped to its code and its 18 findings |
 | [testdata/cgf](testdata/cgf/README.md) | the fixture corpus used above |
 
