@@ -50,6 +50,16 @@ schema_version = 1
 # arg-port types today; an untyped port is never filtered.
 sink_ignore_arg_types = ["context.Context"]
 
+# SEVERITY — optional. Maps a sink class to the level `taint --format sarif`
+# gives its results: "error", "warning" (the default) or "note". Nothing else
+# reads it.
+#
+# [severity]
+# sqli          = "error"
+# exec          = "error"
+# open_redirect = "note"
+# log           = "note"
+
 # ---------------------------------------------------------------------------
 # SOURCES — untrusted input surfaces. A matched result port (a getter's return
 # value) or endpoint parameter becomes tainted.

@@ -4,7 +4,6 @@
 // the chains the MR touches. Deferred: pii_categories, reachable_endpoints.
 use crate::catalog::Catalog;
 use crate::graph::Program;
-use crate::ids;
 use crate::ifds::{Engine, RunStats};
 use crate::report::{self, Chain};
 use crate::summarystore::SummaryStore;
@@ -78,11 +77,6 @@ pub struct ImpactReport {
     pub cache: CacheStats,
 }
 
-pub fn catalog_file_hash(path: &Path) -> Result<ids::Hash> {
-    let bytes = std::fs::read(path).with_context(|| format!("read catalog {path:?}"))?;
-    Ok(ids::hash_parts(&[&bytes]))
-}
-
 fn run_frontend(
     fe: &str,
     repo: &str,
@@ -106,7 +100,7 @@ fn run_frontend(
         cmd.arg("--scope").arg(s);
     }
     // our stdout is the ImpactReport JSON — route pc-fe's stdout to stderr
-    let out = cmd.output().with_context(|| format!("run {fe}"))?;
+    let out = cmd.output().map_err(|e| crate::cli::fe_err(fe, e))?;
     eprint!("{}", String::from_utf8_lossy(&out.stderr));
     eprint!("{}", String::from_utf8_lossy(&out.stdout));
     if !out.status.success() {
@@ -128,7 +122,7 @@ pub fn impact(
     base: &str,
     head: &str,
     other_cgf: &[PathBuf],
-    catalog: &PathBuf,
+    catalog: Option<&Path>,
     store_dir: &Path,
     out: Option<&Path>,
     fe: &str,
@@ -151,7 +145,7 @@ pub fn impact(
     run_frontend(fe, repo, scope, base, head, head_cgf)?;
 
     let manifest = read_manifest(head_cgf)?;
-    let cat = Catalog::load(catalog).with_context(|| format!("load catalog {catalog:?}"))?;
+    let (cat, cat_hash) = Catalog::open(catalog)?;
     let mut dirs = vec![head_cgf.to_path_buf()];
     dirs.extend(other_cgf.iter().cloned());
     let mut prog = Program {
@@ -179,7 +173,6 @@ pub fn impact(
     // coverage wave 1 §4.3 — as in `taint`: after normalize, before phase 1
     crate::httplink::link_loaded(&mut prog, true);
 
-    let cat_hash = catalog_file_hash(catalog)?;
     let mut store = SummaryStore::open(Some(store_dir), &cat_hash, 1_000_000)?;
     let mut eng = Engine::new(&prog, &cat);
     let stats = eng.run_with_store(&mut store);

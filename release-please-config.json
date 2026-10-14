@@ -9,6 +9,10 @@
       "package-name": "panopticode",
       "extra-files": [
         {
+          "type": "generic",
+          "path": "README.md"
+        },
+        {
           "type": "toml",
           "path": "core/Cargo.toml",
           "jsonpath": "$.package.version"

@@ -13,44 +13,24 @@ directory from them and is the only test script that needs the frontends.
 ## Provenance
 
 The files were produced by frontends vendoring the same `proto/cgf.proto` as
-this repository; every directory was last regenerated from panoptife-go
-`02a89e7` and panoptife-ts `ed1d213`. A CGF directory is only meaningful
-against a core whose `proto/cgf.proto` matches the one that produced it; each
-frontend's `scripts/check-proto.sh` checks that. When you regenerate, record
-the frontend commits here.
+this repository. Every directory was regenerated together, with go1.27.1, from
+panoptife-go `<go-sha>` and panoptife-ts `<ts-sha>`, the first commits that
+write span paths relative to the extracted directory. A CGF directory is only
+meaningful against a core whose `proto/cgf.proto` matches the one that
+produced it; each frontend's `scripts/check-proto.sh` checks that. When you
+regenerate, record the frontend commits here.
 
 ## Reproducibility
 
-`go/packages` reports absolute file paths and `pc-fe` records them in spans, so
-`regen-testdata.sh` first copies the fixture sources to a fixed staging path
-(`/tmp/panopticode-fixtures`, override with `STAGE`) and extracts from there.
-The committed Go spans read `/private/tmp/panopticode-fixtures/<fixture>/...`,
-except in `libwrites` and `libwrites-off`, which read
-`/tmp/panopticode-fixtures/libwrites/...`; on macOS `/tmp` is a symlink to
-`/private/tmp`, elsewhere set `STAGE=/private/tmp/panopticode-fixtures`.
-Re-running the script against the same frontend commits with the same Go
-release produces byte-identical output.
-A different Go release can change callee ids, which hash standard-library
-signatures (go1.27.1 changes the `fmt.Errorf` id in `errorleaf-*`); any other
-diff after regeneration is a bug.
-
-Known, unexplained: regenerating on go1.27.1 with the frontends at panoptife-go
-`6601c74` adds `v -> v` self-edges to some `LocalFlow`s (`dispatch-*`,
-`fieldpath-*`, `heapslots-*`, `errorleaf-*`, `miniledger-*`) and two arg-port
-field-path variants in `fieldpath-on`; `libwrites*` differ only in the staging
-prefix noted above. Whether the Go release or a frontend commit since `02a89e7`
-causes them has not been bisected. The committed directories are kept as they
-were; every suite passes on both.
-
-Coverage wave 1 added the `httpapi*`, `httpclient`, `kafka-*`, `reactapp*` and
-`nextapp` directories and regenerated `weblib` / `weblib-off` (each gains one
-inert `http:GET /api` client site), from the `feat/coverage-wave-1` working
-trees of panoptife-go and panoptife-ts with go1.27.1. Every other directory was
-left at its earlier provenance: regenerating it reproduced the bytes the
-pre-wave-1 frontends produce on the same machine, so the only differences were
-the Go-release ones above (and, for `webapp`, a pre-existing difference from the
-SvelteKit route-file fix in panoptife-ts `189d6e7`). Record the frontend commits
-here once the branch lands.
+Span paths are relative to each fixture's directory, so the bytes do not
+depend on where a checkout sits. `regen-testdata.sh` still copies the fixture
+sources to a staging directory (`/tmp/panopticode-fixtures`, override with
+`STAGE`) and extracts from there, so no fixture is extracted inside a git
+checkout, which would record that checkout's commit. Re-running the script
+against the same frontend commits with the same Go release produces
+byte-identical output. A different Go release can change callee ids, which hash
+standard-library signatures (go1.27.1 changes the `fmt.Errorf` id in
+`errorleaf-*`); any other diff after regeneration is a bug.
 
 ## The commands
 
@@ -172,7 +152,7 @@ findings they produce.
 
 ## `catalog-warn` noise
 
-Running the suite prints many `catalog-warn: inert rule ...` lines. That is
-expected: `catalog.example.toml` covers libraries (`database/sql`, `pgx`, `zap`,
+Running the suite prints a `catalog-warn: N inert rules match no call site`
+line (`--verbose` lists them). That is expected: `catalog.example.toml` covers libraries (`database/sql`, `pgx`, `zap`,
 `kafka-go`, ...) these small fixtures do not import. On a real corpus the same
 report is worth reading; see [docs/catalog.md](../../docs/catalog.md#diagnostics).

@@ -14,6 +14,7 @@ mod compose;
 mod heap;
 mod impact;
 mod report;
+mod output;
 mod witness;
 mod backward;
 mod storage;

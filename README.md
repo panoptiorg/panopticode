@@ -50,10 +50,39 @@ and the engine joins any number of them into one program.
 
 **More details, with visual explanations: [panopti.org](https://panopti.org)**
 
+## Install
+
+Prebuilt binaries for Linux and macOS (x86_64 and aarch64) are attached to each
+[GitHub release](https://github.com/panoptiorg/panopticode/releases). Each
+tarball holds `panopticode`, `catalog.example.toml`, the README and the license,
+and comes with a `.sha256` file:
+
+<!-- x-release-please-start-version -->
+```bash
+target=aarch64-apple-darwin   # or x86_64-apple-darwin, x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu
+base=https://github.com/panoptiorg/panopticode/releases/download/v0.2.0
+file=panopticode-0.2.0-$target.tar.gz
+curl -fLO $base/$file -O $base/$file.sha256
+shasum -a 256 -c $file.sha256
+tar -xzf $file
+```
+<!-- x-release-please-end -->
+
+### Build from source
+
+You need Rust and `protoc` (`apt-get install protobuf-compiler` or
+`brew install protobuf`, or set `PROTOC` to the binary's path):
+
+```bash
+cargo build --release --manifest-path core/Cargo.toml   # core/target/release/panopticode
+```
+
 ## Quickstart
 
-You need Rust and `protoc`. The repository ships pre-extracted CGF for the
-three repositories presented in [docs/example](docs/example.md), so you can try the engine without running a frontend:
+The quickstart needs a clone of this repository, which ships pre-extracted CGF
+for three of the four repositories presented in [docs/example](docs/example.md)
+(the fourth, `downstream`, adds three more findings there), so you can try the
+engine without running a frontend:
 
 ```bash
 cargo build --manifest-path core/Cargo.toml

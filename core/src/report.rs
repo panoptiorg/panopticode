@@ -11,6 +11,11 @@ use std::collections::HashMap;
 pub struct Span {
     pub file: String,
     pub line: i32,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub col: i32,
+}
+fn is_zero(n: &i32) -> bool {
+    *n == 0
 }
 #[derive(Serialize, Clone)]
 pub struct Hop {
@@ -150,6 +155,7 @@ fn to_span(s: &Option<cgf::Span>) -> Option<Span> {
     s.as_ref().map(|sp| Span {
         file: sp.file.clone(),
         line: sp.line,
+        col: sp.col,
     })
 }
 
@@ -501,6 +507,7 @@ mod tests {
             func: "f".into(),
             file: Some("a.go".into()),
             line: Some(10),
+            col: None,
             kind: HopKind::Source,
             callee: String::new(),
             field: field.map(|s| s.into()),
@@ -520,12 +527,14 @@ mod tests {
             sink_span: Some(Span {
                 file: "a.go".into(),
                 line,
+                col: 0,
             }),
             sink_field: sink_field.map(|s| s.into()),
             sink_fields: Vec::new(),
             hops: Vec::new(),
             route: Some(Route {
                 id: route_id.into(),
+                fingerprint: String::new(),
                 hops: vec![hop(None), hop(sink_field)],
                 incomplete: None,
                 boundaries: 0,

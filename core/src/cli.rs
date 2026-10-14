@@ -6,6 +6,7 @@ use crate::ifds::Engine;
 use crate::summarystore::SummaryStore;
 use crate::{backward, compose, report};
 use crate::normalize::normalize_loaded;
+use crate::output::{self, FailOn, Format};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -38,8 +39,9 @@ enum Cmd {
     Taint {
         #[arg(long = "cgf", required = true)]
         cgf: Vec<PathBuf>,
-        #[arg(long, default_value = "catalog.example.toml")]
-        catalog: PathBuf,
+        /// policy file; default: the example catalog built into the binary
+        #[arg(long)]
+        catalog: Option<PathBuf>,
         /// filter chains whose source fn fqn contains this substring
         #[arg(long)]
         endpoint: Option<String>,
@@ -115,13 +117,25 @@ enum Cmd {
         /// chains printed on stdout are unchanged.
         #[arg(long)]
         unmodeled: Option<PathBuf>,
-        /// Do not link synthetic HTTP client sites to the loaded HTTP routes
-        /// (coverage wave 1). Linked, a client request whose method and path
+        /// Do not link synthetic HTTP client sites to the loaded HTTP routes.
+        /// Linked, a client request whose method and path
         /// match a route becomes a cross-service call into its handler, like a
         /// gRPC method; unlinked, the site is inert and the chains are exactly
         /// those of a corpus without HTTP facts.
         #[arg(long = "no-http-link")]
         no_http_link: bool,
+        /// Output format on stdout: `json` (the chains), `text`, or `sarif`
+        /// (SARIF 2.1.0, for code scanning and the VS Code SARIF Viewer).
+        #[arg(long, value_enum, default_value = "json")]
+        format: Format,
+        /// Exit 3 after writing the output if any chain's sink class is in
+        /// this comma-separated list, or if there is any chain for `any`.
+        /// A class the catalog does not define is a usage error.
+        #[arg(long = "fail-on")]
+        fail_on: Option<String>,
+        /// List every inert catalog rule instead of counting them.
+        #[arg(short, long)]
+        verbose: bool,
     },
     /// Dump the loaded function/contract counts.
     GraphDump {
@@ -132,8 +146,9 @@ enum Cmd {
     Summary {
         #[arg(long = "cgf", required = true)]
         cgf: Vec<PathBuf>,
-        #[arg(long, default_value = "catalog.example.toml")]
-        catalog: PathBuf,
+        /// policy file; default: the example catalog built into the binary
+        #[arg(long)]
+        catalog: Option<PathBuf>,
         #[arg(long)]
         fn_: String,
     },
@@ -152,8 +167,9 @@ enum Cmd {
         /// pre-extracted CGF dirs of OTHER repos to compose cross-repo
         #[arg(long = "cgf")]
         cgf: Vec<PathBuf>,
-        #[arg(long, default_value = "catalog.example.toml")]
-        catalog: PathBuf,
+        /// policy file; default: the example catalog built into the binary
+        #[arg(long)]
+        catalog: Option<PathBuf>,
         /// summary store dir (warm it with a baseline `taint --store` run)
         #[arg(long)]
         store: PathBuf,
@@ -250,9 +266,12 @@ pub fn run() -> Result<()> {
             pb_getters,
             unmodeled,
             no_http_link,
+            format,
+            fail_on,
+            verbose,
         } => taint(
             &cgf,
-            &catalog,
+            catalog.as_deref(),
             endpoint.as_deref(),
             pg.as_deref(),
             store.as_deref(),
@@ -269,9 +288,10 @@ pub fn run() -> Result<()> {
                 http_link: !no_http_link,
             },
             unmodeled.as_deref(),
+            Output { format, fail_on, verbose },
         ),
         Cmd::GraphDump { cgf } => graph_dump(&cgf),
-        Cmd::Summary { cgf, catalog, fn_ } => summary_dbg(&cgf, &catalog, &fn_),
+        Cmd::Summary { cgf, catalog, fn_ } => summary_dbg(&cgf, catalog.as_deref(), &fn_),
         Cmd::Impact {
             repo,
             scope,
@@ -289,7 +309,7 @@ pub fn run() -> Result<()> {
             &base,
             &head,
             &cgf,
-            &catalog,
+            catalog.as_deref(),
             &store,
             out.as_deref(),
             &fe,
@@ -311,13 +331,23 @@ pub fn run() -> Result<()> {
     }
 }
 
+/// Why `fe` could not be started. A missing binary reads like a missing repo
+/// unless it is named.
+pub(crate) fn fe_err(fe: &str, e: std::io::Error) -> anyhow::Error {
+    if e.kind() == std::io::ErrorKind::NotFound {
+        anyhow::anyhow!("{fe} not found (install panoptife-go or pass --fe <path>)")
+    } else {
+        anyhow::anyhow!("run {fe}: {e}")
+    }
+}
+
 fn extract(fe: &str, repo: &str, scope: Option<&str>, mode: &str, out: &PathBuf) -> Result<()> {
     let mut cmd = Command::new(fe);
     cmd.arg("build").arg(repo).arg("--out").arg(out).arg("--mode").arg(mode);
     if let Some(s) = scope {
         cmd.arg("--scope").arg(s);
     }
-    let status = cmd.status().with_context(|| format!("run {fe}"))?;
+    let status = cmd.status().map_err(|e| fe_err(fe, e))?;
     if !status.success() {
         anyhow::bail!("pc-fe exited with {status}");
     }
@@ -346,6 +376,13 @@ fn load(cgf: &[PathBuf], http_link: bool) -> Result<Program> {
     Ok(prog)
 }
 
+/// What `taint` prints and when it fails.
+struct Output {
+    format: Format,
+    fail_on: Option<String>,
+    verbose: bool,
+}
+
 /// doc 35 taint-side options. Separate struct so the arity of `taint` stops
 /// growing by one per flag.
 #[derive(Clone, Copy, Default)]
@@ -361,7 +398,7 @@ struct TaintOpts {
 
 fn taint(
     cgf: &[PathBuf],
-    catalog: &PathBuf,
+    catalog: Option<&std::path::Path>,
     endpoint: Option<&str>,
     pg: Option<&str>,
     store_dir: Option<&std::path::Path>,
@@ -371,14 +408,24 @@ fn taint(
     no_error_leaf: bool,
     opts: TaintOpts,
     unmodeled: Option<&std::path::Path>,
+    out: Output,
 ) -> Result<()> {
-    let cat = Catalog::load(catalog).with_context(|| format!("load catalog {catalog:?}"))?;
+    let (cat, cat_hash) = Catalog::open(catalog)?;
+    // a typo must not run the whole analysis, nor let CI pass
+    let fail_on = match out.fail_on.as_deref().map(|s| FailOn::parse(s, &cat)) {
+        Some(Err(e)) => {
+            eprintln!("error: {e}");
+            std::process::exit(2);
+        }
+        Some(Ok(f)) => Some(f),
+        None => None,
+    };
     let prog = load(cgf, opts.http_link)?;
     // Loud failures (measurements 2026-09-01, 00-report §4): a catalog rule
     // that matches nothing and a callee with no body both used to produce
     // "no finding" indistinguishable from "nothing there". stderr, once per
     // run, before any analysis — a property of the inputs, not of a chain.
-    catalog_fit_report(&cat, &prog);
+    catalog_fit_report(&cat, &prog, out.verbose);
     opacity_report(&prog);
     let tr = match trace_path {
         Some(p) => Some(
@@ -423,10 +470,7 @@ fn taint(
     }
     let stats = match store_dir {
         Some(dir) => {
-            let cat_hash = crate::summarystore::env_hash(
-                &crate::impact::catalog_file_hash(catalog)?,
-                &env_flags,
-            );
+            let cat_hash = crate::summarystore::env_hash(&cat_hash, &env_flags);
             let mut store = SummaryStore::open(Some(dir), &cat_hash, 1_000_000)?;
             eng.run_with_store(&mut store)
         }
@@ -520,7 +564,7 @@ fn taint(
     if let Some(t) = &tr {
         t.flush();
     }
-    println!("{}", serde_json::to_string_pretty(&chains)?);
+    println!("{}", output::render(out.format, &chains, &cat)?);
     eprintln!(
         "functions={} summaries={} contracts_linked={} remote_leaves={} chains={} cache_hits={} cache_misses={}",
         prog.funcs.len(),
@@ -531,6 +575,13 @@ fn taint(
         stats.hits,
         stats.misses
     );
+    if let Some(f) = fail_on {
+        let n = f.count(&chains);
+        if n > 0 {
+            eprintln!("fail-on: {n} finding(s) in the listed classes");
+            std::process::exit(3);
+        }
+    }
     Ok(())
 }
 
@@ -538,7 +589,7 @@ fn taint(
 /// matches no callee fqn in the loaded CGF. Distinct callee fqns only, so the
 /// cost is rules × distinct callees (broker corpus: ~50 × ~60k, well under a
 /// second).
-fn catalog_fit_report(cat: &Catalog, prog: &Program) {
+fn catalog_fit_report(cat: &Catalog, prog: &Program, verbose: bool) {
     let mut fqns: std::collections::HashSet<&str> = std::collections::HashSet::new();
     // (fqn, argc) — the arg-range check needs the width of the call, and
     // distinct pairs are enough for "was the index EVER in range".
@@ -563,8 +614,15 @@ fn catalog_fit_report(cat: &Catalog, prog: &Program) {
         fqns.len(),
         if inert.is_empty() { "" } else { " — inert rules follow; docs/catalog.md explains these lines" }
     );
-    for (section, tag, label) in &inert {
-        eprintln!("catalog-warn: inert rule {section}[{tag}] {label:?} — no call site matches it (zero recall here)");
+    if verbose {
+        for (section, tag, label) in &inert {
+            eprintln!("catalog-warn: inert rule {section}[{tag}] {label:?} — no call site matches it (zero recall here)");
+        }
+    } else if !inert.is_empty() {
+        eprintln!(
+            "catalog-warn: {} inert rules match no call site (list them with --verbose)",
+            inert.len()
+        );
     }
     // The other inertness: the NAME matches, so the rule counts as fitted
     // above, but the arg index is wider than any of those call sites.
@@ -658,8 +716,8 @@ fn module_of(fqn: &str) -> Option<String> {
     })
 }
 
-fn summary_dbg(cgf: &[PathBuf], catalog: &PathBuf, fnpat: &str) -> Result<()> {
-    let cat = Catalog::load(catalog)?;
+fn summary_dbg(cgf: &[PathBuf], catalog: Option<&std::path::Path>, fnpat: &str) -> Result<()> {
+    let (cat, _) = Catalog::open(catalog)?;
     let prog = load(cgf, true)?;
     let mut eng = Engine::new(&prog, &cat);
     eng.run();

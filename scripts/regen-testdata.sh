@@ -20,11 +20,10 @@
 #   DEST            output root                          (default: testdata/cgf)
 #   STAGE           staging dir for fixture sources      (default: /tmp/panopticode-fixtures)
 #
-# Why STAGE: go/packages reports ABSOLUTE file paths, and pc-fe records them in
-# CGF spans. Extracting straight out of a developer's checkout would bake that
-# developer's home directory into a committed artifact and make the bytes differ
-# per machine. Copying the fixtures to a fixed neutral path first makes the
-# golden CGF byte-reproducible anywhere.
+# Why STAGE: span paths are relative to the extracted directory, but a fixture
+# extracted inside a git checkout records that checkout's commit. Copying the
+# fixtures to a directory outside any checkout first keeps the golden CGF
+# byte-reproducible anywhere.
 #
 # Build the frontends first:
 #   ( cd ../panoptife-go && go build -o bin/pc-fe ./cmd/pc-fe )
