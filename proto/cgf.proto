@@ -56,6 +56,8 @@ enum Generator {
 }
 
 message Span {
+  // Path relative to the directory the frontend was run on, "/"-separated;
+  // a file outside that directory keeps its absolute path.
   string file = 1;
   int32  line = 2;
   int32  col  = 3;

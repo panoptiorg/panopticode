@@ -30,6 +30,9 @@ CgfPackage            repo, language, package_path, commit_sha
   to a result port; the core supplies that through the callee's summary.
 - `field_path` holds up to two field indices; `field_names` the matching names
   for output.
+- A `span`'s `file` is relative to the directory the frontend was run on, with
+  `/` separators, so the same checkout gives the same CGF wherever it sits on
+  disk. A file outside that directory keeps its absolute path.
 - `IN_GLOBAL` and `OUT_FIELD` vertices with a `sym` are heap cells (Go, only
   with `pc-fe --heap-slots`).
 - A call site's `callee_iids` lists resolved targets (several for virtual

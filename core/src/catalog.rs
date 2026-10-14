@@ -1,11 +1,16 @@
 // catalog.toml loader — sources / sinks / sanitizers / propagators (doc 04 §3).
-use anyhow::Result;
+use crate::ids;
+use anyhow::{Context, Result};
 use regex::Regex;
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::path::Path;
 
 #[derive(Debug, Deserialize)]
 pub struct RawCatalog {
+    /// sink class -> `"error" | "warning" | "note"`, used by `--format sarif`
+    #[serde(default)]
+    pub severity: BTreeMap<String, String>,
     /// Coverage wave 1 §4.2 (E3): a sink never fires on an arg port whose
     /// vertex `type` is one of these exact strings (`"context.Context"`). A
     /// request object seeded whole would otherwise turn every `ctx`-taking sink
@@ -274,6 +279,8 @@ pub struct ErrorWrapperRule {
 }
 
 pub struct Catalog {
+    /// sink class -> severity; a class with no entry is `warning`
+    pub severity: BTreeMap<String, Severity>,
     /// see `RawCatalog::sink_ignore_arg_types`
     pub sink_ignore_arg_types: Vec<String>,
     pub sources: Vec<SourceRule>,
@@ -283,9 +290,58 @@ pub struct Catalog {
     pub propagators: Vec<PropagatorRule>,
 }
 
+/// SARIF result level of a sink class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Severity {
+    Error,
+    Warning,
+    Note,
+}
+
+impl Severity {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Severity::Error => "error",
+            Severity::Warning => "warning",
+            Severity::Note => "note",
+        }
+    }
+}
+
+/// The example catalog, compiled in: what `--catalog` defaults to.
+pub const BUILTIN: &str = include_str!("../../catalog.example.toml");
+
 impl Catalog {
+    #[cfg(test)]
     pub fn load(path: &Path) -> Result<Catalog> {
         Self::load_str(&std::fs::read_to_string(path)?)
+    }
+
+    /// Load the catalog a command was given, or the built-in one. Also returns
+    /// the hash of its bytes, the summary-store namespace: the built-in copy
+    /// hashes like the file it was compiled from.
+    pub fn open(path: Option<&Path>) -> Result<(Catalog, ids::Hash)> {
+        let (src, what) = match path {
+            Some(p) => (
+                std::fs::read_to_string(p).with_context(|| format!("load catalog {p:?}"))?,
+                format!("{p:?}"),
+            ),
+            None => {
+                eprintln!("catalog: built-in example (pass --catalog <file> to use your own)");
+                (BUILTIN.to_string(), "built-in".to_string())
+            }
+        };
+        let cat = Self::load_str(&src).with_context(|| format!("load catalog {what}"))?;
+        Ok((cat, ids::hash_parts(&[src.as_bytes()])))
+    }
+
+    /// Sink classes the catalog defines, sorted.
+    pub fn sink_classes(&self) -> std::collections::BTreeSet<&str> {
+        self.sinks.iter().map(|r| r.class.as_str()).collect()
+    }
+
+    pub fn severity_of(&self, class: &str) -> Severity {
+        self.severity.get(class).copied().unwrap_or(Severity::Warning)
     }
 
     pub fn load_str(toml_src: &str) -> Result<Catalog> {
@@ -302,7 +358,20 @@ impl Catalog {
                 anyhow::bail!("[[{section}]] rule {label:?}: `to` applies to [[sources]] only");
             }
         }
+        let mut severity = BTreeMap::new();
+        for (class, v) in &raw.severity {
+            let sev = match v.as_str() {
+                "error" => Severity::Error,
+                "warning" => Severity::Warning,
+                "note" => Severity::Note,
+                _ => anyhow::bail!(
+                    "[severity] {class:?}: expected \"error\", \"warning\" or \"note\", got {v:?}"
+                ),
+            };
+            severity.insert(class.clone(), sev);
+        }
         Ok(Catalog {
+            severity,
             sink_ignore_arg_types: raw.sink_ignore_arg_types.clone(),
             sources: raw
                 .sources
@@ -1051,5 +1120,16 @@ arg = "3"
         assert!(cat.sink_of("io/fs.ReadFile").is_none());
         assert!(cat.is_error_wrapper("fmt.Sprintf"));
         assert!(cat.is_error_wrapper("fmt.Errorf"));
+    }
+
+    /// The summary-store namespace is the catalog hash; the built-in copy must
+    /// hash like the file it was compiled from.
+    #[test]
+    fn built_in_catalog_hashes_like_the_file() {
+        let file = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../catalog.example.toml")).unwrap();
+        assert_eq!(BUILTIN.as_bytes(), file.as_slice());
+        let (cat, h) = Catalog::open(None).unwrap();
+        assert_eq!(h, ids::hash_parts(&[&file]));
+        assert!(cat.sink_classes().contains("sqli"));
     }
 }

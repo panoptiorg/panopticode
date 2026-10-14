@@ -82,6 +82,9 @@ pub struct RouteHop {
     pub file: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub line: Option<i32>,
+    /// column of `line`, when the frontend recorded one
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub col: Option<i32>,
     pub kind: HopKind,
     /// callee fqn at this hop (empty for source/sink terminals)
     #[serde(skip_serializing_if = "String::is_empty")]
@@ -124,6 +127,9 @@ pub struct Route {
     /// route, so a consumer can cache it, diff two analyses, or let an LLM
     /// reference one route out of many (doc 24 WS-A).
     pub id: String,
+    /// Like `id` but without line and column: the flow's shape, which survives
+    /// edits that only move code. For dedup and baselines across commits.
+    pub fingerprint: String,
     pub hops: Vec<RouteHop>,
     /// None = the route reaches its sink; Some(_) = it stops early, with why
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -356,10 +362,23 @@ impl<'a, 'e> Walk<'a, 'e> {
             true,
             &Residual::default(),
         );
+        let id = route_id(class, &hops);
+        // The source hop carries the source function's span unless the seed
+        // vertex had its own. Set after `id` so ids do not depend on it.
+        if let (Some(h), Some(f)) = (hops.first_mut(), self.engine.prog.funcs.get(fn_iid)) {
+            if h.kind == HopKind::Source && h.file.is_none() {
+                if let Some(sp) = &f.span {
+                    h.file = Some(sp.file.clone());
+                    h.line = Some(sp.line);
+                    h.col = col_of(Some(sp));
+                }
+            }
+        }
         let boundaries = hops.iter().filter(|h| h.kind == HopKind::Boundary).count();
         let terminal = if incomplete.is_none() { self.terminal.take() } else { None };
         Route {
-            id: route_id(class, &hops),
+            id,
+            fingerprint: route_fingerprint(class, &hops),
             hops,
             incomplete,
             boundaries,
@@ -485,6 +504,7 @@ impl<'a, 'e> Walk<'a, 'e> {
                 func: f.fqn.clone(),
                 file: cs.span.as_ref().map(|s| s.file.clone()),
                 line: cs.span.as_ref().map(|s| s.line),
+                col: col_of(cs.span.as_ref()),
                 kind: if is_boundary(cs) {
                     HopKind::Boundary
                 } else {
@@ -515,6 +535,7 @@ impl<'a, 'e> Walk<'a, 'e> {
                 func: f.fqn.clone(),
                 file: ps.span.as_ref().map(|s| s.file.clone()),
                 line: ps.span.as_ref().map(|s| s.line),
+                col: col_of(ps.span.as_ref()),
                 kind: HopKind::Heap,
                 callee: via.cell.clone(),
                 field: field_of(flow, ps.last, resid),
@@ -565,6 +586,7 @@ impl<'a, 'e> Walk<'a, 'e> {
                     func: f.fqn.clone(),
                     file: cs.span.as_ref().map(|s| s.file.clone()),
                     line: cs.span.as_ref().map(|s| s.line),
+                col: col_of(cs.span.as_ref()),
                     kind: HopKind::Sink,
                     callee: cs.callee_fqn.clone(),
                     field: field_of(flow, ps.last, resid),
@@ -586,6 +608,7 @@ impl<'a, 'e> Walk<'a, 'e> {
                 func: f.fqn.clone(),
                 file: cs.span.as_ref().map(|s| s.file.clone()),
                 line: cs.span.as_ref().map(|s| s.line),
+                col: col_of(cs.span.as_ref()),
                 kind: HopKind::Sink,
                 callee: cs.callee_fqn.clone(),
                 field: field_of(flow, ps.last, resid),
@@ -664,6 +687,7 @@ impl<'a, 'e> Walk<'a, 'e> {
                     func: f.fqn.clone(),
                     file: cs.span.as_ref().map(|s| s.file.clone()),
                     line: cs.span.as_ref().map(|s| s.line),
+                col: col_of(cs.span.as_ref()),
                     kind: if boundary { HopKind::Boundary } else { HopKind::Call },
                     callee: match self.http_labels.get(&callee_iid) {
                         Some(label) if boundary => label.clone(),
@@ -810,6 +834,7 @@ impl<'a, 'e> Walk<'a, 'e> {
             func: f.fqn.clone(),
             file: span.as_ref().map(|s| s.file.clone()),
             line: span.as_ref().map(|s| s.line),
+            col: col_of(span.as_ref()),
             kind: HopKind::Source,
             callee: String::new(),
             field: flow.zip(seed).and_then(|(fl, s)| field_of(fl, s, resid)),
@@ -842,6 +867,11 @@ impl Drop for Walk<'_, '_> {
             s.cand_capped
         );
     }
+}
+
+/// `Span.col`, None when unset (0).
+fn col_of(s: Option<&cgf::Span>) -> Option<i32> {
+    s.map(|s| s.col).filter(|c| *c > 0)
 }
 
 fn is_boundary(cs: &cgf::CallSite) -> bool {
@@ -903,6 +933,19 @@ fn route_id(class: &str, hops: &[RouteHop]) -> String {
         parts.push(h.func.as_bytes().to_vec());
         parts.push(h.callee.as_bytes().to_vec());
         parts.push(h.line.unwrap_or(-1).to_le_bytes().to_vec());
+        parts.push(format!("{:?}", h.kind).into_bytes());
+    }
+    let refs: Vec<&[u8]> = parts.iter().map(|p| p.as_slice()).collect();
+    crate::ids::hex(&crate::ids::hash_parts(&refs))[..12].to_string()
+}
+
+/// Hash of the route's shape: `route_id` minus line numbers.
+fn route_fingerprint(class: &str, hops: &[RouteHop]) -> String {
+    let mut parts: Vec<Vec<u8>> = vec![class.as_bytes().to_vec()];
+    for h in hops {
+        parts.push(h.repo.as_bytes().to_vec());
+        parts.push(h.func.as_bytes().to_vec());
+        parts.push(h.callee.as_bytes().to_vec());
         parts.push(format!("{:?}", h.kind).into_bytes());
     }
     let refs: Vec<&[u8]> = parts.iter().map(|p| p.as_slice()).collect();
@@ -1508,5 +1551,32 @@ mod tests {
         assert_eq!(unview_slot(&sp(Slot::Param(1), &[]), &shape).slot, Slot::Param(3));
         // a dangling port (normalize.rs pushes unknown names past the end)
         assert_eq!(unview_slot(&sp(Slot::Param(9), &[]), &shape).slot, Slot::Param(9));
+    }
+
+    fn rhop(kind: HopKind, line: i32) -> RouteHop {
+        RouteHop {
+            repo: "r".into(),
+            func: "f".into(),
+            file: Some("a.go".into()),
+            line: Some(line),
+            col: Some(3),
+            kind,
+            callee: "g".into(),
+            field: None,
+            fields: Vec::new(),
+            confidence: 1.0,
+        }
+    }
+
+    /// The id names the exact route; the fingerprint survives code moving.
+    #[test]
+    fn fingerprint_ignores_lines_but_not_shape() {
+        let a = [rhop(HopKind::Source, 1), rhop(HopKind::Sink, 10)];
+        let moved = [rhop(HopKind::Source, 5), rhop(HopKind::Sink, 14)];
+        assert_ne!(route_id("sqli", &a), route_id("sqli", &moved));
+        assert_eq!(route_fingerprint("sqli", &a), route_fingerprint("sqli", &moved));
+        assert_ne!(route_fingerprint("sqli", &a), route_fingerprint("xss", &a));
+        assert_ne!(route_fingerprint("sqli", &a), route_fingerprint("sqli", &a[..1]));
+        assert_eq!(route_fingerprint("sqli", &a).len(), 12);
     }
 }

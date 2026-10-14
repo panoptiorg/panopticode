@@ -179,11 +179,13 @@ impl Program {
             repo_of: HashMap::new(),
             packages: Vec::new(),
         };
+        let mut found = 0;
         for entry in std::fs::read_dir(dir).with_context(|| format!("read_dir {dir:?}"))? {
             let path = entry?.path();
             if path.extension().and_then(|s| s.to_str()) != Some("pb") {
                 continue;
             }
+            found += 1;
             let bytes = std::fs::read(&path)?;
             let pkg =
                 cgf::CgfPackage::decode(&*bytes).with_context(|| format!("decode {path:?}"))?;
@@ -195,6 +197,11 @@ impl Program {
                 }
             }
             prog.packages.push(pkg);
+        }
+        // An empty directory is a wrong path or a failed extraction, and the
+        // run over it would look like a clean one.
+        if found == 0 {
+            anyhow::bail!("no CGF files (*.pb) in {}", dir.display());
         }
         Ok(prog)
     }

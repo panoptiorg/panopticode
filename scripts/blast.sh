@@ -2,8 +2,8 @@
 #
 # blast.sh — PG-backed blast radius for a changed repo.
 # NO extraction: computes the repo's changed files (git diff vs --base,
-# including uncommitted worktree changes) and hands them to
-# `panopticode query blast`, which maps them to persisted fn nodes via
+# including uncommitted worktree changes, relative to <repo-path>) and hands
+# them to `panopticode query blast`, which maps them to persisted fn nodes via
 # nodes.span_file and walks edges backwards (calls / binds_to /
 # invokes_remote) to every upstream repo and boundary endpoint.
 #
@@ -48,12 +48,14 @@ REPO="$(awk '/^module /{print $2; exit}' "$REPO_PATH/go.mod" 2>/dev/null || true
 [ -n "$REPO" ] || { echo "blast.sh: no go.mod module in $REPO_PATH" >&2; exit 1; }
 
 # changed files vs base (falls back to HEAD when base ref doesn't exist),
-# INCLUDING uncommitted worktree changes
+# INCLUDING uncommitted worktree changes. --relative makes them relative to
+# <repo-path> (the module dir, possibly below the git root), which is how
+# current CGF stores spans; older CGF with absolute spans still matches by suffix.
 if ! git -C "$REPO_PATH" rev-parse --verify -q "$BASE" >/dev/null; then
   echo ">> base '$BASE' not found, using HEAD" >&2
   BASE="HEAD"
 fi
-CHANGED="$(git -C "$REPO_PATH" diff --name-only "$BASE" -- '*.go' | sort -u)"
+CHANGED="$(git -C "$REPO_PATH" diff --name-only --relative "$BASE" -- '*.go' | sort -u)"
 [ -n "$CHANGED" ] || { echo "no changed .go files vs $BASE — empty blast radius"; exit 0; }
 echo ">> repo: $REPO  base: $BASE" >&2
 echo ">> changed files:" >&2; sed 's/^/     /' <<<"$CHANGED" >&2

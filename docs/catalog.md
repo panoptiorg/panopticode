@@ -4,16 +4,18 @@ The catalog is the whole security policy. Frontends emit structural facts only;
 everything the tool calls a source, sink, sanitizer or propagator comes from
 this TOML file, which only the core reads. Start from
 [`catalog.example.toml`](../catalog.example.toml), which the test suite also
-runs against.
+runs against. The binary carries a copy of it, which `taint`, `summary` and
+`impact` use when `--catalog` is not given.
 
 ## Format
 
-Five optional arrays of tables and one top-level key. These are the only keys
-the core reads:
+Five optional arrays of tables, one optional table and one top-level key. These
+are the only keys the core reads:
 
 | table | keys |
 |---|---|
 | top level | `sink_ignore_arg_types` (a list of type strings) |
+| `[severity]` | sink class = `"error"`, `"warning"` or `"note"` |
 | `[[sources]]` | `kind`, `selector`, `selector_regex`, `to` |
 | `[[sinks]]` | `class`, `selector`, `selector_regex`, `arg` |
 | `[[sanitizers]]` | `kind`, `selector`, `selector_regex` |
@@ -26,8 +28,16 @@ the load. Any other key or table, including
 silently ignored. A misspelled table name therefore removes all its rules
 without an error; check the `catalog-fit` line (below) after editing.
 
+`[severity]` sets the level `taint --format sarif` gives the results of a sink
+class (see [SARIF](cli.md#sarif)); a class without an entry is `warning`, and
+any other value fails the load. It does not change which chains are found.
+
 ```toml
 sink_ignore_arg_types = ["context.Context"]
+
+[severity]
+sqli          = "error"
+open_redirect = "note"
 
 [[sources]]
 kind           = "ts_url_query"         # free text, never matched on
@@ -189,17 +199,24 @@ sink at `app.go:124`.
 Every `taint` run prints, on stderr:
 
 ```
+catalog: built-in example (pass --catalog <file> to use your own)
 catalog-fit: N/M rules match at least one call site (K distinct callees) — inert rules follow; ...
-catalog-warn: inert rule <section>[<class or kind>] "<selector>" — no call site matches it (zero recall here)
+catalog-warn: N inert rules match no call site (list them with --verbose)
 catalog-warn: sink rule [<class>] "<selector>" arg N never in range (max argc seen M) — it can never fire
 catalog-warn: source rule [<kind>] "<selector>" `to` port never in range (max argc seen M) — it can never seed it
 catalog-fit: N/M propagators match at least one call site
 opaque: X of Y call sites into a Go module or func value have no loaded body (default leaf: ...) — top modules: ...
 ```
 
-`M` in the first line counts sources, sinks, sanitizers and error wrappers.
-An inert rule produces no findings and no other signal, so read these lines on
-every new corpus. The arg-range warning covers a sink whose name matches but
+The first line appears when no `--catalog` was given. `M` in the second counts
+sources, sinks, sanitizers and error wrappers. An inert rule produces no
+findings and no other signal, so read these lines on every new corpus. The
+inert rules are only counted; `--verbose` lists them, one line each:
+
+```
+catalog-warn: inert rule <section>[<class or kind>] "<selector>" — no call site matches it (zero recall here)
+```
+ The arg-range warning covers a sink whose name matches but
 whose `arg` index exceeds every matching call's argument count; the `to`
 warning is the same for a source whose `to` names argument ports no matching
 call has. Inert
@@ -220,7 +237,7 @@ covers. That is expected.
   more). Its rules were written from each library's API shape and are checked
   only by the `example_catalog_shapes` unit test in `core/src/catalog.rs`; they
   have not been measured against a real corpus.
-- Coverage wave 1 added, from API shapes and equally unmeasured: `read:`
+- Since 0.2.0 it also has, from API shapes and equally unmeasured: `read:`
   sources on `net/http.Request`'s fields (`Body`, `Form`, `PostForm`,
   `MultipartForm`, `Header`, `Trailer`, `URL`, `Host`, `RequestURI`; needs
   `pc-fe --surface-reads`); the gin `Bind*`/`ShouldBind*` family and echo
@@ -253,13 +270,13 @@ covers. That is expected.
 
 ## Fitting a catalog to a codebase
 
-1. Run once and read the fit report. Many inert rules means the vocabulary is
-   wrong for this codebase.
+1. Run once with `--verbose` and read the fit report. Many inert rules means
+   the vocabulary is wrong for this codebase.
 2. List the real terminal operations (SQL, exec, file, outbound HTTP, logging):
    for each, the exact callee fqn as it appears in the CGF (`summary --fn` or
    a `--trace` run shows them), the sink class, and which argument carries the
    data.
-3. Add rules and rerun until the inert list is empty or deliberately kept for
+3. Add rules and rerun (still with `--verbose`) until the inert list is empty or deliberately kept for
    other repositories.
 4. Run with `--unmodeled` and add propagators (or `to = "none"`) for what it
    lists.

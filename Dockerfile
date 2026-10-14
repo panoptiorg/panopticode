@@ -2,7 +2,7 @@
 #
 #   docker build -t panopticode .
 #   docker run --rm -v "$PWD/cgf:/cgf" panopticode \
-#     taint --cgf /cgf/gateway --cgf /cgf/ledger-svc --catalog /etc/panopticode/catalog.example.toml
+#     taint --cgf /cgf/webapp --cgf /cgf/federation --cgf /cgf/backend --catalog /etc/panopticode/catalog.example.toml
 #
 # NOTE: this image contains the CORE ONLY. Extraction — turning a repo into CGF
 # — is done by a separate frontend binary (`pc-fe` for Go, `pc-fe-ts` for
@@ -27,6 +27,8 @@ RUN mkdir -p core/src && echo 'fn main() {}' > core/src/main.rs \
  && rm -rf core/src
 
 COPY proto ./proto
+# core/src/catalog.rs embeds it with include_str!
+COPY catalog.example.toml ./catalog.example.toml
 COPY core ./core
 # touch so cargo does not reuse the stub main.rs fingerprint
 RUN touch core/src/main.rs && cargo build --release --manifest-path core/Cargo.toml

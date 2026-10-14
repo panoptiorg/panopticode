@@ -7,28 +7,32 @@ panopticode --version
 
 | command | what it does | needs |
 |---|---|---|
-| `taint` | the analysis: load CGF, summarize, compose, print chains as JSON | CGF dirs, a catalog; Postgres only with `--pg` |
+| `taint` | the analysis: load CGF, summarize, compose, print chains as JSON, text or SARIF | CGF dirs; a catalog (the built-in one by default); Postgres only with `--pg` |
 | `graph-dump` | counts of what was loaded | CGF dirs |
-| `summary` | debug print of computed summaries | CGF dirs, a catalog |
+| `summary` | debug print of computed summaries | CGF dirs; a catalog (optional) |
 | `extract` | run the Go frontend `pc-fe` | `pc-fe` |
 | `impact` | merge-request mode against a warm summary store | a git checkout, `pc-fe`, a store dir |
 | `query blast\|reach\|path` | read-only queries over a persisted call graph | Postgres filled by `taint --pg` |
 
 `--cgf <dir>` reads every `*.pb` file directly in that directory (not
 recursively). Repeat it to load several repositories into one program. A
-directory with no `.pb` files is not an error: it loads zero functions and the
-run succeeds with no chains.
+directory with no `.pb` files is an error (`no CGF files (*.pb) in <dir>`):
+it is a wrong path or a failed extraction, and a run over it would look like a
+clean one.
 
-`--catalog` defaults to `catalog.example.toml` resolved against the current
-directory, so outside the repository root pass it explicitly.
+Without `--catalog`, `taint`, `summary` and `impact` use a copy of
+[`catalog.example.toml`](../catalog.example.toml) built into the binary and say
+so on stderr (`catalog: built-in example ...`). It is a starting point, not
+a policy for your code; see [catalog.md](catalog.md).
 
 ## Exit codes
 
 | code | meaning |
 |---|---|
 | 0 | success, including a run that found nothing |
-| 1 | any runtime error, printed as `Error: ...` on stderr: unreadable catalog, invalid regex or port spec in the catalog, missing `--cgf` directory, undecodable CGF, unreachable Postgres, a failed `pc-fe`, an unknown `--trace-events` kind, a `query` that matches nothing |
-| 2 | command-line usage error (from the argument parser) |
+| 1 | any runtime error, printed as `Error: ...` on stderr: unreadable catalog, invalid regex, port spec or `[severity]` level in the catalog, missing or empty `--cgf` directory, undecodable CGF, unreachable Postgres, a missing or failed `pc-fe`, an unknown `--trace-events` kind, a `query` that matches nothing |
+| 2 | command-line usage error (from the argument parser), including a `--fail-on` class the catalog does not define |
+| 3 | `taint --fail-on` matched: the output was written, and at least one chain is in a listed class |
 
 ## taint
 
@@ -36,15 +40,15 @@ directory, so outside the repository root pass it explicitly.
 panopticode taint --cgf <dir> [--cgf <dir> ...] [--catalog <file>] [flags]
 ```
 
-stdout is a JSON array of chains, sorted so output is byte-stable across runs.
-stderr carries diagnostics and a final stats line. For the README quickstart
-(the inert-rule lines, the `opaque:` detail and the `route-stats:` line
-elided):
+stdout is a JSON array of chains, sorted so output is byte-stable across runs
+(`--format` selects text or SARIF instead). stderr carries diagnostics and a
+final stats line. For the README quickstart (the `opaque:` detail and the
+`route-stats:` line elided):
 
 ```
 normalize: 1 by-name callsite(s), 0 arg port(s) moved into contract position, 0 dangling name(s), 0 unknown contract(s)
 catalog-fit: 7/88 rules match at least one call site (47 distinct callees) — inert rules follow; ...
-catalog-warn: inert rule <section>[<class|kind>] "<selector>" — no call site matches it (zero recall here)
+catalog-warn: 81 inert rules match no call site (list them with --verbose)
 catalog-fit: 0/23 propagators match at least one call site
 opaque: 5 of 75 call sites into a Go module or func value have no loaded body (default leaf: ...) — top modules: ...
 functions=56 summaries=63 contracts_linked=7 remote_leaves=0 chains=15 cache_hits=2 cache_misses=54
@@ -53,7 +57,7 @@ functions=56 summaries=63 contracts_linked=7 remote_leaves=0 chains=15 cache_hit
 See [catalog.md](catalog.md#diagnostics) for what the `catalog-*` and `opaque`
 lines mean.
 
-A corpus with HTTP routes or synthetic HTTP client sites (coverage wave 1)
+Since 0.2.0, a corpus with HTTP routes or synthetic HTTP client sites
 adds, right after the `normalize:` line:
 
 ```
@@ -75,7 +79,10 @@ replaced by `http-link: off (--no-http-link) — N client site(s) left unlinked`
 | flag | default | effect |
 |---|---|---|
 | `--cgf <dir>` | required, repeatable | a CGF directory; several compose across contracts |
-| `--catalog <file>` | `catalog.example.toml` | the policy file, see [catalog.md](catalog.md) |
+| `--catalog <file>` | built-in example | the policy file, see [catalog.md](catalog.md) |
+| `--format <json\|text\|sarif>` | `json` | what stdout holds, see [Output formats](#output-formats). stderr is the same in all three |
+| `--fail-on <class,...\|any>` | none | after writing the output, exit 3 if any chain's sink class is listed (any chain at all for `any`). A class the catalog has no sink rule for is a usage error (exit 2), so a typo cannot make CI pass |
+| `-v`, `--verbose` | off | list each inert catalog rule on stderr instead of counting them |
 | `--endpoint <substr>` | none | keep only chains whose source function fqn contains the substring |
 | `--pg <url>` | none | persist the call graph, contracts and summaries to Postgres, and read contract views for contracts no loaded CGF serves (counted as `remote_leaves`). The schema must already exist, see [Postgres](#postgres) |
 | `--store <dir>` | none | filesystem summary cache: reuse cached summaries and write new ones. Warms the cache `impact` reads. Independent of Postgres |
@@ -108,15 +115,17 @@ its first and last route hops:
   "source_repo": "webapp",
   "source_fn": "src/routes/search/+page.svelte:$script",
   "sink_class": "sqli",
-  "sink_span": {"file": "src/routes/search/+page.svelte", "line": 11},
+  "sink_span": {"file": "src/routes/search/+page.svelte", "line": 11, "col": 15},
   "hops": [...],
   "route": {
     "id": "a956a2f72f24",
+    "fingerprint": "43f3a5f6b672",
     "hops": [
-      {"repo": "webapp", "func": "src/routes/search/+page.svelte:$script", "kind": "source", "confidence": 1.0},
+      {"repo": "webapp", "func": "src/routes/search/+page.svelte:$script",
+       "file": "src/routes/search/+page.svelte", "line": 1, "col": 19, "kind": "source", "confidence": 1.0},
       ...
       {"repo": "example.com/backend", "func": "(*example.com/backend/store.Storage).findBy",
-       "file": ".../backend/store/store.go", "line": 13, "kind": "sink",
+       "file": ".../backend/store/store.go", "line": 13, "col": 18, "kind": "sink",
        "callee": "(*example.com/backend/store.Storage).Selectx", "confidence": 1.0}
     ],
     "boundaries": 2
@@ -131,8 +140,14 @@ its first and last route hops:
   reaches its sink: the sink call itself when the sink is local, otherwise the
   first call on the way (here `searchClient.call(...)`). The sink's own
   location is the last entry of `route.hops`.
-- `route.hops[]` is the full route: `repo, func, file, line, kind, callee,
+- `col`, on `sink_span`, on `hops[].span` and on `route.hops[]`, is the column
+  of the call, when the frontend recorded one; it is left out when unknown.
+  `file` is whatever the frontend stored: relative to the directory it was run
+  on, or absolute in older CGF.
+- `route.hops[]` is the full route: `repo, func, file, line, col, kind, callee,
   field(s), confidence`, with `kind` one of `source call boundary sink heap`.
+  The `source` hop's location is the source function's own, unless the
+  frontend placed the tainted value at a more precise one.
 - `route.boundaries` counts the contracts the route crosses. A `boundary`
   hop's `callee` is the client's callee name, except across an HTTP route,
   where it names the route actually entered: `http POST /api/users (gin)`
@@ -141,7 +156,13 @@ its first and last route hops:
 - `route.incomplete`, when present, says why the route stops early:
   `depth_cap`, `cycle`, `handler_not_loaded`, `callee_body_missing`,
   `not_reproduced`.
-- `route.id` is a content hash of the route, stable across runs.
+- `route.id` names this exact route: a content hash of its class and of every
+  hop's repo, function, callee, kind and line, stable across runs. It changes
+  when a hop's line moves.
+- `route.fingerprint` is the same hash without lines: the shape of the flow
+  (class, and per hop repo, function, callee and kind). It survives edits that
+  only move code, so use it to deduplicate and to keep baselines across
+  commits.
 - `route_confidence` is the minimum over the route; the top-level `confidence`
   covers only the source function's own call resolution. Use `route_confidence`.
 - `sink_field` / `sink_fields` name the field at the sink, when known.
@@ -162,6 +183,60 @@ backward: confirmed=8 (exact=8, route-terminal-refuted=0) refuted=0 undecided=7 
 $ panopticode taint ... --backward-unview
 backward: confirmed=13 (exact=13, route-terminal-refuted=0) refuted=0 undecided=2 pruned=0 unview-flips=5 in 0.00s
 ```
+
+### Output formats
+
+`--format` chooses what stdout holds. The analysis, stderr and exit codes are
+the same for all three, and `--fail-on` works with each.
+
+`json` (the default) is the array of chains above. `text` is one block per
+chain, in output order, then a summary line; columns are aligned and there is no
+colour:
+
+```
+sqli  webapp src/routes/search/+page.svelte:$script → example.com/backend (*example.com/backend/store.Storage).Selectx
+  route a956a2f72f24 · 2 boundaries · confidence 1.00
+  source    webapp                  src/routes/search/+page.svelte:1                            src/routes/search/+page.svelte:$script
+  call      webapp                  src/routes/search/+page.svelte:10                           URLSearchParams.get
+  ...
+  boundary  example.com/federation  .../federation/graph/graph.go:93                            pb.Account/GetAccount
+  ...
+  sink      example.com/backend     .../backend/store/store.go:13                               (*example.com/backend/store.Storage).Selectx
+
+15 findings: 13 sqli, 1 open_redirect, 1 xss
+```
+
+The route line also shows `backward <verdict>` with `--backward`, and
+`incomplete: <reason>` for a route that stops early.
+
+#### SARIF
+
+`--format sarif` writes a [SARIF 2.1.0](https://docs.oasis-open.org/sarif/sarif/v2.1.0/sarif-v2.1.0.html)
+log with one run:
+
+| SARIF | from |
+|---|---|
+| `rules[]` | one per sink class that appears, with the class as `id` and `name`; `defaultConfiguration.level` is its `[severity]` in the [catalog](catalog.md#format) (default `warning`) |
+| `results[]` | one per chain; `ruleId` is the sink class, `level` its severity |
+| `message` | `<source_fn> (<source_repo>) reaches <class> sink <callee> in <repo>`, plus the number of service boundaries crossed |
+| `locations[0]` | the sink, i.e. the last hop of the route (for an incomplete route, its last hop with a file) |
+| `codeFlows[0].threadFlows[0].locations[]` | every hop of `route.hops`, in order; `kinds` is the hop kind and the message is `<kind>: <callee or function>` |
+| `partialFingerprints["panopticodeRoute/v1"]` | `route.fingerprint` |
+| `properties` | `routeId`, `routeConfidence`, `boundaries`, `sourceRepo`, `sourceFunction`, and `backwardVerdict` / `incomplete` when present |
+
+Paths are written as stored in the CGF, with no rewriting. A relative path gets
+`uriBaseId` set to the hop's repo id, and `originalUriBaseIds` lists those repo
+ids without a `uri`, because the engine does not know where a checkout is. An
+absolute path becomes a `file://` URI. A hop without a file is a location with
+only its message.
+
+- **GitHub code scanning**: upload the file with
+  `github/codeql-action/upload-sarif`. GitHub annotates locations whose path is
+  inside the repository, so it helps to extract with paths relative to the
+  checkout; it deduplicates results on `partialFingerprints`.
+- **VS Code**: open the log with the SARIF Viewer extension, with the
+  repositories in one multi-root workspace, and step through a route in the
+  code flow view.
 
 ## graph-dump
 
@@ -198,7 +273,9 @@ panopticode extract --repo <dir> --out <dir> [--scope <pat>] [--mode main] [--fe
 ```
 
 Runs `pc-fe build <repo> --out <out> --mode <mode> [--scope <pat>]` and fails if
-it fails. It forwards no other flag; call `pc-fe` directly for any extraction
+it fails. If the binary is not found, the error names it
+(`pc-fe not found (install panoptife-go or pass --fe <path>)`); `impact` says
+the same. It forwards no other flag; call `pc-fe` directly for any extraction
 option (see the [panoptife-go](https://github.com/panoptiorg/panoptife-go)
 README).
 
@@ -220,7 +297,7 @@ taint_chains, blast_radius{repos, endpoints, provenance}, cache{hits, misses,
 scc_recomputed, reuse_pct}`. `pc-fe` output goes to stderr.
 
 - Warm the store first with `taint --store <dir>` using the same catalog file
-  and none of `--no-error-leaf`, `--pb-getters`, `--unmodeled`; otherwise the
+  (or the built-in one in both) and none of `--no-error-leaf`, `--pb-getters`, `--unmodeled`; otherwise the
   store namespace differs and every summary is recomputed.
 - `--cgf` adds pre-extracted CGF of other repositories so chains compose.
 - `--pg` resolves remote contract views from Postgres (making `--cgf`
@@ -248,20 +325,24 @@ panopticode query path  --pg <url> --from <substr> --to <substr> [--limit 5] [--
 | `reach` | upstream repos and boundary endpoints that reach functions matching `--fn` | nothing matches `--fn` |
 | `path` | shortest forward call paths between two fqn or contract substrings; `--max-depth` bounds the cost | `--from` or `--to` matches no function or contract |
 
-`scripts/blast.sh` wraps `query blast` with a `git diff` of a local checkout.
+`--file` paths are matched against the span files stored in the graph, by
+equality or as a suffix after a `/`, so they work for CGF with relative spans
+(relative to the directory the frontend was run on) and for older CGF with
+absolute ones. `scripts/blast.sh` wraps `query blast` with a `git diff` of a
+local checkout; it passes the changed files relative to the checkout directory
+it is given, which is the module directory and may be below the git root.
 
 ## Docker
 
 ```bash
 docker build -t panopticode .
 docker run --rm -v "$PWD/testdata/cgf:/cgf" panopticode taint \
-  --cgf /cgf/webapp --cgf /cgf/federation --cgf /cgf/backend \
-  --catalog /etc/panopticode/catalog.example.toml
+  --cgf /cgf/webapp --cgf /cgf/federation --cgf /cgf/backend
 ```
 
-The image holds the binary and the example catalog at
-`/etc/panopticode/catalog.example.toml`. The working directory is `/work`, where
-the default `--catalog` path does not exist, so pass `--catalog` explicitly.
+The image holds the binary and, for reference, the example catalog at
+`/etc/panopticode/catalog.example.toml`; without `--catalog` the binary uses its
+built-in copy of the same file.
 `extract` and `impact` need `pc-fe`, which the image does not contain.
 
 ## Postgres
