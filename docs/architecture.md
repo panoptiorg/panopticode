@@ -65,8 +65,18 @@ argument port, the engine checks in this order:
    flows through the call;
 3. the callee has a summary: map the argument to the callee's slot and fire
    every row whose in-fact is compatible, tainting the mapped outputs;
-4. otherwise, apply matching `[[propagators]]`, then the default leaf: every
-   result port becomes tainted (except error results under `--no-error-leaf`).
+4. for every call that has a target with no summary, or no resolved target at
+   all, apply matching `[[propagators]]`, then the default leaf: every result
+   port becomes tainted (except error results under `--no-error-leaf`).
+
+Step 3 and step 4 are not exclusive. A call site can list several targets
+(virtual dispatch). The engine checks each target on its own: targets with a
+summary are composed as in step 3, and if at least one target has no summary
+(for example a dispatch target in a library whose CGF is not loaded in this
+run), step 4 also runs for that site. Taint then flows through the missing
+target as it would through any other unsummarized call. When every target of a
+site has a summary, no default leaf applies. Route reconstruction and backward
+confirmation use the same rule (`Engine::site_has_unsummarized_target`).
 
 Source seeds, the only places a chain can start, are `Function.source_params`,
 the ports a matching `[[sources]]` rule names in `to` — call results by
@@ -102,9 +112,17 @@ byte-identical in Go and TypeScript, for GraphQL names too. Function `iid`s
 and `bid`s follow each frontend's own recipe and are not comparable across
 languages.
 
+A call site's callee `iid` must equal the `iid` that the declaring code's own
+extraction emits for that function. This is the join rule across CGF
+directories: the core finds a callee's summary only by this equality, and a
+callee that does not match has no summary and gets the default leaf. In Go, the
+first `iid` field is the module that declares the function's package. For a
+package that has no module, such as the standard library, it is the extraction
+repo.
+
 | id | hashes | property |
 |---|---|---|
-| `iid` | repo, package path, fqn, signature (`ts` in TypeScript) | stable across body edits |
+| `iid` | repo (Go: the module that declares the package), package path, fqn, signature (`ts` in TypeScript) | stable across body edits; a call site's callee `iid` equals the `iid` of the declaring code's own extraction |
 | `bid` | the LocalFlow and sorted callee `iid`s; Go hashes a deterministic protobuf encoding without spans, TypeScript a JSON encoding with spans | changes when the body or its call targets change |
 | `contract_hash` | a summary's flows and sink hits | same behaviour, same hash |
 | `summary_key` | `bid`, `source_params`, sorted callee `contract_hash`es | cache key for one summary |

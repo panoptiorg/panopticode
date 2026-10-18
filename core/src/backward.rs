@@ -1025,11 +1025,9 @@ impl<'a, 'e> Back<'a, 'e> {
     /// frame's arg ports. Mirrors `propagate`'s call-site cases one by one.
     fn cross(&self, b: &BCtx<'e>, cs_idx: usize, out: &Demand, depth: usize, fo: &mut FrameOut, states: &mut Vec<St>) {
         let cs = &b.flow.callsites[cs_idx];
-        let mut have = false;
         for cid in &cs.callee_iids {
             let h = hexid(cid);
             let Some(sum) = self.engine.summaries.get(&h) else { continue };
-            have = true;
             // see back_sink. A remapped contract is crossed only with
             // --backward-unview, and then in BOTH directions: the demanded
             // out-slot goes client -> handler on the way down
@@ -1100,7 +1098,9 @@ impl<'a, 'e> Back<'a, 'e> {
                 }
             }
         }
-        if have {
+        // Targets with a summary were crossed above. Propagators and the leaf
+        // apply when some target has none, as in `propagate`.
+        if !self.engine.site_has_unsummarized_target(cs) {
             return;
         }
         // Catalog propagators (propagate's library branch, run BEFORE the
@@ -1447,6 +1447,59 @@ mod tests {
         assert_eq!(b.verdict, Verdict::Confirmed, "{b:?}");
         assert!(b.exact, "no over-approximation on the confirming path: {b:?}");
         assert_eq!(b.source_fields, vec!["Amount".to_string()]);
+        assert_eq!((st.refuted, st.confirmed), (0, 1));
+    }
+
+    /// `S(p) -> M(p)`; `M(p) { r = iface.M(p); L(r) }` where `iface.M` has two
+    /// targets: one summarized with no flow from its parameter to its result,
+    /// one not loaded. Forward analysis gives the unloaded target the default
+    /// leaf, so `p` reaches `r` and the sink in `L`. The backward pass must find
+    /// the same predecessor, or it would refute a real chain.
+    #[test]
+    fn a_mixed_dispatch_site_is_crossed_through_its_leaf() {
+        use cgf::VertexKind::*;
+        let s = func(1, vec![0], cgf::LocalFlow {
+            vertices: vec![vx(0, InParam, 0, &[], &[]), vx(1, CallArgPort, 0, &[], &[])],
+            edges: vec![ed(0, 1)],
+            callsites: vec![site(0, Some(2), "pkg.F2", 1, 0)],
+        });
+        let mut dispatch = site(0, Some(5), "iface.M", 1, 1);
+        dispatch.callee_iids.push(vec![6; 32]); // not loaded
+        let m = func(2, vec![], cgf::LocalFlow {
+            vertices: vec![
+                vx(0, InParam, 0, &[], &[]),
+                vx(1, CallArgPort, 0, &[], &[]),
+                vx(2, CallResultPort, 0, &[], &[]),
+                vx(3, CallArgPort, 1, &[], &[]),
+            ],
+            edges: vec![ed(0, 1), ed(2, 3)],
+            callsites: vec![dispatch, site(1, Some(4), "pkg.F4", 1, 0)],
+        });
+        let l = func(4, vec![], cgf::LocalFlow {
+            vertices: vec![vx(0, InParam, 0, &[], &[]), vx(1, CallArgPort, 0, &[], &[])],
+            edges: vec![ed(0, 1)],
+            callsites: vec![site(0, None, "db.Exec", 1, 0)],
+        });
+        let a = func(5, vec![], cgf::LocalFlow {
+            vertices: vec![vx(0, InParam, 0, &[], &[]), vx(1, OutReturn, 0, &[], &[])],
+            edges: vec![],
+            callsites: vec![],
+        });
+        let mut prog = Program { funcs: HashMap::new(), repo_of: HashMap::new(), packages: Vec::new() };
+        for f in [s, m, l, a] {
+            let h = hexid(&f.id.as_ref().unwrap().iid);
+            prog.repo_of.insert(h.clone(), "test".into());
+            prog.funcs.insert(h, f);
+        }
+        set_opts(BackOpts::default());
+        let cat = Catalog::load_str(CAT).unwrap();
+        let mut eng = Engine::new(&prog, &cat);
+        eng.run();
+        let mut chains = crate::report::intra_chains(&eng, None);
+        assert_eq!(chains.len(), 1, "forward finds the chain through the leaf");
+        let st = crate::report::backward_check(&eng, &mut chains, false);
+        let b = chains[0].backward.as_ref().unwrap();
+        assert_eq!(b.verdict, Verdict::Confirmed, "{b:?}");
         assert_eq!((st.refuted, st.confirmed), (0, 1));
     }
 

@@ -1140,6 +1140,66 @@ arg = "any"
             route.hops.iter().map(|h| h.func.clone()).collect::<Vec<_>>());
     }
 
+    /// `F(p) { r = iface.M(p); sink_leaf(r) }` where `iface.M` has two targets:
+    /// one summarized with no flow from its parameter to its result, one not
+    /// loaded. The unloaded target is a default leaf, so `p` reaches `r`. The
+    /// route must go through that leaf (a local step in F, no hop of its own)
+    /// and end at the sink.
+    #[test]
+    fn a_route_through_a_mixed_site_leaf_reaches_the_sink() {
+        let cat = Catalog::load_str(CAT).unwrap();
+        let f = func(
+            0xA0,
+            cgf::LocalFlow {
+                vertices: vec![
+                    vertex(1, cgf::VertexKind::InParam, 0, 0),
+                    vertex(2, cgf::VertexKind::CallArgPort, 0, 0),
+                    vertex(3, cgf::VertexKind::CallResultPort, 0, 0),
+                    vertex(4, cgf::VertexKind::CallArgPort, 0, 1),
+                ],
+                edges: vec![edge(1, 2), edge(3, 4)],
+                callsites: vec![
+                    cgf::CallSite {
+                        id: 0,
+                        callee_iids: vec![vec![0xB1; 32], vec![0xB2; 32]], // 0xB2 is not loaded
+                        callee_fqn: "iface.M".into(),
+                        argc: 1,
+                        resultc: 1,
+                        ..Default::default()
+                    },
+                    cgf::CallSite {
+                        id: 1,
+                        callee_iids: vec![vec![0x0F; 32]],
+                        callee_fqn: "pkg.Y".into(),
+                        argc: 1,
+                        ..Default::default()
+                    },
+                ],
+            },
+        );
+        let no_flow = func(
+            0xB1,
+            cgf::LocalFlow {
+                vertices: vec![
+                    vertex(1, cgf::VertexKind::InParam, 0, 0),
+                    vertex(2, cgf::VertexKind::OutReturn, 0, 0),
+                ],
+                edges: vec![],
+                callsites: vec![],
+            },
+        );
+        let prog = prog_of(vec![f, no_flow, sink_leaf(0x0F)]);
+        let mut eng = Engine::new(&prog, &cat);
+        eng.run();
+        let handlers = ContractHandlers::new();
+        let w = Walk::new(&eng, &handlers);
+        let route = w.route(&iid(0xA0), &[1], "sqli", None);
+        assert_eq!(route.incomplete, None, "{:?}", route.hops.iter().map(|h| (&h.func, &h.callee)).collect::<Vec<_>>());
+        assert_eq!(route.hops.last().unwrap().kind, HopKind::Sink);
+        assert_eq!(route.hops.last().unwrap().callee, "db.Exec");
+        assert!(route.hops.iter().any(|h| h.callee == "pkg.Y"), "the call into the sink function is a hop");
+    }
+
     /// The path stack must be exactly as it was found: every key pushed on
     /// entry is popped on every exit. This is what makes sibling branches
     /// independent (and what the diamond above relies on).

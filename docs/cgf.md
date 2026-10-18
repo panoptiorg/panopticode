@@ -39,7 +39,18 @@ CgfPackage            repo, language, package_path, commit_sha
   dispatch); `callee_fqn` is the name catalog rules match; `opaque` marks an
   unresolved call (`pc-fe` sets it on a function-value call with no target and
   on a dispatch site over its fan-out cap, not on other interface calls); the
-  core applies the default leaf to any call without a summary either way.
+  core applies the default leaf to any call without a summary either way. The
+  rule is per target: a site with several `callee_iids` gets the default leaf
+  when at least one of them has no summary (for example a dispatch target in a
+  CGF that is not loaded), in addition to the summaries of the others.
+  `target_fqns` is set on a site whose `callee_iids` come from dispatch targets
+  (a virtual call or a function-value call): `target_fqns[i]` is the fqn of the
+  function whose iid is `callee_iids[i]`. A consumer can name a target in
+  another module without that module's CGF. When a site has a target in another
+  module, its last entry is the unresolved one (`callee_iids` the iid hashed from
+  `callee_fqn`, `target_fqns` the `callee_fqn`), which has no summary, so the
+  default leaf applies next to the summaries of the targets. It is empty on
+  other sites.
   `INVOKES_REMOTE` sites name a contract's iid.
   `arg0_is_receiver`, `dispatch_confidence`, `stream_op`, `stream_client_side`,
   `error_results` (a bitmask of error-typed results) and `arg_names` (by-name
@@ -62,7 +73,10 @@ CgfPackage            repo, language, package_path, commit_sha
   arguments of handlers and resolvers). They seed chains without any catalog
   rule.
 - `iid` and `bid` are SHA-256 identities; see
-  [architecture.md](architecture.md#identity-and-caching).
+  [architecture.md](architecture.md#identity-and-caching). A call site's callee
+  `iid` equals the `iid` that the declaring code's own extraction emits. In Go,
+  the first `iid` field is the module that declares the function's package (the
+  extraction repo for packages with no module, such as the standard library).
 
 ### Canonical HTTP path
 
