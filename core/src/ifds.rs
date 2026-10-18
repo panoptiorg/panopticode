@@ -346,9 +346,20 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// Does this call site need the default leaf and the catalog propagators?
+    /// True when the site has no resolved target, or when at least one target
+    /// has no summary (a library call, or a dispatch target whose code is not
+    /// loaded in this run). Targets that do have a summary are composed as
+    /// usual, in addition. `propagate`, witness and the backward pass all ask
+    /// this one question, so they agree on where the leaf applies.
+    pub fn site_has_unsummarized_target(&self, cs: &cgf::CallSite) -> bool {
+        cs.callee_iids.is_empty()
+            || cs.callee_iids.iter().any(|c| !self.summaries.contains_key(&hexid(c)))
+    }
+
     /// Is arg port `arg_idx` of call site `cs_idx` a place `--unmodeled`
-    /// reports? True when the report is on, the callee is a body-less library
-    /// call (no summary), no propagator names it, and some OTHER port of the
+    /// reports? True when the report is on, the call has a body-less library
+    /// target (no summary), no propagator names it, and some OTHER port of the
     /// call can carry a write back into this frame — the frontend marks such a
     /// port by giving it out-edges (Go: a by-ref argument, `--library-writeback`;
     /// TS: an identifier). Shared by `propagate` and witness, which must agree on
@@ -361,7 +372,7 @@ impl<'a> Engine<'a> {
         if stream_of(cs).is_some() || cs.kind == cgf::call_site::Kind::InvokesRemote as i32 {
             return false;
         }
-        if cs.callee_iids.iter().any(|c| self.summaries.contains_key(&hexid(c))) {
+        if !self.site_has_unsummarized_target(cs) {
             return false;
         }
         if self.cat.propagators_for(&cs.callee_fqn).next().is_some() {
@@ -499,9 +510,10 @@ impl<'a> Engine<'a> {
             }
             if self_rec {
                 // Start the ascent at ⊥ (bottom), not at the default leaf's ⊤.
-                // With an EMPTY summary present, `propagate`'s `have_summary`
-                // is true at the recursive call site, so round 1 composes
-                // against "nothing flows, nothing sinks" and each round can
+                // With an EMPTY summary present, every target of the recursive
+                // call site has a summary, so `propagate` applies no default
+                // leaf there and round 1 composes against "nothing flows,
+                // nothing sinks" and each round can
                 // only add. The result is the LEAST fixpoint: every real flow
                 // and sink hit is found, and the recursive site contributes no
                 // taint it cannot justify. (Seeding ⊤ instead would be sound
@@ -889,11 +901,9 @@ impl<'a> Engine<'a> {
                         callee_slot = Slot::StreamIn.into();
                     }
                 }
-                let mut have_summary = false;
                 for cid in &cs.callee_iids {
                     let h = hexid(cid);
                     if let Some(sum) = self.summaries.get(&h) {
-                        have_summary = true;
                         if let Some(t) = tr.filter(|t| t.wants("apply")) {
                             t.log(format_args!(
                                 "apply     fn={} cs={} callee={} slot={} flows={} sink_hits={}",
@@ -959,7 +969,10 @@ impl<'a> Engine<'a> {
                 // — any tainted arg (incl. receiver, for builder chains) taints
                 // all result ports. Over-approximate, lower confidence. Keeps
                 // taint flowing through squirrel builders, mappers, wrappers.
-                if !have_summary {
+                // The test is per target: a dispatch site with one summarized
+                // target and one target that is not loaded gets the summary of
+                // the first AND the leaf for the second.
+                if self.site_has_unsummarized_target(cs) {
                     // Catalog propagators: the data movement the default leaf
                     // cannot see (`sb.WriteString(s)` fills sb, `json.Unmarshal(
                     // b, &v)` fills v). Additive — the leaf below still runs.
@@ -2700,6 +2713,87 @@ arg = "any"
             hit_sites.contains(&1) && hit_sites.contains(&2),
             "default leaf must taint every variant: {sum:?}"
         );
+    }
+
+    /// A callee whose parameter does not reach its result: its summary holds
+    /// no flow from param 0 to return 0.
+    fn callee_without_flow(iid: u8) -> cgf::Function {
+        func(
+            iid,
+            cgf::LocalFlow {
+                vertices: vec![
+                    vertex(1, cgf::VertexKind::InParam, 0, 0),
+                    vertex(2, cgf::VertexKind::OutReturn, 0, 0),
+                ],
+                edges: vec![],
+                callsites: vec![],
+            },
+        )
+    }
+
+    /// A caller whose param 0 goes into one call site (with the given targets)
+    /// and whose result goes into a `db.Exec` sink.
+    fn caller_of_targets(iid: u8, targets: &[u8]) -> cgf::Function {
+        func(
+            iid,
+            cgf::LocalFlow {
+                vertices: vec![
+                    vertex(1, cgf::VertexKind::InParam, 0, 0),
+                    vertex(2, cgf::VertexKind::CallArgPort, 0, 0),
+                    vertex(3, cgf::VertexKind::CallResultPort, 0, 0),
+                    vertex(4, cgf::VertexKind::CallArgPort, 0, 1),
+                ],
+                edges: vec![edge(1, 2), edge(3, 4)],
+                callsites: vec![
+                    cgf::CallSite {
+                        id: 0,
+                        callee_iids: targets.iter().map(|t| vec![*t; 32]).collect(),
+                        callee_fqn: "pkg.Dispatch".into(),
+                        argc: 1,
+                        resultc: 1,
+                        ..Default::default()
+                    },
+                    cgf::CallSite { id: 1, callee_fqn: "db.Exec".into(), argc: 1, ..Default::default() },
+                ],
+            },
+        )
+    }
+
+    fn sqli_reached(fns: Vec<cgf::Function>, caller: u8) -> bool {
+        let cat = Catalog::load_str(CAT).unwrap();
+        let prog = engine_prog(fns);
+        let mut eng = Engine::new(&prog, &cat);
+        eng.run();
+        eng.summaries[&hexid(&[caller; 32])].sink_hits.iter().any(|h| h.class == "sqli")
+    }
+
+    /// A dispatch site with two targets: one summarized (no flow from arg 0 to
+    /// the result), one not loaded. The unloaded target gets the default leaf,
+    /// so taint on arg 0 still reaches the result.
+    #[test]
+    fn a_site_with_one_unsummarized_target_gets_the_leaf() {
+        let fns = vec![callee_without_flow(0xA1), caller_of_targets(0xC1, &[0xA1, 0xB1])];
+        assert!(sqli_reached(fns, 0xC1), "the unloaded target must be taint-transparent");
+    }
+
+    /// The same site once every target has a summary: no leaf, so the callee
+    /// summaries alone decide and no taint reaches the result.
+    #[test]
+    fn a_site_with_every_target_summarized_gets_no_leaf() {
+        let fns = vec![
+            callee_without_flow(0xA1),
+            callee_without_flow(0xA2),
+            caller_of_targets(0xC1, &[0xA1, 0xA2]),
+        ];
+        assert!(!sqli_reached(fns, 0xC1), "two summarized targets must not add a leaf");
+        let fns = vec![callee_without_flow(0xA1), caller_of_targets(0xC1, &[0xA1])];
+        assert!(!sqli_reached(fns, 0xC1), "one summarized target must not add a leaf");
+    }
+
+    /// A site with no target at all keeps the leaf.
+    #[test]
+    fn a_site_with_no_target_gets_the_leaf() {
+        assert!(sqli_reached(vec![caller_of_targets(0xC1, &[])], 0xC1));
     }
 
     /// B1 / doc 31 §4. A synthetic CGF is the only way to test this: no fixture

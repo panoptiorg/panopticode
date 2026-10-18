@@ -32,6 +32,10 @@ message CgfPackage {
 //   iid: stable across body edits.
 //     Go:         hash(repo, package_path, fqn, signature)
 //     TypeScript: hash(repo, directory, "file:symbol", "ts")
+//   A call site's callee iid equals the iid that the declaring code's own
+//     extraction emits. Go: the first iid field is the module that declares
+//     the function's package (the extraction repo for packages with no
+//     module, such as the standard library).
 //   bid = hash(LocalFlow) embedding callees' iids (NOT bids). Go hashes a
 //     deterministic protobuf encoding without spans or field names;
 //     TypeScript hashes a JSON encoding, spans included.
@@ -216,7 +220,7 @@ message CallSite {
   bool   arg0_is_receiver = 7;
   uint32 resultc         = 8;  // result-port vertices for 0..resultc-1
   Span   span            = 9;
-  float  dispatch_confidence = 10; // 1/n for n dispatch targets (2..fan-out cap); else 1.0
+  float  dispatch_confidence = 10; // 1/n for n callee_iids (2..fan-out cap); else 1.0
 
   // Stream data ports: a Send/Recv call on a generated Svc_MethodServer /
   // Svc_MethodClient stream. Kind is INVOKES_REMOTE with callee_iids =
@@ -252,6 +256,15 @@ message CallSite {
   // Unlinked, such a site is inert. The core links it to an HttpRoute by
   // method + canonical path at load time and turns it into INVOKES_REMOTE.
   HttpCall http_call = 15;
+
+  // Set when callee_iids come from dispatch targets (VIRTUAL or a func-value
+  // call): target_fqns[i] is the fqn of the function whose iid is
+  // callee_iids[i]. Empty otherwise. A consumer can name a target in another
+  // module without that module's CGF. When a site has a target in another
+  // module, the last entry is the unresolved one (iid from callee_fqn, name
+  // callee_fqn): the targets cannot be all the code that can run there, so the
+  // core still applies its default leaf next to the summaries it finds.
+  repeated string target_fqns = 16;
 }
 
 message HttpCall {
