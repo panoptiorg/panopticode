@@ -3,12 +3,12 @@
 // unchanged functions via the summary store, re-tabulate the rest, and report
 // the chains the MR touches. Deferred: pii_categories, reachable_endpoints.
 use crate::catalog::Catalog;
+use crate::compose;
 use crate::graph::Program;
 use crate::ifds::{Engine, RunStats};
+use crate::normalize::normalize_loaded;
 use crate::report::{self, Chain};
 use crate::summarystore::SummaryStore;
-use crate::compose;
-use crate::normalize::normalize_loaded;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -244,6 +244,10 @@ fn merge_pg_blast_radius(
 /// A chain is impacted when it passes through a changed function (manifest) or
 /// any function the engine had to re-tabulate this run (changed OR behavior-
 /// downstream of a change — by construction of summary_key invalidation).
+/// Matching is by function identity — the changed manifest iid, the recomputed
+/// iid, and for hops the (repo, fqn) pair — never by fqn alone: sibling repos
+/// built from one template share fqn paths, and a name match would report
+/// their chains for an MR that does not touch them.
 /// Cross-repo chains report hops only inside the SOURCE function, so a chain is
 /// also impacted when a crossed-boundary hop targets a contract whose HANDLER
 /// was recomputed (the caller side itself cache-hits — the contract iid is not
@@ -257,13 +261,32 @@ pub fn build_report(
     manifest: &Manifest,
     repo: &str,
 ) -> ImpactReport {
-    let changed_fqns: HashSet<&str> = manifest.changed_fns.iter().map(|c| c.fqn.as_str()).collect();
-    let recomputed_fqns: HashSet<&str> = eng
-        .recomputed
+    // Match changed and recomputed functions by IDENTITY, not by name. A
+    // TypeScript fqn is a path inside its repo ("src/api/items.ts:getItems"),
+    // and repositories made from one template share these paths — so an MR in
+    // repo A must not report the chains of repo B that merely share a path.
+    // The manifest records the iid of each changed function (same head
+    // extraction as this run), and `recomputed` already holds iids. Hops carry
+    // no iid, only (repo, fqn) — so the touched iids resolve to (repo, fqn)
+    // pairs in THIS program. For Go the fqn holds the module path and was
+    // already unique; the iid match changes nothing there.
+    let changed_iids: HashSet<&str> = manifest
+        .changed_fns
         .iter()
-        .filter_map(|iid| prog.funcs.get(iid).map(|f| f.fqn.as_str()))
+        .map(|c| c.iid.as_str())
         .collect();
-    let touches = |fqn: &str| changed_fqns.contains(fqn) || recomputed_fqns.contains(fqn);
+    let touched_hops: HashSet<(&str, &str)> = changed_iids
+        .iter()
+        .copied()
+        .chain(eng.recomputed.iter().map(|iid| iid.as_str()))
+        .filter_map(|iid| {
+            prog.funcs.get(iid).map(|f| {
+                let repo = prog.repo_of.get(iid).map(|s| s.as_str()).unwrap_or("");
+                (repo, f.fqn.as_str())
+            })
+        })
+        .collect();
+    let touches = |repo: &str, fqn: &str| touched_hops.contains(&(repo, fqn));
 
     // contract full_name -> was its handler re-tabulated this run? Covers
     // GraphQL fields too (doc 36 §3.3): their handler is the resolver and
@@ -290,7 +313,10 @@ pub fn build_report(
             let Some(flow) = &f.flow else { continue };
             for cs in &flow.callsites {
                 if cs.http_call.is_some()
-                    && cs.callee_iids.iter().any(|k| recomputed_keys.contains(&crate::graph::hexid(k)))
+                    && cs
+                        .callee_iids
+                        .iter()
+                        .any(|k| recomputed_keys.contains(&crate::graph::hexid(k)))
                 {
                     handler_recomputed.insert(cs.callee_fqn.clone());
                 }
@@ -302,11 +328,11 @@ pub fn build_report(
     let taint_chains: Vec<Chain> = all_chains
         .into_iter()
         .filter(|c| {
-            touches(&c.source_fn)
+            changed_iids.contains(c.source_iid.as_str())
+                || eng.recomputed.contains(&c.source_iid)
                 || c.hops.iter().any(|h| {
-                    touches(&h.func)
-                        || (h.crossed_service_boundary
-                            && handler_recomputed.contains(&h.detail))
+                    touches(&h.repo, &h.func)
+                        || (h.crossed_service_boundary && handler_recomputed.contains(&h.detail))
                 })
         })
         .collect();
@@ -351,6 +377,121 @@ pub fn build_report(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::graph::hexid;
+    use crate::ifds::cache_tests::{edge, vertex};
+    use crate::proto::cgf;
+
+    /// A TS fqn is a path inside the repo; two repos built from one template
+    /// both have this function.
+    const TS_FQN: &str = "src/api/items.ts:getItems";
+    const REPO_A: &str = "example.com/a";
+    const REPO_B: &str = "example.com/b";
+    const IID_A: u8 = 0xA1;
+    const IID_B: u8 = 0xB2;
+
+    const CAT: &str = r#"
+[[sources]]
+kind = "http_bind"
+selector = "(*github.com/gin-gonic/gin.Context).ShouldBindJSON"
+to = "1"
+[[sinks]]
+class = "sqli"
+selector = "db.Exec"
+arg = "any"
+"#;
+
+    /// `create(c) { err := c.ShouldBindJSON(&req); db.Exec(req) }` — one
+    /// source→sink chain per function.
+    fn handler(iid: u8, fqn: &str) -> cgf::Function {
+        cgf::Function {
+            id: Some(cgf::Ident {
+                iid: vec![iid; 32],
+                bid: vec![iid; 32],
+            }),
+            fqn: fqn.into(),
+            has_body: true,
+            flow: Some(cgf::LocalFlow {
+                vertices: vec![
+                    vertex(1, cgf::VertexKind::InParam, 0, 0),
+                    vertex(2, cgf::VertexKind::CallArgPort, 0, 0),
+                    vertex(3, cgf::VertexKind::CallArgPort, 1, 0),
+                    vertex(4, cgf::VertexKind::CallResultPort, 0, 0),
+                    vertex(5, cgf::VertexKind::CallArgPort, 0, 1),
+                ],
+                edges: vec![edge(1, 2), edge(3, 5)],
+                callsites: vec![
+                    cgf::CallSite {
+                        id: 0,
+                        callee_fqn: "(*github.com/gin-gonic/gin.Context).ShouldBindJSON".into(),
+                        argc: 2,
+                        resultc: 1,
+                        arg0_is_receiver: true,
+                        ..Default::default()
+                    },
+                    cgf::CallSite {
+                        id: 1,
+                        callee_fqn: "db.Exec".into(),
+                        argc: 1,
+                        resultc: 0,
+                        ..Default::default()
+                    },
+                ],
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// Two repos, one function path in each.
+    fn two_repo_prog() -> Program {
+        let mut prog = Program {
+            funcs: Default::default(),
+            repo_of: Default::default(),
+            packages: Default::default(),
+        };
+        for (repo, iid) in [(REPO_A, IID_A), (REPO_B, IID_B)] {
+            let f = handler(iid, TS_FQN);
+            let h = hexid(&f.id.as_ref().unwrap().iid);
+            prog.repo_of.insert(h.clone(), repo.into());
+            prog.funcs.insert(h, f);
+        }
+        prog
+    }
+
+    /// An MR that changes `TS_FQN` in one repo must report that repo's chain
+    /// only. Before, matching went by fqn alone, so the sibling repo's chain
+    /// with the same path was reported too.
+    #[test]
+    fn an_mr_in_one_repo_does_not_report_sibling_repos_with_the_same_fqn() {
+        let prog = two_repo_prog();
+        let cat = Catalog::load_str(CAT).unwrap();
+
+        for (repo, iid) in [(REPO_A, IID_A), (REPO_B, IID_B)] {
+            let manifest = Manifest {
+                base: "aaaaaaaa".into(),
+                head: "bbbbbbbb".into(),
+                changed_files: vec!["src/api/items.ts".into()],
+                changed_fns: vec![ChangedFn {
+                    iid: hexid(&[iid; 32]),
+                    bid: "0000".into(),
+                    fqn: TS_FQN.into(),
+                    file: "src/api/items.ts".into(),
+                }],
+            };
+            // warm-store shape: only the changed function was re-tabulated.
+            // The test pins the matching in build_report, not the cache logic.
+            let mut eng = Engine::new(&prog, &cat);
+            eng.run();
+            eng.recomputed = [hexid(&[iid; 32])].into_iter().collect();
+
+            let report = build_report(&prog, &eng, RunStats::default(), &manifest, repo);
+            let repos: HashSet<&str> = report
+                .taint_chains
+                .iter()
+                .map(|c| c.source_repo.as_str())
+                .collect();
+            assert_eq!(repos, [repo].into_iter().collect());
+        }
+    }
 
     /// A manifest for an MR that changed nothing in scope. pc-fe writes Go nil
     /// slices as `null`; this used to abort `impact` outright.

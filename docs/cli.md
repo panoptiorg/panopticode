@@ -301,6 +301,11 @@ scc_recomputed, reuse_pct}`. `pc-fe` output goes to stderr.
   (or the built-in one in both) and none of `--no-error-leaf`, `--pb-getters`, `--unmodeled`; otherwise the
   store namespace differs and every summary is recomputed.
 - `--cgf` adds pre-extracted CGF of other repositories so chains compose.
+- The report lists a chain only when it passes through a function that the
+  MR changed or that the engine re-tabulated. Functions match by identity (iid, or
+  repo plus fqn for hops), never by fqn alone: sibling repositories made from
+  one template share fqn paths, and a name match would report their chains
+  for an MR that does not touch them.
 - `--fe-arg <arg>` (repeatable, order kept) appends arguments to the frontend
   command, after the built-in ones. A TypeScript frontend needs
   `--fe-arg --repo-id <id>` — the CGF repo must match the other CGF dirs of
