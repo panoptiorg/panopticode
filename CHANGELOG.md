@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.1](https://github.com/panoptiorg/panopticode/compare/v0.4.0...v0.4.1) (2026-10-24)
+
+
+### Bug Fixes
+
+* match MR impact by function identity, not by fqn ([#10](https://github.com/panoptiorg/panopticode/issues/10)) ([4a4652c](https://github.com/panoptiorg/panopticode/commit/4a4652c07567428ad2a33cbbffe902f17ad5315c))
+
 ## [0.4.0](https://github.com/panoptiorg/panopticode/compare/v0.3.0...v0.4.0) (2026-10-24)
 
 
