@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.0](https://github.com/panoptiorg/panopticode/compare/v0.3.0...v0.4.0) (2026-10-24)
+
+
+### Features
+
+* persist entry endpoints; fix invokes per repo; impact --fe-arg ([#8](https://github.com/panoptiorg/panopticode/issues/8)) ([8d7e764](https://github.com/panoptiorg/panopticode/commit/8d7e76403127da1ef3488f5ab9f2b545172f4a3f))
+
 ## [0.3.0](https://github.com/panoptiorg/panopticode/compare/v0.2.0...v0.3.0) (2026-10-18)
 
 
