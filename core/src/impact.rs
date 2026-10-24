@@ -84,6 +84,7 @@ fn run_frontend(
     base: &str,
     head: &str,
     out: &Path,
+    fe_args: &[String],
 ) -> Result<()> {
     let mut cmd = Command::new(fe);
     cmd.arg("build")
@@ -99,6 +100,8 @@ fn run_frontend(
     if let Some(s) = scope {
         cmd.arg("--scope").arg(s);
     }
+    // caller-supplied frontend arguments, after the built-in ones, in order
+    cmd.args(fe_args);
     // our stdout is the ImpactReport JSON — route pc-fe's stdout to stderr
     let out = cmd.output().map_err(|e| crate::cli::fe_err(fe, e))?;
     eprint!("{}", String::from_utf8_lossy(&out.stderr));
@@ -126,6 +129,7 @@ pub fn impact(
     store_dir: &Path,
     out: Option<&Path>,
     fe: &str,
+    fe_args: &[String],
     pg: Option<&str>,
 ) -> Result<()> {
     let tmp_out;
@@ -142,7 +146,7 @@ pub fn impact(
             &tmp_out
         }
     };
-    run_frontend(fe, repo, scope, base, head, head_cgf)?;
+    run_frontend(fe, repo, scope, base, head, head_cgf, fe_args)?;
 
     let manifest = read_manifest(head_cgf)?;
     let (cat, cat_hash) = Catalog::open(catalog)?;

@@ -178,6 +178,12 @@ enum Cmd {
         out: Option<PathBuf>,
         #[arg(long, default_value = "pc-fe")]
         fe: String,
+        /// Extra argument passed through to the frontend, after the built-in
+        /// arguments, in order (repeatable). A TypeScript frontend needs
+        /// `--repo-id <id>` — the CGF repo must match the other CGF dirs of
+        /// the run — and `--adapter <name>`.
+        #[arg(long = "fe-arg", allow_hyphen_values = true)]
+        fe_arg: Vec<String>,
         /// Postgres URL: resolve remote contract views from contract_summaries
         /// (makes --cgf of other repos optional) + PG-walked blast radius
         #[arg(long)]
@@ -302,6 +308,7 @@ pub fn run() -> Result<()> {
             store,
             out,
             fe,
+            fe_arg,
             pg,
         } => crate::impact::impact(
             &repo,
@@ -313,6 +320,7 @@ pub fn run() -> Result<()> {
             &store,
             out.as_deref(),
             &fe,
+            &fe_arg,
             pg.as_deref(),
         ),
         Cmd::Query { q } => match q {
@@ -507,8 +515,8 @@ fn taint(
     if let Some(url) = pg {
         let st = crate::storage::persist(&prog, &eng, url)?;
         eprintln!(
-            "persisted nodes={} edges={} invokes={} to postgres",
-            st.nodes, st.edges, st.invokes
+            "persisted nodes={} edges={} invokes={} endpoints={} to postgres",
+            st.nodes, st.edges, st.invokes, st.endpoints
         );
     }
     let mut chains = report::intra_chains(&eng, endpoint);

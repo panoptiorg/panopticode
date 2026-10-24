@@ -104,6 +104,7 @@ pub struct PersistStats {
     pub nodes: usize,
     pub edges: usize,
     pub invokes: usize,
+    pub endpoints: usize,
 }
 
 pub fn persist(prog: &Program, eng: &Engine<'_>, pg_url: &str) -> Result<PersistStats> {
@@ -218,6 +219,7 @@ async fn persist_async(prog: &Program, eng: &Engine<'_>, pg_url: &str) -> Result
     let edges = refresh_edges(&mut tx, prog, &repo_ids, &analyzed_rids, &fn_node, &contract_node)
         .await?;
     let invokes = refresh_invokes(&mut tx, prog).await?;
+    let endpoints = refresh_endpoints(&mut tx, prog).await?;
 
     persist_summaries(&mut tx, prog, eng).await?;
 
@@ -226,6 +228,7 @@ async fn persist_async(prog: &Program, eng: &Engine<'_>, pg_url: &str) -> Result
         nodes,
         edges,
         invokes,
+        endpoints,
     })
 }
 
@@ -577,8 +580,54 @@ async fn refresh_edges(
     Ok(out.len())
 }
 
-/// Reverse index: one row per distinct (contract iid, caller fn, span). Keyed
-/// by raw iid bytes, so it records calls to contracts we can't resolve yet.
+/// One row of the reverse index: a distinct remote call from a function to a
+/// contract, deduped on (contract iid, caller repo, caller fn, span). The
+/// caller REPO is part of the key: TypeScript function fqns are paths inside
+/// the repo, and repos made from one template share those paths, so the same
+/// (fqn, file, line) in two repos calling the same contract is two rows.
+#[derive(Debug)]
+struct InvokesRow {
+    iid: Vec<u8>,
+    caller_repo: String,
+    caller_fn: String,
+    span_file: String,
+    span_line: i32,
+}
+
+/// Pure row collection, so the dedup key is testable without a database.
+fn invokes_rows(prog: &Program) -> Vec<InvokesRow> {
+    let mut rows: Vec<InvokesRow> = Vec::new();
+    let mut seen: HashSet<(IidHex, String, String, String, i32)> = HashSet::new();
+    for (fiid, f) in &prog.funcs {
+        let repo = prog.repo_of.get(fiid).cloned().unwrap_or_default();
+        let Some(flow) = &f.flow else { continue };
+        for cs in flow.callsites.iter().filter(|cs| is_remote(cs)) {
+            let (file, line) = cs
+                .span
+                .as_ref()
+                .map(|s| (s.file.clone(), s.line))
+                .unwrap_or_default();
+            for cid in &cs.callee_iids {
+                let h = hexid(cid);
+                if !seen.insert((h, repo.clone(), f.fqn.clone(), file.clone(), line)) {
+                    continue;
+                }
+                rows.push(InvokesRow {
+                    iid: cid.clone(),
+                    caller_repo: repo.clone(),
+                    caller_fn: f.fqn.clone(),
+                    span_file: file.clone(),
+                    span_line: line,
+                });
+            }
+        }
+    }
+    rows
+}
+
+/// Reverse index: one row per distinct (contract iid, caller fn, span) call,
+/// per repo. Keyed by raw iid bytes, so it records calls to contracts we
+/// can't resolve yet.
 async fn refresh_invokes(tx: &mut Transaction<'_, Postgres>, prog: &Program) -> Result<usize> {
     let caller_repos: Vec<String> = {
         let mut v: Vec<String> = prog.packages.iter().map(|p| p.repo.clone()).collect();
@@ -591,36 +640,21 @@ async fn refresh_invokes(tx: &mut Transaction<'_, Postgres>, prog: &Program) -> 
         .execute(&mut **tx)
         .await?;
 
-    let mut iid = Vec::new();
-    let mut repo = Vec::new();
-    let mut caller_fn = Vec::new();
-    let mut span_file = Vec::new();
-    let mut span_line = Vec::new();
-    let mut seen: HashSet<(IidHex, String, String, i32)> = HashSet::new();
-    for (fiid, f) in &prog.funcs {
-        let r = prog.repo_of.get(fiid).cloned().unwrap_or_default();
-        let Some(flow) = &f.flow else { continue };
-        for cs in flow.callsites.iter().filter(|cs| is_remote(cs)) {
-            let (file, line) = cs
-                .span
-                .as_ref()
-                .map(|s| (s.file.clone(), s.line))
-                .unwrap_or_default();
-            for cid in &cs.callee_iids {
-                let h = hexid(cid);
-                if !seen.insert((h, f.fqn.clone(), file.clone(), line)) {
-                    continue;
-                }
-                iid.push(cid.clone());
-                repo.push(r.clone());
-                caller_fn.push(f.fqn.clone());
-                span_file.push(file.clone());
-                span_line.push(line);
-            }
-        }
-    }
-    if iid.is_empty() {
+    let rows = invokes_rows(prog);
+    if rows.is_empty() {
         return Ok(0);
+    }
+    let mut iid = Vec::with_capacity(rows.len());
+    let mut repo = Vec::with_capacity(rows.len());
+    let mut caller_fn = Vec::with_capacity(rows.len());
+    let mut span_file = Vec::with_capacity(rows.len());
+    let mut span_line = Vec::with_capacity(rows.len());
+    for r in &rows {
+        iid.push(r.iid.clone());
+        repo.push(r.caller_repo.clone());
+        caller_fn.push(r.caller_fn.clone());
+        span_file.push(r.span_file.clone());
+        span_line.push(r.span_line);
     }
     sqlx::query(
         "INSERT INTO invokes(iid, caller_repo, caller_fn, span_file, span_line)
@@ -633,7 +667,139 @@ async fn refresh_invokes(tx: &mut Transaction<'_, Postgres>, prog: &Program) -> 
     .bind(&span_line)
     .execute(&mut **tx)
     .await?;
-    Ok(iid.len())
+    Ok(rows.len())
+}
+
+/// One row of the `endpoints` table: a repo's entry points (CGF `endpoints`)
+/// joined with the functions that implement them (`Function.binds_to`). The
+/// repo is part of the row, and handler matching is repo-scoped: an
+/// Endpoint.iid for an HTTP route is the route's ContractIID, so repos made
+/// from one template share it, and repo A's endpoint must not adopt repo B's
+/// handler. Unbound endpoints keep one row with handler_fqn ''.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct EndpointRow {
+    repo: String,
+    iid: Vec<u8>,
+    kind: i16,
+    name: String,
+    untrusted: bool,
+    handler_fqn: String,
+    span_file: Option<String>,
+    span_line: Option<i32>,
+}
+
+/// Pure row collection, so the (endpoint, handler) join is testable without a
+/// database. For every package endpoint, one row per same-repo function whose
+/// `binds_to` names it; if none binds it, one row with handler_fqn ''.
+///
+/// Deduped on the (repo, iid, handler_fqn) PRIMARY KEY and sorted: two
+/// packages of one repo can list the same endpoint, and two functions can
+/// share an fqn, so the naive enumeration yields duplicates that would break
+/// the INSERT.
+fn endpoint_rows(prog: &Program) -> Vec<EndpointRow> {
+    // (endpoint iid hex, owning repo) -> bound handlers
+    let mut handlers: HashMap<(IidHex, String), Vec<&cgf::Function>> = HashMap::new();
+    for (fiid, f) in &prog.funcs {
+        let repo = prog.repo_of.get(fiid).cloned().unwrap_or_default();
+        for b in &f.binds_to {
+            handlers
+                .entry((hexid(b), repo.clone()))
+                .or_default()
+                .push(f);
+        }
+    }
+    let mut rows: Vec<EndpointRow> = Vec::new();
+    for p in &prog.packages {
+        for ep in &p.endpoints {
+            let bound = handlers
+                .get(&(hexid(&ep.iid), p.repo.clone()))
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let base = |handler: &&cgf::Function| EndpointRow {
+                repo: p.repo.clone(),
+                iid: ep.iid.clone(),
+                kind: ep.kind as i16,
+                name: ep.name.clone(),
+                untrusted: ep.untrusted_input,
+                handler_fqn: handler.fqn.clone(),
+                span_file: handler.span.as_ref().map(|s| s.file.clone()),
+                span_line: handler.span.as_ref().map(|s| s.line),
+            };
+            match bound {
+                [] => rows.push(EndpointRow {
+                    repo: p.repo.clone(),
+                    iid: ep.iid.clone(),
+                    kind: ep.kind as i16,
+                    name: ep.name.clone(),
+                    untrusted: ep.untrusted_input,
+                    handler_fqn: String::new(),
+                    span_file: None,
+                    span_line: None,
+                }),
+                _ => rows.extend(bound.iter().map(base)),
+            }
+        }
+    }
+    rows.sort();
+    let mut seen: HashSet<(String, Vec<u8>, String)> = HashSet::new();
+    rows.retain(|r| seen.insert((r.repo.clone(), r.iid.clone(), r.handler_fqn.clone())));
+    rows
+}
+
+/// Entry-point listing for readers of the store (every kind, gRPC to message
+/// consumers), refreshed per analyzed repo like `invokes`. Reporting only: an
+/// HTTP route still gets no contract row, node, edge or view (see
+/// `persisted_contracts`), and no analysis reads this table.
+async fn refresh_endpoints(tx: &mut Transaction<'_, Postgres>, prog: &Program) -> Result<usize> {
+    let repos: Vec<String> = {
+        let mut v: Vec<String> = prog.packages.iter().map(|p| p.repo.clone()).collect();
+        v.sort();
+        v.dedup();
+        v
+    };
+    sqlx::query("DELETE FROM endpoints WHERE repo = ANY($1)")
+        .bind(&repos)
+        .execute(&mut **tx)
+        .await?;
+
+    let rows = endpoint_rows(prog);
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    let mut repo = Vec::with_capacity(rows.len());
+    let mut iid = Vec::with_capacity(rows.len());
+    let mut kind = Vec::with_capacity(rows.len());
+    let mut name = Vec::with_capacity(rows.len());
+    let mut untrusted = Vec::with_capacity(rows.len());
+    let mut handler_fqn = Vec::with_capacity(rows.len());
+    let mut span_file = Vec::with_capacity(rows.len());
+    let mut span_line = Vec::with_capacity(rows.len());
+    for r in &rows {
+        repo.push(r.repo.clone());
+        iid.push(r.iid.clone());
+        kind.push(r.kind);
+        name.push(r.name.clone());
+        untrusted.push(r.untrusted);
+        handler_fqn.push(r.handler_fqn.clone());
+        span_file.push(r.span_file.clone());
+        span_line.push(r.span_line);
+    }
+    sqlx::query(
+        "INSERT INTO endpoints(repo, iid, kind, name, untrusted, handler_fqn, span_file, span_line)
+         SELECT * FROM UNNEST($1::text[], $2::bytea[], $3::int2[], $4::text[], $5::bool[],
+                              $6::text[], $7::text[], $8::int4[])",
+    )
+    .bind(&repo)
+    .bind(&iid)
+    .bind(&kind)
+    .bind(&name)
+    .bind(&untrusted)
+    .bind(&handler_fqn)
+    .bind(&span_file)
+    .bind(&span_line)
+    .execute(&mut **tx)
+    .await?;
+    Ok(rows.len())
 }
 
 async fn persist_summaries(
@@ -844,6 +1010,372 @@ mod tests {
         assert_eq!(like_escape("100%"), "100\\%");
         assert_eq!(like_escape("a\\b"), "a\\\\b");
         assert_eq!(like_escape("plain"), "plain");
+    }
+
+    /// Two template repos expose the same repo-relative function path, and
+    /// both call the same GraphQL contract. The dedup key must carry the
+    /// caller repo, or the second repo's rows are silently dropped.
+    #[test]
+    fn invokes_keep_two_repos_with_the_same_function_path() {
+        // Two functions in one Program cannot share an iid (funcs is keyed by
+        // iid), so the repos' functions get distinct iids here.
+        let f = |fiid: u8| {
+            (
+                hexid(&[fiid; 32]),
+                cgf::Function {
+                    id: Some(cgf::Ident {
+                        iid: vec![fiid; 32],
+                        bid: vec![fiid; 32],
+                    }),
+                    fqn: "src/api/items.ts:getItems".into(),
+                    flow: Some(cgf::LocalFlow {
+                        callsites: vec![cgf::CallSite {
+                            kind: cgf::call_site::Kind::InvokesRemote as i32,
+                            callee_iids: vec![vec![0x09; 32]],
+                            span: Some(cgf::Span {
+                                file: "src/api/items.ts".into(),
+                                line: 42,
+                                col: 0,
+                            }),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )
+        };
+        let repo_a = "example.com/a".to_string();
+        let repo_b = "example.com/b".to_string();
+        let prog = Program {
+            funcs: [f(0xC0), f(0xC1)].into_iter().collect(),
+            repo_of: [
+                (hexid(&[0xC0; 32]), repo_a.clone()),
+                (hexid(&[0xC1; 32]), repo_b.clone()),
+            ]
+            .into_iter()
+            .collect(),
+            packages: vec![
+                cgf::CgfPackage {
+                    repo: repo_a.clone(),
+                    graphql_fields: vec![cgf::GraphqlField {
+                        iid: vec![0x09; 32],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+                cgf::CgfPackage {
+                    repo: repo_b.clone(),
+                    graphql_fields: vec![cgf::GraphqlField {
+                        iid: vec![0x09; 32],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            ],
+        };
+        let rows = invokes_rows(&prog);
+        assert_eq!(rows.len(), 2, "both repos' calls must survive: {rows:?}");
+        let mut repos: Vec<&str> = rows.iter().map(|r| r.caller_repo.as_str()).collect();
+        repos.sort_unstable();
+        assert_eq!(repos, ["example.com/a", "example.com/b"]);
+        for r in &rows {
+            assert_eq!(r.caller_fn, "src/api/items.ts:getItems");
+            assert_eq!(r.span_file, "src/api/items.ts");
+            assert_eq!(r.span_line, 42);
+            assert_eq!(r.iid, vec![0x09; 32]);
+        }
+    }
+
+    fn bound_fn(iid: u8, fqn: &str, file: &str, line: i32, binds: u8) -> (IidHex, cgf::Function) {
+        (
+            hexid(&[iid; 32]),
+            cgf::Function {
+                id: Some(cgf::Ident {
+                    iid: vec![iid; 32],
+                    bid: vec![iid; 32],
+                }),
+                fqn: fqn.into(),
+                binds_to: vec![vec![binds; 32]],
+                span: Some(cgf::Span {
+                    file: file.into(),
+                    line,
+                    col: 0,
+                }),
+                ..Default::default()
+            },
+        )
+    }
+
+    fn endpoint(iid: u8, kind: cgf::endpoint::Kind, name: &str) -> cgf::Endpoint {
+        cgf::Endpoint {
+            iid: vec![iid; 32],
+            kind: kind as i32,
+            untrusted_input: true,
+            name: name.into(),
+        }
+    }
+
+    fn pkg(repo: &str, endpoints: Vec<cgf::Endpoint>) -> cgf::CgfPackage {
+        cgf::CgfPackage {
+            repo: repo.into(),
+            endpoints,
+            ..Default::default()
+        }
+    }
+
+    /// HTTP and MESSAGE endpoints bound to handlers: rows carry the handler
+    /// fqn and span, and the endpoint kind passes through unmerged.
+    #[test]
+    fn http_and_message_endpoints_persist_with_handler_fqn_and_span() {
+        let repo = "example.com/api".to_string();
+        let prog = Program {
+            funcs: [
+                bound_fn(
+                    0xA1,
+                    "src/api/users.ts:createUser",
+                    "src/api/users.ts",
+                    10,
+                    0x02,
+                ),
+                bound_fn(
+                    0xA2,
+                    "src/queue/orders.ts:consume",
+                    "src/queue/orders.ts",
+                    20,
+                    0x03,
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            repo_of: [
+                (hexid(&[0xA1; 32]), repo.clone()),
+                (hexid(&[0xA2; 32]), repo.clone()),
+            ]
+            .into_iter()
+            .collect(),
+            packages: vec![pkg(
+                &repo,
+                vec![
+                    endpoint(0x02, cgf::endpoint::Kind::Http, "POST /api/users/{id}"),
+                    endpoint(0x03, cgf::endpoint::Kind::Message, "orders"),
+                ],
+            )],
+        };
+        let rows = endpoint_rows(&prog);
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        let http = rows
+            .iter()
+            .find(|r| r.name == "POST /api/users/{id}")
+            .unwrap();
+        assert_eq!(
+            (http.kind, http.iid.clone()),
+            (2, vec![0x02; 32]),
+            "kind 2 = HTTP, the Endpoint.iid is kept"
+        );
+        assert_eq!(http.handler_fqn, "src/api/users.ts:createUser");
+        assert_eq!(http.span_file.as_deref(), Some("src/api/users.ts"));
+        assert_eq!(http.span_line, Some(10));
+        assert!(http.untrusted);
+        let msg = rows.iter().find(|r| r.name == "orders").unwrap();
+        assert_eq!(msg.kind, 3, "kind 3 = MESSAGE");
+        assert_eq!(msg.handler_fqn, "src/queue/orders.ts:consume");
+        assert_eq!(msg.span_line, Some(20));
+    }
+
+    /// Repos made from one template share route names, and an HTTP
+    /// Endpoint.iid is the route's ContractIID — so handler matching must be
+    /// repo-scoped or repo B's handler lands on repo A's endpoint.
+    #[test]
+    fn two_repos_with_the_same_route_name_give_two_rows() {
+        let repo_a = "example.com/a".to_string();
+        let repo_b = "example.com/b".to_string();
+        let prog = Program {
+            funcs: [
+                bound_fn(
+                    0xA1,
+                    "src/api/items.ts:getItems",
+                    "src/api/items.ts",
+                    5,
+                    0x02,
+                ),
+                bound_fn(
+                    0xA2,
+                    "src/api/items.ts:getItems",
+                    "src/api/items.ts",
+                    5,
+                    0x02,
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            repo_of: [
+                (hexid(&[0xA1; 32]), repo_a.clone()),
+                (hexid(&[0xA2; 32]), repo_b.clone()),
+            ]
+            .into_iter()
+            .collect(),
+            packages: vec![
+                pkg(
+                    &repo_a,
+                    vec![endpoint(0x02, cgf::endpoint::Kind::Http, "GET /api/items")],
+                ),
+                pkg(
+                    &repo_b,
+                    vec![endpoint(0x02, cgf::endpoint::Kind::Http, "GET /api/items")],
+                ),
+            ],
+        };
+        let rows = endpoint_rows(&prog);
+        assert_eq!(
+            rows.len(),
+            2,
+            "each repo's endpoint keeps its own handler: {rows:?}"
+        );
+        assert_eq!(rows[0].repo, repo_a);
+        assert_eq!(rows[1].repo, repo_b);
+        assert_eq!(rows[0].handler_fqn, "src/api/items.ts:getItems");
+        // the shared HTTP route ContractIID is exactly what made repo-scoped
+        // handler matching necessary
+        assert_eq!(rows[0].iid, rows[1].iid);
+    }
+
+    /// An endpoint no loaded function binds still lists, so a reader gets
+    /// every entry point from one table.
+    #[test]
+    fn an_endpoint_with_no_bound_handler_gives_one_row_with_empty_handler_fqn() {
+        let repo = "example.com/api".to_string();
+        let prog = Program {
+            funcs: HashMap::new(),
+            repo_of: HashMap::new(),
+            packages: vec![pkg(
+                &repo,
+                vec![endpoint(0x02, cgf::endpoint::Kind::Http, "GET /health")],
+            )],
+        };
+        let rows = endpoint_rows(&prog);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].handler_fqn, "");
+        assert_eq!(rows[0].span_file, None);
+        assert_eq!(rows[0].span_line, None);
+        assert_eq!(rows[0].repo, repo);
+        assert_eq!(rows[0].iid, vec![0x02; 32]);
+    }
+
+    /// The same endpoint listed by two packages of one repo: unbound it must
+    /// still give ONE '' row, bound it must give each handler once — the
+    /// naive enumeration duplicates both, and the INSERT would hit the
+    /// (repo, iid, handler_fqn) PRIMARY KEY.
+    #[test]
+    fn an_endpoint_listed_in_two_packages_of_one_repo_gives_one_row() {
+        let repo = "example.com/api".to_string();
+        let listing = || {
+            pkg(
+                &repo,
+                vec![endpoint(0x02, cgf::endpoint::Kind::Http, "GET /api/items")],
+            )
+        };
+        let unbound = Program {
+            funcs: HashMap::new(),
+            repo_of: HashMap::new(),
+            packages: vec![listing(), listing()],
+        };
+        let rows = endpoint_rows(&unbound);
+        assert_eq!(rows.len(), 1, "unbound: one '' row, not two: {rows:?}");
+        assert_eq!(rows[0].handler_fqn, "");
+
+        let (iid_a, f_a) = bound_fn(
+            0xA1,
+            "src/api/items.ts:getItems",
+            "src/api/items.ts",
+            5,
+            0x02,
+        );
+        let bound = Program {
+            funcs: [(iid_a, f_a)].into_iter().collect(),
+            repo_of: [(hexid(&[0xA1; 32]), repo.clone())].into_iter().collect(),
+            packages: vec![listing(), listing()],
+        };
+        let rows = endpoint_rows(&bound);
+        assert_eq!(rows.len(), 1, "bound: one row, not two: {rows:?}");
+        assert_eq!(rows[0].handler_fqn, "src/api/items.ts:getItems");
+    }
+
+    /// Two loaded functions sharing an fqn in one repo, both binding the same
+    /// endpoint, collapse to one row (same PRIMARY KEY), and the rows come
+    /// out sorted, so the table is deterministic.
+    #[test]
+    fn two_functions_with_the_same_fqn_binding_one_endpoint_give_one_row() {
+        let repo = "example.com/api".to_string();
+        let (iid_a, f_a) = bound_fn(0xA1, "src/api/util.ts:handle", "a.ts", 5, 0x02);
+        let (iid_b, f_b) = bound_fn(0xA2, "src/api/util.ts:handle", "b.ts", 6, 0x02);
+        // a second, distinct handler of the same endpoint
+        let (iid_c, f_c) = bound_fn(0xA3, "src/api/alt.ts:handle", "c.ts", 7, 0x02);
+        let prog = Program {
+            funcs: [(iid_a, f_a), (iid_b, f_b), (iid_c, f_c)]
+                .into_iter()
+                .collect(),
+            repo_of: [
+                (hexid(&[0xA1; 32]), repo.clone()),
+                (hexid(&[0xA2; 32]), repo.clone()),
+                (hexid(&[0xA3; 32]), repo.clone()),
+            ]
+            .into_iter()
+            .collect(),
+            packages: vec![pkg(
+                &repo,
+                vec![endpoint(0x02, cgf::endpoint::Kind::Http, "GET /api/items")],
+            )],
+        };
+        let rows = endpoint_rows(&prog);
+        assert_eq!(rows.len(), 2, "duplicate fqn collapses: {rows:?}");
+        assert_eq!(rows[0].handler_fqn, "src/api/alt.ts:handle");
+        assert_eq!(rows[1].handler_fqn, "src/api/util.ts:handle");
+        assert_eq!(
+            rows,
+            {
+                let mut s = rows.clone();
+                s.sort();
+                s
+            },
+            "rows must come out sorted"
+        );
+    }
+
+    /// The refresh rule of the per-repo rows: a run over repo A writes only
+    /// A's rows, a run over repo B only B's — the DELETE is per analyzed
+    /// repo, so A's rows from the earlier run survive B's run.
+    #[test]
+    fn a_second_run_over_another_repo_writes_only_that_repos_rows() {
+        let repo_a = "example.com/a".to_string();
+        let repo_b = "example.com/b".to_string();
+        let run = |repo: &str| Program {
+            funcs: vec![bound_fn(
+                0xA1,
+                "src/api/x.ts:handler",
+                "src/api/x.ts",
+                5,
+                0x02,
+            )]
+            .into_iter()
+            .collect(),
+            repo_of: [(hexid(&[0xA1; 32]), repo.to_string())]
+                .into_iter()
+                .collect(),
+            packages: vec![pkg(
+                repo,
+                vec![endpoint(0x02, cgf::endpoint::Kind::Http, "GET /api/x")],
+            )],
+        };
+        let a = endpoint_rows(&run(&repo_a));
+        let b = endpoint_rows(&run(&repo_b));
+        assert!(a.iter().all(|r| r.repo == repo_a), "{a:?}");
+        assert!(b.iter().all(|r| r.repo == repo_b), "{b:?}");
+        // Same (repo, iid, handler_fqn) key shape, disjoint repos: B's DELETE
+        // on its own repo cannot remove A's rows, and B's INSERT lands on a
+        // different primary key.
+        assert_eq!(a.len(), b.len());
+        assert_ne!(a[0].repo, b[0].repo);
     }
 
     #[test]
