@@ -67,12 +67,14 @@ sink_ignore_arg_types = ["context.Context"]
 # Note that endpoint-driven sourcing is STRUCTURAL and needs no rule here: the
 # frontends list gRPC request params and gqlgen resolver args in
 # `Function.source_params`, which the core seeds directly. The selectors below
-# only catch accessor getters used inside a handler body, and under structural
-# field-path seeding (`pc-fe --field-paths`, the default) the gRPC one is
-# largely INERT — the request parameter is already a source, and trivial
-# protobuf getters are canonicalized into field projections rather than call
-# sites. It is kept because it still fires on corpora extracted with
-# `--field-paths=false`.
+# only catch accessor getters used inside a function body. Under structural
+# field-path seeding (`pc-fe --field-paths`, the default), trivial protobuf
+# getters are canonicalized into field projections; the frontend keeps a
+# zero-arg shell call site for each one, so the rule still matches the real
+# getter name and seeds the projected field — including in helper functions
+# whose parameters are not endpoint params. A plain field read (`req.Number`)
+# has no call site and is not sourced: name-shaped rules must not fire on
+# in-scope structs that merely share the type-name shape.
 # ---------------------------------------------------------------------------
 
 [[sources]]

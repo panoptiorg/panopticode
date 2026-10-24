@@ -84,6 +84,8 @@ pc-fe-ts build --repo $STAGE/webapp --repo-id webapp --adapter bff-gateway --qui
 | `httpclient` | `httpclient` | defaults | e2e-http |
 | `kafka-producer` | `kafka/producer` | defaults | e2e-kafka |
 | `kafka-consumer` | `kafka/consumer` | defaults | e2e-kafka |
+| `xgrpc-client` | `xgrpc/client` | defaults | e2e-getterfield |
+| `xgrpc-server` | `xgrpc/server` | `--scope ./app/...` (pb out of scope, so the getters are bodiless) | e2e-getterfield |
 | `reactapp` | `reactapp` (TS) | defaults | e2e-react |
 | `reactapp-off` | `reactapp` (TS) | `--no-jsx` | e2e-react |
 | `nextapp` | `nextapp` (TS) | defaults | e2e-next |
@@ -139,6 +141,14 @@ frontend flag, so any difference is attributable to that flag.
 - **`kafka/producer`** / **`kafka/consumer`** — kafka-go and franz-go producers,
   a sarama consumer group and a kafka-go reader; topic `orders` joins, the decoy
   pair `audit-events` / `audit-log` must not.
+- **`xgrpc/client` / `xgrpc/server`** — two services sharing one proto. The
+  client writes one untrusted field and one constant; the server (pb out of
+  scope, so the getters are bodiless and canonicalized) reads both fields
+  through the zero-arg shell call sites into different sinks, and a helper
+  that merely receives the request reads one too. Pins that the catalog's
+  getter `[[sources]]` rule sources the projections across the contract and
+  in the bare helper, while the clean field's sink stays silent from the
+  client's side.
 - **`reactapp`** — a React Router SPA: `useSearchParams` drilled through two
   components into `dangerouslySetInnerHTML`, an `onClick` body, and `fetch` /
   `axios` calls to `httpapi`'s routes.
