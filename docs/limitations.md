@@ -143,10 +143,11 @@ that guard. A wrong refutation deletes a real finding, so prune with care.
 - `impact` re-extracts the whole working tree, not only changed files.
 - Postgres holds the call graph and contract views, not dataflow; the `query`
   commands answer call-reachability questions only.
-- HTTP routes are not persisted: no contract row, node, edge, `invokes` row or
-  view goes to Postgres for them, so `--pg` leaves never carry an HTTP view and
-  the persisted graph has no edge from an HTTP client to its handler. Topic
-  cells are phase-2 and in memory only, like every heap cell.
+- HTTP routes persist as `endpoints` rows only (name, kind, bound handler):
+  no contract row, node, edge, `invokes` row or view goes to Postgres for
+  them, so `--pg` leaves never carry an HTTP view and the persisted graph has
+  no edge from an HTTP client to its handler. Topic cells are phase-2 and in
+  memory only, like every heap cell.
 - The core's cost is dominated by the frontends: whole-program call-graph
   construction in `pc-fe` is the slowest step. On the fixtures in this repo the
   full e2e suite runs in about 3 seconds.

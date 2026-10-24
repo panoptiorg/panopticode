@@ -62,6 +62,24 @@ CREATE TABLE IF NOT EXISTS invokes (
 );
 CREATE INDEX IF NOT EXISTS invokes_iid_idx ON invokes(iid);
 
+-- Entry points of each repo (CGF `endpoints`, one row per bound handler):
+-- kind 0 grpc, 1 graphql, 2 http, 3 message. `name` is Endpoint.name, e.g.
+-- "POST /api/users/{id}" or "ledger.Ledger/GetAccount"; `untrusted` is
+-- Endpoint.untrusted_input. handler_fqn is the fqn of a function whose
+-- binds_to lists the endpoint iid; '' when no loaded function binds it.
+-- The repo is in the key: repos made from one template share route names.
+CREATE TABLE IF NOT EXISTS endpoints (
+  repo        TEXT NOT NULL,
+  iid         BYTEA NOT NULL,
+  kind        SMALLINT NOT NULL,  -- Endpoint.Kind: 0 grpc, 1 graphql, 2 http, 3 message
+  name        TEXT NOT NULL,      -- Endpoint.name, e.g. "POST /api/users/{id}"
+  untrusted   BOOLEAN NOT NULL,
+  handler_fqn TEXT NOT NULL,      -- a function whose binds_to has iid; '' if none
+  span_file   TEXT,               -- the span of the handler
+  span_line   INT,
+  PRIMARY KEY (repo, iid, handler_fqn)
+);
+
 -- Contract summary store (durable tier; hot tier is in-process moka LRU).
 -- Immutable, content-addressed by summary_key (doc 06 §8.2).
 CREATE TABLE IF NOT EXISTS summaries (

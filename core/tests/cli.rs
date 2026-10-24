@@ -134,3 +134,92 @@ fn locations_carry_columns_and_the_source_hop_a_span() {
     }
     assert!(cs.iter().any(|c| c["sink_span"]["col"].is_number()));
 }
+
+/// A fake frontend that records its argv, copies a real CGF over --out, and
+/// writes the manifest `impact` reads. Proves `--fe-arg` values reach the
+/// frontend after the built-in arguments, in order.
+#[test]
+fn impact_passes_fe_args_to_the_frontend_in_order() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = std::env::temp_dir().join(format!("pc-fe-arg-{}", std::process::id()));
+    let out = tmp.join("cgf-out");
+    let store = tmp.join("store");
+    std::fs::create_dir_all(&out).unwrap();
+
+    let fixture = root().join("testdata/cgf/webapp");
+    let script = format!(
+        r#"#!/bin/sh
+out=""
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "--out" ]; then out="$a"; fi
+  prev="$a"
+done
+printf '%s\n' "$@" > "$out/argv.txt"
+cp -R "{}/." "$out/"
+printf '{{"base":"aaaaaaaa","head":"bbbbbbbb","changed_files":[],"changed_fns":[]}}' > "$out/manifest.json"
+"#,
+        fixture.display()
+    );
+    let fe = tmp.join("fake-fe.sh");
+    std::fs::write(&fe, script).unwrap();
+    std::fs::set_permissions(&fe, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let repo = tmp.join("repo");
+    let o = Command::new(env!("CARGO_BIN_EXE_panopticode"))
+        .args([
+            "impact",
+            "--repo",
+            repo.to_str().unwrap(),
+            "--base",
+            "aaaaaaaa",
+            "--head",
+            "bbbbbbbb",
+            "--store",
+            store.to_str().unwrap(),
+            "--out",
+            out.to_str().unwrap(),
+            "--scope",
+            "src/",
+            "--fe",
+            fe.to_str().unwrap(),
+            "--fe-arg",
+            "--repo-id",
+            "--fe-arg",
+            "example.com/webapp",
+            "--fe-arg=--adapter",
+            "--fe-arg=gateway",
+        ])
+        .current_dir(std::env::temp_dir())
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+
+    let argv: Vec<String> = std::fs::read_to_string(out.join("argv.txt"))
+        .unwrap()
+        .lines()
+        .map(String::from)
+        .collect();
+    let expected = vec![
+        "build".to_string(),
+        repo.to_string_lossy().to_string(),
+        "--out".to_string(),
+        out.to_string_lossy().to_string(),
+        "--mode".to_string(),
+        "mr".to_string(),
+        "--base".to_string(),
+        "aaaaaaaa".to_string(),
+        "--head".to_string(),
+        "bbbbbbbb".to_string(),
+        "--scope".to_string(),
+        "src/".to_string(),
+        "--repo-id".to_string(),
+        "example.com/webapp".to_string(),
+        "--adapter".to_string(),
+        "gateway".to_string(),
+    ];
+    assert_eq!(argv, expected, "frontend argv order wrong");
+
+    std::fs::remove_dir_all(&tmp).ok();
+}

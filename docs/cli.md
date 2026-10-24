@@ -287,7 +287,8 @@ run on real Go repositories: it extracts each one with `pc-fe`, then runs
 
 ```
 panopticode impact --repo <dir> --base <sha> --head <sha> --store <dir> \
-  [--scope <pat>] [--cgf <dir> ...] [--catalog <file>] [--out <dir>] [--fe pc-fe] [--pg <url>]
+  [--scope <pat>] [--cgf <dir> ...] [--catalog <file>] [--out <dir>] [--fe pc-fe] \
+  [--fe-arg <arg> ...] [--pg <url>]
 ```
 
 Re-extracts `--repo` with `pc-fe build --mode mr --base --head` (the working
@@ -300,12 +301,17 @@ scc_recomputed, reuse_pct}`. `pc-fe` output goes to stderr.
   (or the built-in one in both) and none of `--no-error-leaf`, `--pb-getters`, `--unmodeled`; otherwise the
   store namespace differs and every summary is recomputed.
 - `--cgf` adds pre-extracted CGF of other repositories so chains compose.
+- `--fe-arg <arg>` (repeatable, order kept) appends arguments to the frontend
+  command, after the built-in ones. A TypeScript frontend needs
+  `--fe-arg --repo-id <id>` — the CGF repo must match the other CGF dirs of
+  the run — and `--fe-arg --adapter <name>`.
 - `--pg` resolves remote contract views from Postgres (making `--cgf`
   optional) and adds an upstream walk of the persisted call graph to the blast
   radius.
 - HTTP client sites are linked to the loaded routes as in `taint` (there is no
-  `--no-http-link` here). Postgres holds no HTTP routes, so a client of a
-  route outside the loaded CGF stays unlinked.
+  `--no-http-link` here). Postgres lists HTTP routes in `endpoints`, but holds
+  no view for them, so a client of a route outside the loaded CGF stays
+  unlinked.
 
 ## query
 
@@ -358,5 +364,11 @@ docker compose -f deploy/docker-compose.yml up -d
 ```
 
 What is written: functions and contracts as nodes; call, binds-to and
-invokes-remote edges; summaries; contract views (`contract_summaries`, which
-`--pg` also reads back). The `summaries` table is written but never read.
+invokes-remote edges; the entry points of each repo as `endpoints` rows (one
+per endpoint and bound handler, every kind — gRPC, GraphQL, HTTP, message
+consumers); summaries; contract views (`contract_summaries`, which `--pg`
+also reads back). The `summaries` table is written but never read.
+
+A store made by an older version lacks the `endpoints` table; apply
+[`deploy/schema.sql`](../deploy/schema.sql) again — every statement is
+`CREATE ... IF NOT EXISTS`, so re-applying it adds only what is missing.

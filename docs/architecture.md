@@ -237,7 +237,9 @@ store namespace flag.
 The witness renders a crossing as `http <METHOD> <display> (<framework>)` and
 re-enters the handler at the first request parameter whose rows carry the
 sink. The view is not identity, so `--backward` reports `undecided` across it
-unless `--backward-unview` is given. HTTP routes are not persisted to Postgres.
+unless `--backward-unview` is given. Routes persist to Postgres as
+`endpoints` rows only — no contract row, node, edge or view — so a PG-backed
+run still cannot resolve one.
 
 ## Routes
 
@@ -348,7 +350,9 @@ uses. A new contract record is one more block in `pkg_contracts`. Its readers:
 `cli.rs` `graph-dump` counts each package field itself, for display only.
 
 `Endpoint` plus `Function.binds_to` is not enough to replace them: an `Endpoint`
-carries no handler iid and no shape, so endpoints are only counted.
+carries no handler iid and no shape, so endpoints are only counted, and with
+`--pg` listed in the `endpoints` table (name, kind, untrusted flag, the fqn
+and span of each bound handler) for readers of the store.
 
 `ContractShape` (`compose.rs`) has three variants, `Grpc(client_streaming,
 server_streaming)`, `Graphql(arg → param index)` and `Http { request_params }`.
@@ -385,11 +389,13 @@ contract is counted, persisted and displayed as gRPC.
 ## Optional Postgres
 
 [`deploy/schema.sql`](../deploy/schema.sql) stores `repos`, `nodes`, `edges`,
-`contracts`, `invokes`, `summaries` and `contract_summaries`. The binary does
-not apply the schema. Only the call graph (function and contract nodes; call,
-binds-to and invokes-remote edges), summaries and contract views are written;
-LocalFlow is not. `summaries` is written but not read back;
-`contract_summaries` is read by `--pg` runs. HTTP routes and linked HTTP
-client sites are not written at all (`storage.rs` `persisted_contracts`, `is_remote`):
-a link is made per run against the loaded routes only. The `query` subcommands
+`contracts`, `invokes`, `endpoints`, `summaries` and `contract_summaries`. The
+binary does not apply the schema. Only the call graph (function and contract
+nodes; call, binds-to and invokes-remote edges), summaries, contract views and
+entry points are written; LocalFlow is not. `summaries` is written but not
+read back; `contract_summaries` is read by `--pg` runs. HTTP routes are
+written to `endpoints` (name, kind, bound handler) and nowhere else: no
+contract row, node, edge or view, and linked HTTP client sites are not
+written at all (`storage.rs` `persisted_contracts`, `is_remote`): a link is
+made per run against the loaded routes only. The `query` subcommands
 ([cli.md](cli.md#query)) read this data.
