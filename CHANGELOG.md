@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.2](https://github.com/panoptiorg/panopticode/compare/v0.4.1...v0.4.2) (2026-10-24)
+
+
+### Bug Fixes
+
+* run the compose fixpoint in the summary debug command ([#12](https://github.com/panoptiorg/panopticode/issues/12)) ([246d35b](https://github.com/panoptiorg/panopticode/commit/246d35b6dd35695111bd217777f209090a0d6cd8))
+
 ## [0.4.1](https://github.com/panoptiorg/panopticode/compare/v0.4.0...v0.4.1) (2026-10-24)
 
 

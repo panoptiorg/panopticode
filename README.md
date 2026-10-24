@@ -60,8 +60,8 @@ and comes with a `.sha256` file:
 <!-- x-release-please-start-version -->
 ```bash
 target=aarch64-apple-darwin   # or x86_64-apple-darwin, x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu
-base=https://github.com/panoptiorg/panopticode/releases/download/v0.4.1
-file=panopticode-0.4.1-$target.tar.gz
+base=https://github.com/panoptiorg/panopticode/releases/download/v0.4.2
+file=panopticode-0.4.2-$target.tar.gz
 curl -fLO $base/$file -O $base/$file.sha256
 shasum -a 256 -c $file.sha256
 tar -xzf $file
