@@ -132,6 +132,13 @@ go_fixture httpclient        httpclient
 go_fixture kafka-producer    kafka/producer
 go_fixture kafka-consumer    kafka/consumer
 
+# --- e2e-getterfield: canonicalized pb getters keep their catalog source rule
+# Two services share one proto. The server's pb stays OUT of scope (the later
+# --scope wins over go_fixture's), so its getters are bodiless and the
+# frontend canonicalizes them into projections plus zero-arg shell call sites.
+go_fixture xgrpc-client xgrpc/client
+go_fixture xgrpc-server xgrpc/server --scope './app/...'
+
 echo ">> webapp (pc-fe-ts, adapter=$ADAPTER)" >&2
 rm -rf "$DEST/webapp"
 "$FE_TS" build --repo "$STAGE/webapp" --repo-id webapp --out "$DEST/webapp" \

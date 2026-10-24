@@ -3495,4 +3495,92 @@ mod catalog_port_tests {
         assert_eq!(st.confirmed, 1, "{:?}", chains[0].backward);
         assert_eq!(chains[0].backward.as_ref().unwrap().terminal, Some(crate::backward::Verdict::Confirmed));
     }
+
+    /// ```go
+    /// // a canonicalized pb getter is a field projection plus a ZERO-ARG
+    /// // shell call (the frontend keeps the callee identity and one result
+    /// // port, no arg ports):
+    /// func Save(r *pb.Request) {   // no source_params
+    ///     db.Exec(r.GetId())       // shell call + projection: the route
+    ///     db.Exec(r.Note)          // plain read: projection only, no call
+    /// }
+    /// ```
+    /// The catalog's getter [[sources]] rule fires on the shell's result port
+    /// — the same CallResultPort seeding any call gets — and nothing seeds a
+    /// plain field read, which carries no call site to match.
+    fn getter_handler() -> cgf::Function {
+        let mut whole = vertex(1, cgf::VertexKind::InParam, 0, 0);
+        whole.r#type = "*example.com/api/pb.Request".into();
+        let mut id = vertex(2, cgf::VertexKind::InParam, 0, 0);
+        id.r#type = "*example.com/api/pb.Request".into();
+        id.field_path = vec![1];
+        id.field_names = vec!["Id".into()];
+        let mut note = vertex(3, cgf::VertexKind::InParam, 0, 0);
+        note.r#type = "*example.com/api/pb.Request".into();
+        note.field_path = vec![2];
+        note.field_names = vec!["Note".into()];
+        let mut shell = vertex(4, cgf::VertexKind::CallResultPort, 0, 0);
+        shell.r#type = "string".into();
+        let mut port = vertex(5, cgf::VertexKind::CallArgPort, 0, 1);
+        port.r#type = "string".into();
+        let mut port2 = vertex(6, cgf::VertexKind::CallArgPort, 0, 2);
+        port2.r#type = "string".into();
+        let mut cs0 = call(0, "(*example.com/api/pb.Request).GetId", 0, 1, false);
+        cs0.arg0_is_receiver = false;
+        func(
+            0x64,
+            "app.Save",
+            cgf::LocalFlow {
+                vertices: vec![whole, id, note, shell, port, port2],
+                edges: vec![edge(4, 5), edge(3, 6)],
+                callsites: vec![
+                    cs0,
+                    call(1, "db.Exec", 1, 0, false),
+                    call(2, "db.Exec", 1, 0, false),
+                ],
+            },
+        )
+    }
+
+    fn getter_cat(rule: bool) -> Catalog {
+        let src = if rule {
+            "[[sources]]\nkind = \"grpc_request\"\nselector_regex = 'Request\\)\\.Get[A-Za-z0-9_]+$'\n"
+        } else {
+            ""
+        };
+        Catalog::load_str(&format!(
+            "{src}[[sinks]]\nclass = \"sqli\"\nselector = \"db.Exec\"\n"
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_canonicalized_getter_shell_call_still_matches_its_catalog_source_rule() {
+        let prog = prog_of(getter_handler());
+        // no rule: nothing seeds, no finding
+        let ctx = FnCtx::build(&prog.funcs[&hexid(&[0x64; 32])], &getter_cat(false));
+        assert!(ctx.source_seeds.is_empty());
+
+        let cat = getter_cat(true);
+        let f = &prog.funcs[&hexid(&[0x64; 32])];
+        let ctx = FnCtx::build(f, &cat);
+        assert_eq!(
+            ctx.source_seeds,
+            vec![4],
+            "the shell's result port seeds; the param and the plain read do not"
+        );
+        let mut eng = Engine::new(&prog, &cat);
+        eng.run();
+        assert_eq!(source_hits(&eng, 0x64), vec!["sqli".to_string()]);
+        // the Source-keyed hit sits on the Id sink (callsite 1); the Note
+        // read (callsite 2) fires only as a caller-facing Param(0) summary
+        // row — no source ever taints a plain field read
+        let src_cs: Vec<usize> = eng.summaries[&hexid(&[0x64; 32])]
+            .sink_hits
+            .iter()
+            .filter(|h| h.in_slot == Slot::Source)
+            .map(|h| h.callsite)
+            .collect();
+        assert_eq!(src_cs, vec![1]);
+    }
 }

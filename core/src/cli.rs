@@ -730,8 +730,9 @@ fn summary_dbg(cgf: &[PathBuf], catalog: Option<&std::path::Path>, fnpat: &str) 
     let mut eng = Engine::new(&prog, &cat);
     eng.run();
     // same phase-2 order taint uses, so `summary --fn` shows what the report
-    // actually sees — without this a heap-mediated hit is invisible to the one
-    // tool built for diagnosing summaries.
+    // actually sees — without this a heap-mediated hit or a contract view
+    // composed at an invokes_remote site is invisible to the one tool built
+    // for diagnosing summaries.
     let hs = crate::heap::fixpoint(&mut eng);
     if hs.cells > 0 {
         eprintln!(
@@ -739,6 +740,9 @@ fn summary_dbg(cgf: &[PathBuf], catalog: Option<&std::path::Path>, fnpat: &str) 
             hs.cells, hs.writers, hs.cell_sinks, hs.spliced, hs.iters
         );
     }
+    // last phase-2 step, exactly like taint: the contract views composed at
+    // invokes_remote sites are part of what the report sees
+    compose::fixpoint(&mut eng);
     for (iid, f) in &prog.funcs {
         if !f.fqn.contains(fnpat) {
             continue;

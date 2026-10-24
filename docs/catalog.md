@@ -265,8 +265,12 @@ covers. That is expected.
   `scripts/e2e-core.sh` can delete it and show GraphQL sourcing is structural.
   Delete it in your copy.
 - Under `pc-fe --field-paths` (the default) trivial protobuf getters become
-  field projections, not calls, so getter-based source rules rarely match on
-  Go. Go sinks and sanitizers are catalog-only.
+  field projections plus zero-arg shell call sites, so a getter-based source
+  rule still matches the real getter name and seeds the projected field —
+  including in helper functions whose parameters are not endpoint params. A
+  plain field read has no call site and is not sourced: a name-shaped rule
+  never fires on in-scope structs that merely share the type-name shape.
+  Go sinks and sanitizers are catalog-only.
 
 ## Fitting a catalog to a codebase
 

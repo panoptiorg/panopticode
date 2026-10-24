@@ -23,7 +23,7 @@
 # The assertions below are ported, statement for statement, from the cross-repo
 # acceptance battery that drives the three repos together (a Go frontend, a TS
 # frontend and this core). Everything that can be decided from a CGF corpus plus
-# `panopticode` is reproduced here verbatim. Twenty suites:
+# `panopticode` is reproduced here verbatim. Twenty-one suites:
 #
 #   e2e          cross-repo unary / server-stream / client-stream chains
 #   e2e-multihop two service boundaries; a boundary inside a local helper
@@ -50,6 +50,7 @@
 #   e2e-react     JSX props, an onClick body, and React → Go chains over HTTP
 #   e2e-next      Next.js route files, a server action, a fetch linked to its
 #                 own route
+#   e2e-getterfield canonicalized pb getters keep their catalog source rule
 #
 # WHAT IS DEPRIVED FROM THE FULL BATTERY (and why)
 #
@@ -1570,6 +1571,53 @@ assert re.search(r"http-link: sites=1 linked=1 \(exact=1", err), "client fetch l
 dump = open(os.path.join(OUT, "next-dump.txt")).read()
 assert re.search(r"http_routes=6\b", dump), re.search(r"http_routes=\d+", dump)
 print("PASS: e2e-next — route.ts, a server action and a Pages-era app in one repo; the client fetch links to its own route")
+PY
+
+# ===========================================================================
+echo
+echo "########## e2e-getterfield — canonicalized getters keep their catalog source"
+# ===========================================================================
+# Two services share one proto. The client writes one untrusted field and one
+# constant; the server (pb out of scope, so the getters are bodiless and the
+# frontend emitted field projections instead of call sites) reads both fields
+# into different sinks, and a helper that merely receives the request reads it
+# too. The gRPC getter rule must still source those reads — on the projected
+# field, across the contract, and in the helper that nothing else seeds —
+# while the clean field's sink stays silent from the client's side.
+taint getterfield --cgf "$CGF/xgrpc-client" --cgf "$CGF/xgrpc-server"
+python3 - "$OUT/getterfield.json" <<'PY' || suite_fail e2e-getterfield
+import json, sys
+ch = json.load(open(sys.argv[1]))
+def srcs(cls):
+    return [c["source_fn"] for c in ch if c["sink_class"] == cls]
+def has(src, cls, what):
+    hit = [c for c in ch if src in c["source_fn"] and c["sink_class"] == cls]
+    assert hit, f"{what}; have {[(c['source_fn'], c['sink_class']) for c in ch]}"
+    return hit[0]
+def hasnt(src, cls, what):
+    assert not [c for c in ch if src in c["source_fn"] and c["sink_class"] == cls], \
+        f"{what}; have {[(c['source_fn'], c['sink_class']) for c in ch]}"
+
+# THE ROUTE: the client's untrusted field crosses the gRPC contract into the
+# Id sink the server reads through a canonicalized getter.
+c = has("client/app.Store).Handle", "sqli", "client field -> server Id sink")
+b = [h for h in c["route"]["hops"] if h.get("kind") == "boundary"]
+assert any("pb.Store/Get" in h.get("callee", "") and h.get("field") == "Id" for h in b), \
+    f"the chain must cross the Store/Get contract on Id: {c['route']['hops']}"
+
+# THE PRECISION: the clean field's command sink never fires from the client.
+hasnt("client/app.Store).Handle", "exec", "client taint reached the Note sink")
+
+# THE FIX: the helper has no endpoint parameter, so the getter rule is its
+# only source — it matches the shell call's real `(*pb.StoreGetRequest).GetId`
+# fqn and seeds the projection.
+has("server/app.Render", "sqli", "helper sourced by the getter rule")
+
+# recall control: the server's endpoint parameter still sources both sinks.
+has("server/app.Implementation).Get", "sqli", "handler Id read")
+has("server/app.Implementation).Get", "exec", "handler Note read")
+print("PASS: e2e-getterfield — getter rule sources projections across the "
+      "contract and in a bare helper; the clean field stays clean")
 PY
 
 # ===========================================================================
