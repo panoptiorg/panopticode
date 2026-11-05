@@ -378,6 +378,7 @@ mod tests {
                 callsite: 0,
                 span: None,
                 via_heap: None,
+                terminal: crate::ifds::SinkOrigin { fn_iid: String::new(), callsite: 0 },
             });
         }
         s
@@ -830,6 +831,7 @@ arg = "any"
             callsite: 0,
             span: None,
             via_heap: None,
+            terminal: crate::ifds::SinkOrigin { fn_iid: String::new(), callsite: 0 },
         });
         leaf
     }

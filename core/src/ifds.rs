@@ -248,6 +248,11 @@ pub struct HeapEntry {
     pub class: String,
     pub via: HeapVia,
     pub assert: Option<String>,
+    /// The terminal sink inside the READER this entry stands for — copied from
+    /// the reader's own `SinkHit::terminal`, so a heap-mediated hit stays
+    /// distinct from any other same-class terminal below the same call site.
+    /// (The heap hit itself has no call site: `callsite` is usize::MAX.)
+    pub terminal: SinkOrigin,
 }
 
 impl HeapEntry {
@@ -272,6 +277,20 @@ pub struct SinkHit {
     pub span: Option<cgf::Span>,
     /// Some(..) iff spliced by heap::fixpoint (phase 2, never persisted).
     pub via_heap: Option<HeapVia>,
+    /// Identity of the TERMINAL sink this hit stands for: the leaf function's
+    /// iid and the call-site index of the sink call inside that leaf. A direct
+    /// sink in this frame sets its own; composition copies the callee row's
+    /// terminal unchanged, so two same-class sinks below one call site stay
+    /// distinct at every level above, while two paths to the same terminal
+    /// still merge (dedup keys include the terminal, not the path).
+    pub terminal: SinkOrigin,
+}
+
+/// Where a sink chain actually ends (see `SinkHit::terminal`).
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SinkOrigin {
+    pub fn_iid: IidHex,
+    pub callsite: usize,
 }
 
 #[derive(Clone, Default, Debug)]
@@ -682,10 +701,13 @@ impl<'a> Engine<'a> {
             .unwrap_or(false)
     }
 
-    /// summary_key = H(bid ++ sorted callee contract_hashes). Callees without a
-    /// recorded hash (out-of-scope / invokes_remote) contribute nothing — their
-    /// default-leaf treatment depends only on callsite structure already in bid.
-    fn key_of(&self, _iid: &IidHex, f: &cgf::Function) -> Option<ids::Hash> {
+    /// summary_key = H(own_iid ++ bid ++ sorted callee contract_hashes).
+    /// Callees without a recorded hash (out-of-scope / invokes_remote)
+    /// contribute nothing — their default-leaf treatment depends only on
+    /// callsite structure already in bid. own_iid is mixed in because a
+    /// summary names its own fn in terminal sink origins: two same-body
+    /// functions have different summaries and must not share a cache entry.
+    fn key_of(&self, iid: &IidHex, f: &cgf::Function) -> Option<ids::Hash> {
         let bid = f.id.as_ref().map(|i| i.bid.as_slice()).unwrap_or_default();
         if bid.is_empty() {
             return None;
@@ -700,7 +722,7 @@ impl<'a> Engine<'a> {
                 }
             }
         }
-        Some(ids::summary_key(bid, &f.source_params, hashes))
+        Some(ids::summary_key(iid, bid, &f.source_params, hashes))
     }
 
     /// Derive the summary of one function.
@@ -728,6 +750,7 @@ impl<'a> Engine<'a> {
                     callsite: sh.callsite,
                     span: sh.span,
                     via_heap: sh.via_heap,
+                    terminal: sh.terminal,
                 });
             }
         }
@@ -749,6 +772,7 @@ impl<'a> Engine<'a> {
                     callsite: sh.callsite,
                     span: sh.span,
                     via_heap: sh.via_heap,
+                    terminal: sh.terminal,
                 });
             }
         }
@@ -776,6 +800,9 @@ impl<'a> Engine<'a> {
                                 callsite: cs_idx,
                                 span: cs.span.clone(),
                                 via_heap: None,
+                                // the terminal is the callee row's — the sink
+                                // deep inside the callee, unchanged
+                                terminal: sh.terminal.clone(),
                             });
                         }
                     }
@@ -809,6 +836,7 @@ impl<'a> Engine<'a> {
                     callsite: sh.callsite,
                     span: sh.span,
                     via_heap: sh.via_heap,
+                    terminal: sh.terminal,
                 });
             }
         }
@@ -831,6 +859,13 @@ impl<'a> Engine<'a> {
         let mut sinks: Vec<PropSink> = Vec::new();
         let mut pred: HashMap<u32, u32> = HashMap::new();
         let mut stream_out = false;
+        // Own identity, for terminal assignment on direct hits: a sink this
+        // frame calls directly IS the terminal.
+        let own_iid = f
+            .id
+            .as_ref()
+            .map(|i| hexid(&i.iid))
+            .unwrap_or_default();
 
         for s in seeds {
             if tainted.insert(*s) {
@@ -883,6 +918,10 @@ impl<'a> Engine<'a> {
                             span: cs.span.clone(),
                             last: v,
                             via_heap: None,
+                            terminal: SinkOrigin {
+                                fn_iid: own_iid.clone(),
+                                callsite: cs_idx,
+                            },
                         });
                     }
                 }
@@ -929,6 +968,10 @@ impl<'a> Engine<'a> {
                                     span: cs.span.clone(),
                                     last: v,
                                     via_heap: sh.via_heap.clone(),
+                                    // unchanged from the callee row: the sink
+                                    // is where the CALLEE (or deeper) put it,
+                                    // not here
+                                    terminal: sh.terminal.clone(),
                                 });
                             }
                         }
@@ -1016,6 +1059,11 @@ impl<'a> Engine<'a> {
                             span: cs.span.clone(),
                             last: v,
                             via_heap: None,
+                            // the unmodeled call here IS the terminal
+                            terminal: SinkOrigin {
+                                fn_iid: own_iid.clone(),
+                                callsite: cs_idx,
+                            },
                         });
                     }
                     if let Some(t) = tr.filter(|t| t.wants("leaf")) {
@@ -1135,6 +1183,9 @@ impl<'a> Engine<'a> {
                         span: vtx.span.clone(),
                         last: vtx.id,
                         via_heap: Some(via.clone()),
+                        // the sink lives inside the READER; HeapEntry carries
+                        // the reader sink_hit's terminal unchanged
+                        terminal: e.terminal.clone(),
                     });
                 }
             }
@@ -1165,6 +1216,12 @@ pub struct PropSink {
     /// still a real vertex (the OUT_FIELD write), so the local backtrace and
     /// every hop before the crossing render normally.
     pub via_heap: Option<HeapVia>,
+    /// Identity of the terminal sink this hit stands for (see
+    /// `SinkHit::terminal`): direct and unmodeled hits set their own
+    /// (fn, callsite); composed and heap-mediated hits carry the callee row's
+    /// / reader row's terminal unchanged. witness follows it when descending,
+    /// and `Route::terminal` must equal it when a route completes.
+    pub terminal: SinkOrigin,
 }
 
 /// Per-function precomputed indices over LocalFlow. Path-variant vertices
@@ -2454,6 +2511,10 @@ arg = "1"
             callsite: 0,
             span: None,
             via_heap: None,
+            terminal: SinkOrigin {
+                fn_iid: hexid(&CONTRACT),
+                callsite: 0,
+            },
         });
         eng.summaries.insert(hexid(&CONTRACT), csum);
         let f = &prog.funcs[&hexid(&[0x07; 32])];

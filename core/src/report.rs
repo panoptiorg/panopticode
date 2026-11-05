@@ -69,6 +69,13 @@ pub struct Chain {
     /// callsite; usize::MAX for a heap crossing) — internal, backward.rs
     #[serde(skip)]
     pub source_callsite: usize,
+    /// terminal sink identity (fn iid, callsite in that fn) of the `PropSink`
+    /// this chain came from — internal. Distinguishes chains whose routes are
+    /// incomplete: those carry no `Route.terminal` (the walk stopped early),
+    /// so two terminals that stop at the same partial hops would otherwise
+    /// share a `chain_key` and merge.
+    #[serde(skip)]
+    pub sink_terminal: (String, usize),
     /// doc 35: the sink-seeded backward confirmation of this chain. None unless
     /// `taint --backward` ran; then confirmed / refuted / undecided plus the
     /// source-side field the terminal actually reads.
@@ -266,13 +273,18 @@ pub fn intra_chains(engine: &Engine, filter: Option<&str>) -> Vec<Chain> {
                     )
                 }
             });
-            // Full route. `target` pins THIS sink, so two same-class sinks in
-            // one function get two distinct routes.
+            // Full route. The target pins THIS sink instance: the (callsite,
+            // firing vertex) pin at the entry frame, and the terminal sink
+            // identity at every level below — so two same-class sinks under one
+            // call site (even two levels down) get two distinct routes.
             let route = walk.route(
                 iid,
                 &ctx.source_seeds,
                 &sink.class,
-                Some((sink.callsite, sink.last)),
+                Some(witness::SinkTarget {
+                    at: Some((sink.callsite, sink.last)),
+                    terminal: sink.terminal.clone(),
+                }),
             );
             // 0.0 = unset (legacy) => 1.0, same convention as the source-fn product.
             let route_confidence = route
@@ -295,6 +307,7 @@ pub fn intra_chains(engine: &Engine, filter: Option<&str>) -> Vec<Chain> {
                 route_confidence,
                 source_iid: iid.clone(),
                 source_callsite: sink.callsite,
+                sink_terminal: (sink.terminal.fn_iid.clone(), sink.terminal.callsite),
                 backward: None,
             });
         }
@@ -329,6 +342,11 @@ pub fn intra_chains(engine: &Engine, filter: Option<&str>) -> Vec<Chain> {
                         span,
                         c.route.as_ref().map(|r| r.id.clone()).unwrap_or_default(),
                         c.sink_field.clone().unwrap_or_default(),
+                        // same tail rule as chain_key: two terminals of the
+                        // same class never tie, so the order never depends on
+                        // the stable sort's insertion-order fallback
+                        c.sink_terminal.0.clone(),
+                        c.sink_terminal.1,
                     )
                 };
                 key(a).cmp(&key(b))
@@ -385,7 +403,7 @@ pub fn backward_check(
 /// request travelled — on a large service one route was emitted 20 times
 /// N12). Those are one finding, and merging them is lossless: every variant is
 /// preserved in `sink_fields` and `RouteHop.fields`.
-type ChainKey = (String, String, String, String, i32, String);
+type ChainKey = (String, String, String, String, i32, String, String, usize);
 
 fn chain_key(c: &Chain) -> ChainKey {
     let (file, line) = c
@@ -393,6 +411,13 @@ fn chain_key(c: &Chain) -> ChainKey {
         .as_ref()
         .map(|s| (s.file.clone(), s.line))
         .unwrap_or_default();
+    // Two chains to different terminals of the same class end in different
+    // hops, so their route ids already differ; the terminal is still part of
+    // the key so a route-id collision could never merge two chains that end at
+    // different sinks. Taken from the chain's own `PropSink`, not the route:
+    // an incomplete route carries no terminal, and two terminals that stop at
+    // the same partial hops then share a route id.
+    let (term_fn, term_cs) = c.sink_terminal.clone();
     (
         c.source_repo.clone(),
         c.source_fn.clone(),
@@ -400,6 +425,8 @@ fn chain_key(c: &Chain) -> ChainKey {
         file,
         line,
         c.route.as_ref().map(|r| r.id.clone()).unwrap_or_default(),
+        term_fn,
+        term_cs,
     )
 }
 
@@ -545,6 +572,7 @@ mod tests {
             route_confidence: 1.0,
             source_iid: String::new(),
             source_callsite: 0,
+            sink_terminal: (String::new(), 0),
             backward: None,
         }
     }

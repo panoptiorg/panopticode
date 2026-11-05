@@ -267,6 +267,13 @@ pub struct BackReport {
     /// not the request, reaches (measurements FP-02 / idx 11).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub terminal: Option<Verdict>,
+    /// The source-side field(s) whose demand reaches the route's OWN terminal
+    /// sink — the subset of `source_fields` that belongs to the route, not to
+    /// a sibling sink of the same class below the chain's call site. Empty
+    /// unless `terminal` is `Confirmed`: a consumer that shows fields on the
+    /// route must show these, not `source_fields`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub terminal_fields: Vec<String>,
     /// The walk crossed a contract whose published view is not the handler's
     /// own frame, and got through it by undoing compose's slot remap
     /// (`--backward-unview`). Always false without that flag. A refutation
@@ -274,6 +281,19 @@ pub struct BackReport {
     /// refuses to act on.
     #[serde(skip_serializing_if = "is_false")]
     pub unviewed: bool,
+}
+
+/// The seed-side field names of a completed walk, in report order: rendered,
+/// non-empty, sorted, deduplicated.
+fn seed_fields(seeds: &[(Path, bool, bool)]) -> Vec<String> {
+    let mut fields: Vec<String> = seeds
+        .iter()
+        .map(|(p, _, _)| p.render())
+        .filter(|s| !s.is_empty())
+        .collect();
+    fields.sort();
+    fields.dedup();
+    fields
 }
 
 #[derive(Default, Debug, Clone, Copy, Serialize)]
@@ -572,6 +592,7 @@ impl<'a, 'e> Back<'a, 'e> {
             source_fields: Vec::new(),
             reason: Some(why.to_string()),
             terminal: None,
+            terminal_fields: Vec::new(),
             unviewed: false,
         };
         let Some(route) = route else {
@@ -648,19 +669,16 @@ impl<'a, 'e> Back<'a, 'e> {
         match v_any {
             Verdict::Confirmed => {
                 let exact = any.seeds.iter().any(|(_, e, _)| *e);
-                let mut fields: Vec<String> = any
-                    .seeds
-                    .iter()
-                    .map(|(p, _, _)| p.render())
-                    .filter(|s| !s.is_empty())
-                    .collect();
-                fields.sort();
-                fields.dedup();
                 BackReport {
                     verdict: Verdict::Confirmed,
                     exact,
-                    source_fields: fields,
+                    source_fields: seed_fields(&any.seeds),
                     reason: None,
+                    terminal_fields: if v_own == Verdict::Confirmed {
+                        seed_fields(&own.seeds)
+                    } else {
+                        Vec::new()
+                    },
                     terminal: Some(v_own),
                     unviewed: any.unviewed,
                 }
@@ -685,6 +703,7 @@ impl<'a, 'e> Back<'a, 'e> {
                 source_fields: Vec::new(),
                 reason: None,
                 terminal: Some(v_own),
+                terminal_fields: Vec::new(),
                 unviewed: any.unviewed,
             },
         }
@@ -825,7 +844,8 @@ impl<'a, 'e> Back<'a, 'e> {
                     }
                 } else {
                     // body-less (PG leaf contract): only its rows are known,
-                    // in its own vocabulary and with no terminal identity
+                    // in its own vocabulary; a row names its terminal, but the
+                    // body that holds that sink is not loaded, so no walk reaches it
                     fo.widened = true;
                     if remapped {
                         // the rows ARE the client-frame view, so they land
@@ -1342,7 +1362,7 @@ mod tests {
     use crate::ifds::Engine;
     use std::collections::HashMap;
 
-    const CAT: &str = "[[sinks]]\nclass = \"sqli\"\nselector = \"db.Exec\"\narg = \"any\"\n";
+    const CAT: &str = "[[sinks]]\nclass = \"sqli\"\nselector = \"db.Exec\"\narg = \"any\"\n[[sinks]]\nclass = \"sqli\"\nselector = \"repo.Exec\"\narg = \"any\"\n";
 
     fn vx(id: u32, kind: cgf::VertexKind, cs: u32, path: &[u32], names: &[&str]) -> cgf::FlowVertex {
         cgf::FlowVertex {
@@ -1367,6 +1387,12 @@ mod tests {
             resultc,
             ..Default::default()
         }
+    }
+    /// a callsite at source line `line` — two same-class sinks sit at
+    /// different lines, which is what makes their route ids differ
+    fn cs(mut s: cgf::CallSite, line: i32) -> cgf::CallSite {
+        s.span = Some(cgf::Span { file: "m.go".into(), line, col: 0 });
+        s
     }
     fn func(iid: u8, source_params: Vec<u32>, flow: cgf::LocalFlow) -> cgf::Function {
         cgf::Function {
@@ -1448,6 +1474,287 @@ mod tests {
         assert!(b.exact, "no over-approximation on the confirming path: {b:?}");
         assert_eq!(b.source_fields, vec!["Amount".to_string()]);
         assert_eq!((st.refuted, st.confirmed), (0, 1));
+    }
+
+    /// Two same-class sinks below ONE call site of the source: the callee puts
+    /// a different request field into each of two `db.Exec` calls. Each sink is
+    /// a distinct terminal, so the report carries TWO chains with distinct
+    /// routes, and `terminal_fields` of each names only its own sink's field.
+    #[test]
+    fn terminal_fields_name_only_the_fields_of_the_route_terminal() {
+        use cgf::VertexKind::*;
+        let s = func(1, vec![0], cgf::LocalFlow {
+            vertices: vec![vx(0, InParam, 0, &[], &[]), vx(1, CallArgPort, 0, &[], &[])],
+            edges: vec![ed(0, 1)],
+            callsites: vec![site(0, Some(2), "pkg.F2", 1, 0)],
+        });
+        // p.Limit reaches the first db.Exec, p.Offset the second
+        let m = func(2, vec![], cgf::LocalFlow {
+            vertices: vec![
+                vx(0, InParam, 0, &[], &[]),
+                vx(1, InParam, 0, &[1], &["Limit"]),
+                vx(2, CallArgPort, 0, &[1], &["Limit"]),
+                vx(3, InParam, 0, &[2], &["Offset"]),
+                vx(4, CallArgPort, 1, &[2], &["Offset"]),
+            ],
+            edges: vec![ed(1, 2), ed(3, 4)],
+            callsites: vec![cs(site(0, None, "db.Exec", 1, 0), 10), cs(site(1, None, "db.Exec", 1, 0), 20)],
+        });
+        let mut prog = Program { funcs: HashMap::new(), repo_of: HashMap::new(), packages: Vec::new() };
+        for f in [s, m] {
+            let h = hexid(&f.id.as_ref().unwrap().iid);
+            prog.repo_of.insert(h.clone(), "test".into());
+            prog.funcs.insert(h, f);
+        }
+        set_opts(BackOpts::default());
+        let cat = Catalog::load_str(CAT).unwrap();
+        let mut eng = Engine::new(&prog, &cat);
+        eng.run();
+        let mut chains = crate::report::intra_chains(&eng, None);
+        assert_eq!(chains.len(), 2, "two terminals below one call site = two chains");
+        // distinct routes: each chain ends at its own sink instance
+        let r0 = chains[0].route.as_ref().unwrap();
+        let r1 = chains[1].route.as_ref().unwrap();
+        assert_ne!(r0.id, r1.id, "each terminal gets its own route");
+        assert_ne!(r0.terminal, r1.terminal, "distinct terminals");
+        let st = crate::report::backward_check(&eng, &mut chains, false);
+        // each chain names only its own terminal's field, and both fields are
+        // covered across the two chains
+        let mut tfs: Vec<Vec<String>> = chains
+            .iter()
+            .map(|c| c.backward.as_ref().unwrap().terminal_fields.clone())
+            .collect();
+        tfs.sort();
+        assert_eq!(
+            tfs,
+            vec![vec!["Limit".to_string()], vec!["Offset".to_string()]],
+            "terminal_fields = its own sink's field, per chain"
+        );
+        for c in &chains {
+            let b = c.backward.as_ref().unwrap();
+            assert_eq!(b.verdict, Verdict::Confirmed, "{b:?}");
+            assert_eq!(b.terminal, Some(Verdict::Confirmed), "{b:?}");
+            // `any` keeps its meaning: the walk that admits any same-class
+            // terminal meets both demands, on every chain
+            assert_eq!(
+                b.source_fields,
+                vec!["Limit".to_string(), "Offset".to_string()],
+                "{b:?}"
+            );
+        }
+        assert_eq!((st.confirmed, st.refuted, st.undecided), (2, 0, 0));
+    }
+
+    /// The same shape with one sink TWO levels below the single call site:
+    /// source -> F2 -> {F3 -> db.Exec (p.Limit), db.Exec (p.Offset)}. Distinct
+    /// terminals survive composition at every level above, so the report keeps
+    /// two chains with distinct routes, each ending at its own sink, and each
+    /// chain's `terminal_fields` names only its own sink's field.
+    #[test]
+    fn two_terminals_below_one_call_site_stay_distinct_two_levels_down() {
+        use cgf::VertexKind::*;
+        let s = func(1, vec![0], cgf::LocalFlow {
+            vertices: vec![vx(0, InParam, 0, &[], &[]), vx(1, CallArgPort, 0, &[], &[])],
+            edges: vec![ed(0, 1)],
+            callsites: vec![site(0, Some(2), "pkg.F2", 1, 0)],
+        });
+        // F2: p.Limit goes to F3 (which sinks it), p.Offset to its own db.Exec
+        let m = func(2, vec![], cgf::LocalFlow {
+            vertices: vec![
+                vx(0, InParam, 0, &[], &[]),
+                vx(1, InParam, 0, &[1], &["Limit"]),
+                vx(2, CallArgPort, 0, &[1], &["Limit"]),
+                vx(3, InParam, 0, &[2], &["Offset"]),
+                vx(4, CallArgPort, 1, &[2], &["Offset"]),
+            ],
+            edges: vec![ed(1, 2), ed(3, 4)],
+            callsites: vec![
+                site(0, Some(3), "pkg.F3", 1, 0),
+                cs(site(1, None, "db.Exec", 1, 0), 20),
+            ],
+        });
+        let d = func(3, vec![], cgf::LocalFlow {
+            vertices: vec![
+                vx(0, InParam, 0, &[1], &["Limit"]),
+                vx(1, CallArgPort, 0, &[1], &["Limit"]),
+            ],
+            edges: vec![ed(0, 1)],
+            callsites: vec![cs(site(0, None, "db.Exec", 1, 0), 30)],
+        });
+        let mut prog = Program { funcs: HashMap::new(), repo_of: HashMap::new(), packages: Vec::new() };
+        for f in [s, m, d] {
+            let h = hexid(&f.id.as_ref().unwrap().iid);
+            prog.repo_of.insert(h.clone(), "test".into());
+            prog.funcs.insert(h, f);
+        }
+        set_opts(BackOpts::default());
+        let cat = Catalog::load_str(CAT).unwrap();
+        let mut eng = Engine::new(&prog, &cat);
+        eng.run();
+        let mut chains = crate::report::intra_chains(&eng, None);
+        assert_eq!(chains.len(), 2, "both terminals reported, two levels down");
+        let terms: Vec<_> = chains
+            .iter()
+            .map(|c| c.route.as_ref().unwrap().terminal.clone().unwrap())
+            .collect();
+        assert_ne!(terms[0], terms[1], "each route ends at its own sink");
+        let leaf2 = hexid(&[2; 32]);
+        let leaf3 = hexid(&[3; 32]);
+        assert!(
+            terms.contains(&(leaf2.clone(), 1)) && terms.contains(&(leaf3, 0)),
+            "terminals are the leaf sinks, not the intermediate call sites: {terms:?}"
+        );
+        let st = crate::report::backward_check(&eng, &mut chains, false);
+        let mut tfs: Vec<Vec<String>> = chains
+            .iter()
+            .map(|c| c.backward.as_ref().unwrap().terminal_fields.clone())
+            .collect();
+        tfs.sort();
+        assert_eq!(tfs, vec![vec!["Limit".to_string()], vec!["Offset".to_string()]]);
+        for c in &chains {
+            let b = c.backward.as_ref().unwrap();
+            assert_eq!(b.verdict, Verdict::Confirmed, "{b:?}");
+            assert_eq!(b.terminal, Some(Verdict::Confirmed), "{b:?}");
+        }
+        assert_eq!((st.confirmed, st.refuted, st.undecided), (2, 0, 0));
+    }
+
+    /// The catalog names an in-repo WRAPPER as a sink and the wrapper's body
+    /// calls the real sink. `propagate` does not stop at the catalog hit: at
+    /// the caller's call site it records the direct row AND the composed row
+    /// from the wrapper's summary. The witness must end the direct route at
+    /// the call site but keep descending for the composed one — ending both
+    /// here gives them the same route id, and dedupe would drop the chain to
+    /// the real sink.
+    #[test]
+    fn a_catalog_named_wrapper_keeps_both_chains_direct_and_through_the_body() {
+        use cgf::VertexKind::*;
+        let s = func(1, vec![0], cgf::LocalFlow {
+            vertices: vec![vx(0, InParam, 0, &[], &[]), vx(1, CallArgPort, 0, &[], &[])],
+            edges: vec![ed(0, 1)],
+            callsites: vec![cs(site(0, Some(2), "repo.Exec", 1, 0), 10)],
+        });
+        let w = func(2, vec![], cgf::LocalFlow {
+            vertices: vec![vx(0, InParam, 0, &[], &[]), vx(1, CallArgPort, 0, &[], &[])],
+            edges: vec![ed(0, 1)],
+            callsites: vec![cs(site(0, None, "db.Exec", 1, 0), 20)],
+        });
+        let mut prog = Program { funcs: HashMap::new(), repo_of: HashMap::new(), packages: Vec::new() };
+        for f in [s, w] {
+            let h = hexid(&f.id.as_ref().unwrap().iid);
+            prog.repo_of.insert(h.clone(), "test".into());
+            prog.funcs.insert(h, f);
+        }
+        set_opts(BackOpts::default());
+        let cat = Catalog::load_str(CAT).unwrap();
+        let mut eng = Engine::new(&prog, &cat);
+        eng.run();
+        let mut chains = crate::report::intra_chains(&eng, None);
+        assert_eq!(
+            chains.len(), 2,
+            "direct row + composed row below one call site = two chains, not one"
+        );
+        let caller = hexid(&[1; 32]);
+        let wrapper = hexid(&[2; 32]);
+        let mut terms: Vec<(String, usize)> = chains
+            .iter()
+            .map(|c| c.route.as_ref().unwrap().terminal.clone().unwrap())
+            .collect();
+        terms.sort();
+        assert_eq!(
+            terms,
+            vec![(caller.clone(), 0), (wrapper.clone(), 0)],
+            "one route ends at the call site, the other at the sink inside the wrapper"
+        );
+        // the deep chain walks into the wrapper and ends at db.Exec there
+        let deep = chains
+            .iter()
+            .find(|c| c.route.as_ref().unwrap().terminal.as_ref().unwrap().0 == wrapper)
+            .unwrap();
+        let hops = &deep.route.as_ref().unwrap().hops;
+        assert_eq!(
+            (hops.len(), hops.last().unwrap().callee.as_str(), hops.last().unwrap().kind),
+            (3, "db.Exec", crate::witness::HopKind::Sink),
+            "{hops:?}"
+        );
+        let st = crate::report::backward_check(&eng, &mut chains, false);
+        assert_eq!((st.confirmed, st.refuted, st.undecided), (2, 0, 0));
+    }
+
+    /// Two same-class rows below one call site whose routes CANNOT be rebuilt:
+    /// the callee has a stored summary but no body, so every descent stops at
+    /// the same partial hops. Incomplete routes carry no terminal, so the two
+    /// chains share a route id — the chain's own terminal must keep them apart
+    /// in `chain_key`, or dedupe merges them and one terminal is lost.
+    #[test]
+    fn incomplete_routes_with_distinct_terminals_do_not_merge() {
+        use cgf::VertexKind::*;
+        let s = func(1, vec![0], cgf::LocalFlow {
+            vertices: vec![vx(0, InParam, 0, &[], &[]), vx(1, CallArgPort, 0, &[], &[])],
+            edges: vec![ed(0, 1)],
+            callsites: vec![cs(site(0, Some(2), "pkg.X", 1, 0), 10)],
+        });
+        let mut prog = Program { funcs: HashMap::new(), repo_of: HashMap::new(), packages: Vec::new() };
+        let h = hexid(&s.id.as_ref().unwrap().iid);
+        prog.repo_of.insert(h.clone(), "test".into());
+        prog.funcs.insert(h, s);
+        set_opts(BackOpts::default());
+        let cat = Catalog::load_str(CAT).unwrap();
+        let mut eng = Engine::new(&prog, &cat);
+        eng.run();
+        // X: a stored summary (cross-repo) with two same-class sink rows, but
+        // no body in this analysis — the witness can compose its rows and
+        // never descend into it.
+        eng.summaries.insert(
+            hexid(&[2; 32]),
+            crate::ifds::Summary {
+                flows: HashSet::new(),
+                sink_hits: vec![
+                    crate::ifds::SinkHit {
+                        in_slot: crate::ifds::Slot::Param(0).into(),
+                        class: "sqli".into(),
+                        callsite: 0,
+                        span: None,
+                        via_heap: None,
+                        terminal: crate::ifds::SinkOrigin {
+                            fn_iid: hexid(&[3; 32]),
+                            callsite: 0,
+                        },
+                    },
+                    crate::ifds::SinkHit {
+                        in_slot: crate::ifds::Slot::Param(0).into(),
+                        class: "sqli".into(),
+                        callsite: 1,
+                        span: None,
+                        via_heap: None,
+                        terminal: crate::ifds::SinkOrigin {
+                            fn_iid: hexid(&[4; 32]),
+                            callsite: 0,
+                        },
+                    },
+                ],
+                confidence: 1.0,
+            },
+        );
+        let chains = crate::report::intra_chains(&eng, None);
+        assert_eq!(chains.len(), 2, "two terminals = two chains even when no route rebuilds");
+        let r0 = chains[0].route.as_ref().unwrap();
+        let r1 = chains[1].route.as_ref().unwrap();
+        assert_eq!(
+            r0.incomplete,
+            Some(crate::witness::Incomplete::HandlerNotLoaded),
+            "both routes stop at the body-less callee"
+        );
+        assert_eq!(r1.incomplete, r0.incomplete);
+        assert_eq!(r0.id, r1.id, "the scenario: identical partial hops, one route id");
+        assert_eq!(
+            r0.terminal, None,
+            "incomplete routes carry no terminal — that is the trap"
+        );
+        assert_ne!(
+            chains[0].sink_terminal, chains[1].sink_terminal,
+            "the chains' own terminals keep them apart"
+        );
     }
 
     /// `S(p) -> M(p)`; `M(p) { r = iface.M(p); L(r) }` where `iface.M` has two

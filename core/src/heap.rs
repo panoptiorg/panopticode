@@ -79,6 +79,11 @@ struct CellSink {
     /// one. Carried through the fixpoint and applied per WRITE SITE in
     /// `propagate` — see `HeapEntry::admits`.
     assert: Option<String>,
+    /// the terminal sink inside the reader this entry stands for — copied from
+    /// the reader's own SinkHit, so two same-class terminals below one call
+    /// site stay distinct across a crossing. Part of the Hash/Eq key: two rows
+    /// identical except for the terminal must both survive the fixpoint sets.
+    terminal: crate::ifds::SinkOrigin,
 }
 
 /// The cell a slot addresses, with the A16 reader constraint stripped off.
@@ -175,6 +180,7 @@ pub fn fixpoint(engine: &mut Engine) -> HeapStats {
                     reader_slot: crate::ifds::slot_str(&sh.in_slot),
                     cell: cell.to_string(),
                     assert: assert.map(str::to_string),
+                    terminal: sh.terminal.clone(),
                 });
             }
         }
@@ -269,6 +275,7 @@ pub fn fixpoint(engine: &mut Engine) -> HeapStats {
             entries.push(HeapEntry {
                 class: cs.class.clone(),
                 assert: cs.assert.clone(),
+                terminal: cs.terminal.clone(),
                 via: HeapVia {
                     // Name the cell the WRITER writes, because that is the cell
                     // the hop's span points at. When the fixpoint composed
@@ -300,13 +307,26 @@ pub fn fixpoint(engine: &mut Engine) -> HeapStats {
         // report lists chains in this order. `assert` is part of the key — two
         // readers of one cell demanding different concrete types are two
         // entries, and only one of them survives at any given write site.
+        // Terminal and reader_slot close the key: `dedup` needs fully-equal
+        // rows adjacent, and two entries of one cell can now differ by the
+        // terminal sink (or the slot the reader consumes) alone.
         entries.sort_by(|a, b| {
-            (&a.class, &a.via.cell, &a.via.reader, &a.assert).cmp(&(
-                &b.class,
-                &b.via.cell,
-                &b.via.reader,
-                &b.assert,
-            ))
+            (
+                &a.class,
+                &a.via.cell,
+                &a.via.reader,
+                crate::ifds::slot_str(&a.via.reader_slot),
+                &a.assert,
+                &a.terminal,
+            )
+                .cmp(&(
+                    &b.class,
+                    &b.via.cell,
+                    &b.via.reader,
+                    crate::ifds::slot_str(&b.via.reader_slot),
+                    &b.assert,
+                    &b.terminal,
+                ))
         });
         entries.dedup();
         stats.spliced += entries.len();
@@ -511,6 +531,7 @@ mod tests {
             callsite: 0,
             span: None,
             via_heap: None,
+            terminal: crate::ifds::SinkOrigin { fn_iid: String::new(), callsite: 0 },
         }
     }
 
@@ -647,6 +668,7 @@ mod tests {
             callsite: 0,
             span: None,
             via_heap: None,
+            terminal: crate::ifds::SinkOrigin { fn_iid: r.clone(), callsite: 0 },
         });
         e.summaries.insert(w, ws);
         e.summaries.insert(r, rs);
@@ -780,6 +802,10 @@ mod tests {
                 reader_slot: Slot::Global("c".into()).into(),
             },
             assert: assert.map(str::to_string),
+            terminal: crate::ifds::SinkOrigin {
+                fn_iid: hexid(&[2u8; 32]),
+                callsite: 0,
+            },
         };
         let bytes = |h: &str| hex::decode(h).expect("hex");
 

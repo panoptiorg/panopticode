@@ -30,7 +30,11 @@ const REL_INVOKES_REMOTE: i16 = 3;
 // slot_parse→None new-style strings and silently drop flows (an FN); the
 // version gate turns that into the loud skip below. Doc 20 §3.3 reserved v3
 // for the transform monoid — that becomes v4 when Part B lands.
-const SUMMARYJ_V: u32 = 3;
+// v4 = sink hits carry the terminal sink identity (leaf fn iid + callsite in
+// the leaf): older binaries reading a v4 blob would reconstruct hits without
+// it, and two same-class sinks below one call site would collapse back into
+// one. The gate makes them skip loudly instead.
+const SUMMARYJ_V: u32 = 4;
 
 #[derive(Serialize, Deserialize)]
 struct SinkHitJ {
@@ -38,6 +42,10 @@ struct SinkHitJ {
     class: String,
     span_file: String,
     span_line: u32,
+    // v4: terminal sink identity. Empty / 0 on a v3 blob, but v3 blobs are
+    // skipped by the version gate before this is read.
+    terminal_fn: String,
+    terminal_callsite: usize,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -64,6 +72,8 @@ fn project(s: &Summary) -> SummaryJ {
                 class: h.class.clone(),
                 span_file: h.span.as_ref().map(|s| s.file.clone()).unwrap_or_default(),
                 span_line: h.span.as_ref().map(|s| s.line as u32).unwrap_or_default(),
+                terminal_fn: h.terminal.fn_iid.clone(),
+                terminal_callsite: h.terminal.callsite,
             })
             .collect(),
         confidence: s.confidence,
@@ -95,6 +105,10 @@ fn unproject(j: &SummaryJ) -> Summary {
             callsite: 0,
             span,
             via_heap: None, // phase-2 only; never persisted
+            terminal: crate::ifds::SinkOrigin {
+                fn_iid: h.terminal_fn.clone(),
+                callsite: h.terminal_callsite,
+            },
         });
     }
     s
@@ -825,7 +839,7 @@ async fn persist_summaries(
             .summary_keys
             .get(iid)
             .copied()
-            .unwrap_or_else(|| ids::summary_key(&bid, &f.source_params, vec![ch]));
+            .unwrap_or_else(|| ids::summary_key(iid, &bid, &f.source_params, vec![ch]));
         let blob = serde_json::to_vec(&project(sum))?;
         let repo = prog.repo_of.get(iid).cloned().unwrap_or_default();
         sqlx::query(
@@ -934,6 +948,10 @@ mod tests {
                 col: 3,
             }),
             via_heap: None,
+            terminal: crate::ifds::SinkOrigin {
+                fn_iid: "aa11".into(),
+                callsite: 3,
+            },
         });
         let blob = serde_json::to_vec(&project(&s)).unwrap();
         let j: SummaryJ = serde_json::from_slice(&blob).unwrap();
@@ -947,6 +965,14 @@ mod tests {
         assert_eq!(h.callsite, 0, "callsite is not persisted");
         assert_eq!(h.span.as_ref().unwrap().file, "store/store.go");
         assert_eq!(h.span.as_ref().unwrap().line, 12);
+        assert_eq!(
+            h.terminal,
+            crate::ifds::SinkOrigin {
+                fn_iid: "aa11".into(),
+                callsite: 3,
+            },
+            "terminal IS persisted"
+        );
     }
 
     /// Coverage wave 1: HTTP routes are not persisted, and a linked HTTP
@@ -1392,12 +1418,16 @@ mod tests {
                     class: "sqli".into(),
                     span_file: String::new(),
                     span_line: 0,
+                    terminal_fn: "aa".into(),
+                    terminal_callsite: 0,
                 },
                 SinkHitJ {
                     slot: "param_0".into(),
                     class: "sqli".into(),
                     span_file: String::new(),
                     span_line: 0,
+                    terminal_fn: "aa".into(),
+                    terminal_callsite: 0,
                 },
             ],
             confidence: 1.0,

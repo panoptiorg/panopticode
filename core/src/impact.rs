@@ -177,7 +177,11 @@ pub fn impact(
     // coverage wave 1 §4.3 — as in `taint`: after normalize, before phase 1
     crate::httplink::link_loaded(&mut prog, true);
 
-    let mut store = SummaryStore::open(Some(store_dir), &cat_hash, 1_000_000)?;
+    // The store namespace must match `taint`'s: env_hash mixes in the blob
+    // format token, so stores written by an older binary (pre-terminal
+    // summaries) are never probed here.
+    let mut store =
+        SummaryStore::open(Some(store_dir), &crate::summarystore::env_hash(&cat_hash, ""), 1_000_000)?;
     let mut eng = Engine::new(&prog, &cat);
     let stats = eng.run_with_store(&mut store);
     // PG leaves for contracts no loaded CGF defines (doc 18 Part C) — explicit
