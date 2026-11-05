@@ -774,7 +774,11 @@ fn summary_dbg(cgf: &[PathBuf], catalog: Option<&std::path::Path>, fnpat: &str) 
                     .map(|h| (
                         format!("{:?}", h.in_slot),
                         h.class.clone(),
-                        h.via_heap.as_ref().map(|v| v.cell.clone()).unwrap_or_default()
+                        h.via_heap.as_ref().map(|v| v.cell.clone()).unwrap_or_default(),
+                        format!(
+                            "{}@{}",
+                            h.terminal.fn_iid, h.terminal.callsite
+                        )
                     ))
                     .collect::<Vec<_>>()
             );

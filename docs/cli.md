@@ -171,7 +171,11 @@ its first and last route hops:
   reported).
 
 With `--backward` each chain also gets `backward`:
-`{"verdict": "confirmed|refuted|undecided", "exact", "source_fields", "terminal", "reason", "unviewed"}`.
+`{"verdict": "confirmed|refuted|undecided", "exact", "source_fields", "terminal", "terminal_fields", "reason", "unviewed"}`.
+`source_fields` names every source field that reaches ANY sink of the class
+below the chain's call site; `terminal_fields` (present only when `terminal`
+is `confirmed`) names the subset that reaches the sink the route ends at —
+show that one on the route, not `source_fields`.
 For `undecided`, `reason` is `walk_incomplete`, `unview_dropped_slot` or
 `unviewed_refutation_not_pruned`; when the walk cannot start it is
 `heap_crossing`, `no_route`, `no_terminal` or `route_incomplete:<kind>` (e.g.

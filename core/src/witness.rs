@@ -145,6 +145,20 @@ pub struct Route {
 
 pub const DEFAULT_MAX_DEPTH: usize = 32;
 
+/// Which sink instance a route must end at. `terminal` is the leaf function's
+/// iid plus the call-site index of the sink call inside that leaf — the same
+/// identity `ifds::SinkHit::terminal` and `PropSink::terminal` carry — so two
+/// same-class sinks below one call site stay distinct all the way down.
+#[derive(Clone, Debug)]
+pub struct SinkTarget {
+    /// Entry-level pin: the (callsite, firing vertex) of the `PropSink` the
+    /// caller saw. Deeper levels pass None and follow `terminal` instead.
+    pub at: Option<(usize, u32)>,
+    /// The terminal sink the chain must end at. Every level's pick filters on
+    /// it; a completed `Route::terminal` equals it by construction.
+    pub terminal: crate::ifds::SinkOrigin,
+}
+
 /// The tail of a caller's field path that the summary row it fired did not
 /// consume (`ifds::residual_after`). Carrying it is what stops a fact from
 /// reading as whole-object after a pass-through frame — doc 25 §3 R1.
@@ -336,16 +350,18 @@ impl<'a, 'e> Walk<'a, 'e> {
 
     /// Reconstruct the route from `seeds` in `fn_iid` to a sink of `class`.
     ///
-    /// `target` pins which sink to chase as `(callsite, firing vertex)` — a
-    /// caller that already propagated (report::intra_chains does) must pass it,
-    /// or a function with two same-class sinks would get the same route twice.
+    /// `target` pins which sink instance to chase — a caller that already
+    /// propagated (report::intra_chains does) must pass it, or a function with
+    /// two same-class sinks would get the same route twice. Every level of the
+    /// descent filters sink candidates on the target TERMINAL, so two same-class
+    /// sinks below one call site (even two levels down) get two distinct routes.
     /// None = pick deterministically, for callers without a PropResult.
     pub fn route(
         &self,
         fn_iid: &IidHex,
         seeds: &[u32],
         class: &str,
-        target: Option<(usize, u32)>,
+        target: Option<SinkTarget>,
     ) -> Route {
         let mut hops = Vec::new();
         let mut visited = HashSet::new();
@@ -400,7 +416,7 @@ impl<'a, 'e> Walk<'a, 'e> {
         fn_iid: &IidHex,
         seeds: &[u32],
         class: &str,
-        target: Option<(usize, u32)>,
+        target: Option<SinkTarget>,
         depth: usize,
         visited: &mut HashSet<(IidHex, String)>,
         out: &mut Vec<RouteHop>,
@@ -446,7 +462,7 @@ impl<'a, 'e> Walk<'a, 'e> {
         fn_iid: &IidHex,
         seeds: &[u32],
         class: &str,
-        target: Option<(usize, u32)>,
+        target: Option<SinkTarget>,
         depth: usize,
         visited: &mut HashSet<(IidHex, String)>,
         out: &mut Vec<RouteHop>,
@@ -462,11 +478,24 @@ impl<'a, 'e> Walk<'a, 'e> {
 
         // Deterministic pick among same-class sinks: HashSet iteration inside
         // propagate makes `sinks` order unstable, so never take sinks[0].
-        let Some(ps) = (match target {
-            Some((cs, last)) => r
-                .sinks
-                .iter()
-                .find(|s| s.class == class && s.callsite == cs && s.last == last),
+        // With a target, only rows whose TERMINAL matches can produce the
+        // chain the caller asked for; the (callsite, last) pin — entry level
+        // only — disambiguates among rows sharing a terminal, else the lowest
+        // (callsite, last) wins. Without a target, the old deterministic pick.
+        let Some(ps) = (match &target {
+            Some(t) => {
+                let matching = || {
+                    r.sinks
+                        .iter()
+                        .filter(|s| s.class == class && s.terminal == t.terminal)
+                };
+                match t.at {
+                    Some((cs, last)) => matching()
+                        .find(|s| s.callsite == cs && s.last == last)
+                        .or_else(|| matching().min_by_key(|s| (s.callsite, s.last))),
+                    None => matching().min_by_key(|s| (s.callsite, s.last)),
+                }
+            }
             None => r
                 .sinks
                 .iter()
@@ -557,7 +586,12 @@ impl<'a, 'e> Walk<'a, 'e> {
                 &via.reader,
                 &rseeds,
                 class,
-                None,
+                // the reader's sink is the terminal the entry carried — keep
+                // following it below the crossing
+                Some(SinkTarget {
+                    at: None,
+                    terminal: ps.terminal.clone(),
+                }),
                 depth + 1,
                 visited,
                 out,
@@ -576,9 +610,22 @@ impl<'a, 'e> Walk<'a, 'e> {
         };
 
         // Is the sink AT this call site (catalog), or inside the callee?
+        //
+        // The call site is the route's end only when the hit's terminal is this
+        // very call. `propagate` does not stop at a catalog sink: it also
+        // composes the callee's summary rows at the same call site, so a wrapper
+        // named by the catalog (its body calls the real sink) produces two
+        // same-class rows here — one ending at this call, one with the terminal
+        // below. Ending both routes here would give them the same route id and
+        // let dedupe drop the deeper chain.
         if let Some(sink) = self.engine.cat.sink_of(&cs.callee_fqn) {
             let vtype = ctx.vtype.get(&ps.last).map_or("", String::as_str);
             if sink.class == class
+                && ps.terminal
+                    == (crate::ifds::SinkOrigin {
+                        fn_iid: fn_iid.clone(),
+                        callsite: ps.callsite,
+                    })
                 && self.engine.cat.sink_fires_on(sink, arg_idx, cs.arg0_is_receiver, vtype)
             {
                 out.push(RouteHop {
@@ -599,8 +646,15 @@ impl<'a, 'e> Walk<'a, 'e> {
         }
 
         // `--unmodeled`: the pseudo-sink sits AT an unmodeled library call —
-        // the same test `propagate` used to record it.
+        // the same test `propagate` used to record it, and the same terminal
+        // guard as the catalog branch: composed rows of the unmodeled class
+        // keep descending to the call that actually fired.
         if class == crate::ifds::UNMODELED_CLASS
+            && ps.terminal
+                == (crate::ifds::SinkOrigin {
+                    fn_iid: fn_iid.clone(),
+                    callsite: ps.callsite,
+                })
             && self.engine.unmodeled_write_at(flow, &ctx, ps.callsite, arg_idx)
         {
             out.push(RouteHop {
@@ -642,18 +696,34 @@ impl<'a, 'e> Walk<'a, 'e> {
         // own call sites always beats one that only gets there through a cell:
         // a route the reviewer can walk in the source is worth more than a
         // crossing, and the crossing is still found when it is the only option.
-        let mut cands: Vec<(bool, IidHex, SlotP)> = Vec::new();
+        let mut cands: Vec<(bool, IidHex, SlotP, crate::ifds::SinkOrigin)> = Vec::new();
         for cid in &cs.callee_iids {
             let h = hexid(cid);
             let Some(sum) = self.engine.summaries.get(&h) else { continue };
             for sh in &sum.sink_hits {
                 if sh.class == class && slot_compat(&sh.in_slot, &callee_slot) {
-                    cands.push((sh.via_heap.is_some(), h.clone(), sh.in_slot.clone()));
+                    cands.push((
+                        sh.via_heap.is_some(),
+                        h.clone(),
+                        sh.in_slot.clone(),
+                        sh.terminal.clone(),
+                    ));
                 }
             }
         }
-        cands.sort_by(|a, b| (a.0, &a.1, slot_str(&a.2)).cmp(&(b.0, &b.1, slot_str(&b.2))));
-        cands.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1 && slot_str(&a.2) == slot_str(&b.2));
+        cands.sort_by(|a, b| {
+            (a.0, &a.1, slot_str(&a.2), &a.3).cmp(&(b.0, &b.1, slot_str(&b.2), &b.3))
+        });
+        cands.dedup_by(|a, b| {
+            a.0 == b.0 && a.1 == b.1 && slot_str(&a.2) == slot_str(&b.2) && a.3 == b.3
+        });
+        // The chain must end at the target terminal: drop candidates whose rows
+        // lead to a different sink below this call site. Two same-class rows
+        // that differ only by terminal both stay (the dedup above keys on the
+        // terminal), and the filter picks the row this chain actually fired.
+        if let Some(t) = &target {
+            cands.retain(|c| c.3 == t.terminal);
+        }
         if cands.is_empty() {
             return Some(Incomplete::NotReproduced);
         }
@@ -675,7 +745,7 @@ impl<'a, 'e> Walk<'a, 'e> {
         let boundary = is_boundary(cs);
         let base = out.len();
         let mut first_fail: Option<(Vec<RouteHop>, Option<Incomplete>)> = None;
-        for (i, (_, callee_iid, callee_in)) in cands
+        for (i, (_, callee_iid, callee_in, cand_term)) in cands
             .into_iter()
             .take(MAX_DISPATCH_CANDIDATES)
             .enumerate()
@@ -753,7 +823,11 @@ impl<'a, 'e> Walk<'a, 'e> {
                         &target_iid,
                         &next_seeds,
                         class,
-                        None,
+                        // follow the matched row's terminal below this frame
+                        Some(SinkTarget {
+                            at: None,
+                            terminal: cand_term.clone(),
+                        }),
                         depth + 1,
                         visited,
                         out,
@@ -789,7 +863,10 @@ impl<'a, 'e> Walk<'a, 'e> {
                         &target_iid,
                         &wide_seeds,
                         class,
-                        None,
+                        Some(SinkTarget {
+                            at: None,
+                            terminal: cand_term.clone(),
+                        }),
                         depth + 1,
                         visited,
                         out,
@@ -1296,6 +1373,7 @@ arg = "any"
                     callsite: 0,
                     span: None,
                     via_heap: None,
+                    terminal: crate::ifds::SinkOrigin { fn_iid: iid(0x22), callsite: 0 },
                 }],
                 confidence: 1.0,
             },

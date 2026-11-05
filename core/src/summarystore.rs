@@ -14,6 +14,13 @@ use std::sync::Arc;
 /// contract_hash = behavior-only hash (flows ∪ sinks), body-independent.
 /// Equal public taint behavior ⇒ equal hash ⇒ callers' summary_keys unchanged
 /// (the early-cutoff that stops invalidation cascades).
+///
+/// The sink's TERMINAL (leaf fn iid + callsite in the leaf) is part of the
+/// hash. It is body-derived, but it is identity the caller's summary row
+/// carries: an edit that only moves a sink call changes the terminal without
+/// changing any flow, and a caller that kept the old hash would reuse its
+/// cached summary with a stale terminal — witness would then fail to reproduce
+/// the route. This weakens the early cutoff for callsite-shifting edits only.
 pub fn contract_hash(s: &Summary) -> ids::Hash {
     let mut items: Vec<String> = s
         .flows
@@ -22,7 +29,15 @@ pub fn contract_hash(s: &Summary) -> ids::Hash {
         .chain(
             s.sink_hits
                 .iter()
-                .map(|h| format!("S:{}:{}", slot_str(&h.in_slot), h.class)),
+                .map(|h| {
+                    format!(
+                        "S:{}:{}:{}:{}",
+                        slot_str(&h.in_slot),
+                        h.class,
+                        h.terminal.fn_iid,
+                        h.terminal.callsite
+                    )
+                }),
         )
         .collect();
     items.sort();
@@ -49,11 +64,26 @@ pub struct SummaryStore {
 /// summaries computed under the other — silently, and it would make trap 1's
 /// 100.000% reuse figure meaningless. `env` is a short stable string per flag
 /// (B1, doc 31 §6).
+///
+/// `STORE_FMT` is the BLOB format version, always mixed in. Bumped when the
+/// StoredSummary projection changes shape so stores warmed by an older binary
+/// miss (and recompute) instead of decoding wrongly. fmt2 = SinkHit carries the
+/// terminal sink identity (SinkOrigin) — pre-fmt2 blobs lack the field, would
+/// fail to deserialize anyway, and their namespace token changed so they are
+/// never probed. The empty-env case no longer falls back to the old layout —
+/// which mixed only the catalog hash, without the blob format — so stores
+/// written before terminals were part of a summary cannot be probed at all.
+pub const STORE_FMT: &str = "fmt2-terminal";
+
 pub fn env_hash(catalog_hash: &ids::Hash, env: &str) -> ids::Hash {
     if env.is_empty() {
-        return *catalog_hash; // pre-B1 layout: catalog only, so old stores stay warm
+        return ids::hash_parts(&[catalog_hash.as_slice(), STORE_FMT.as_bytes()]);
     }
-    ids::hash_parts(&[catalog_hash.as_slice(), env.as_bytes()])
+    ids::hash_parts(&[
+        catalog_hash.as_slice(),
+        env.as_bytes(),
+        STORE_FMT.as_bytes(),
+    ])
 }
 
 impl SummaryStore {
@@ -146,6 +176,11 @@ struct StoredSinkHit {
     class: String,
     callsite: usize,
     span: Option<(String, i32, i32)>, // (file, line, col)
+    // terminal sink identity (leaf fn iid + callsite in the leaf). fmt1 blobs
+    // lack it and fail to deserialize ⇒ cache miss ⇒ recompute — never a
+    // summary with a stale terminal.
+    terminal_fn: String,
+    terminal_callsite: usize,
 }
 
 impl StoredSummary {
@@ -162,6 +197,8 @@ impl StoredSummary {
                     class: h.class.clone(),
                     callsite: h.callsite,
                     span: h.span.as_ref().map(|sp| (sp.file.clone(), sp.line, sp.col)),
+                    terminal_fn: h.terminal.fn_iid.clone(),
+                    terminal_callsite: h.terminal.callsite,
                 })
                 .collect(),
             confidence: s.confidence,
@@ -189,6 +226,10 @@ impl StoredSummary {
                     // heap-mediated hits are phase-2 and never written to the
                     // store, so a decoded one is always a phase-1 hit.
                     via_heap: None,
+                    terminal: crate::ifds::SinkOrigin {
+                        fn_iid: h.terminal_fn,
+                        callsite: h.terminal_callsite,
+                    },
                 })
                 .collect(),
             confidence: self.confidence,
@@ -222,6 +263,10 @@ mod tests {
                     col: 7,
                 }),
                 via_heap: None,
+                terminal: crate::ifds::SinkOrigin {
+                    fn_iid: "aaaa".into(),
+                    callsite: 7,
+                },
             }],
             confidence: 1.0,
         }
@@ -229,6 +274,10 @@ mod tests {
 
     // SPEC §8.3: contract_hash is behavior-only — two summaries with the same
     // public taint behavior MUST hash identically (drives early-cutoff).
+    // Exception: the sink's TERMINAL is included. It is body-derived, but a
+    // caller's summary row carries it, so an edit that only moves a sink call
+    // must invalidate callers' cached rows (a stale terminal would make
+    // witness reproduce the wrong route).
     #[test]
     fn contract_hash_is_behavior_only_and_stable() {
         let mk = sample;
@@ -240,6 +289,12 @@ mod tests {
         let mut c = mk();
         c.sink_hits[0].class = "log".into();
         assert_ne!(contract_hash(&mk()), contract_hash(&c));
+        let mut d = mk();
+        d.sink_hits[0].terminal = crate::ifds::SinkOrigin {
+            fn_iid: "bbbb".into(),
+            callsite: 7,
+        };
+        assert_ne!(contract_hash(&mk()), contract_hash(&d), "moved sink call");
     }
 
     #[test]
