@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.3](https://github.com/panoptiorg/panopticode/compare/v0.4.2...v0.4.3) (2026-11-05)
+
+
+### Bug Fixes
+
+* keep same-class sinks below one call site distinct ([#14](https://github.com/panoptiorg/panopticode/issues/14)) ([a226397](https://github.com/panoptiorg/panopticode/commit/a226397f11867a892da81ebd823cecf6bf8af6b3))
+
 ## [0.4.2](https://github.com/panoptiorg/panopticode/compare/v0.4.1...v0.4.2) (2026-10-24)
 
 
