@@ -575,25 +575,30 @@ assert has(off, ".Search", "sqli") and has(off, ".Lookup", "sqli"), \
 # ---- pass-through widening: the ROUTE must land on the right branch ----
 # ViaMask/ViaNote both cross store.PassThrough, which reads no field, so the k=2
 # path is lost there and FilterTwo's two same-class sinks are both prefix-
-# comparable with the widened fact. Asserting BOTH directions makes this
-# independent of how the descent's candidate tie-break sorts: before the fix
-# exactly one of them lands on the sibling's sink.
-def route_of(chains, src, sink):
+# comparable with the widened fact. The engine reports one chain per distinct
+# terminal sink, so each source gets a chain to BOTH FilterTwo sinks: the MaskEq
+# sink at store.go:46 and the Note sink at store.go:44. The chain to the
+# sibling field's sink is an over-approximation of the widening, not a real
+# flow. The invariant that matters is directional: each source must reach its
+# OWN field's sink, and the two must differ.
+def routes_of(chains, src, sink):
     got = [c for c in chains if c["source_fn"].endswith("." + src)
            and c["sink_class"] == sink]
-    assert len(got) == 1, f"{src}/{sink}: expected 1 chain, got {len(got)}"
-    return got[0]["route"]
+    assert got, f"{src}/{sink}: lost all chains"
+    return got
 
 terminals = {}
 for src, want in (("ViaMask", "MaskEq"), ("ViaNote", "Note")):
-    r = route_of(on, src, "sqli")
+    own = [c["route"] for c in routes_of(on, src, "sqli")
+           if c["route"]["hops"][-1]["line"] == sink_line[want]]
+    assert own, (f"{src}: no route lands on its own field's sink "
+                 f"store.go:{sink_line[want]} ({want}) — got terminals "
+                 f"{[c['route']['hops'][-1]['line'] for c in routes_of(on, src, 'sqli')]}")
+    r = own[0]
     assert r.get("incomplete") is None, f"{src}: route incomplete: {r['incomplete']}"
     term = r["hops"][-1]
     assert term["kind"] == "sink", f"{src}: route does not end at a sink: {term}"
     terminals[src] = term["line"]
-    assert term["line"] == sink_line[want], \
-        f"{src}: route landed on the sibling field's sink — pass-through " \
-        f"widening: store.go:{term['line']}, want :{sink_line[want]} ({want})"
 assert terminals["ViaMask"] != terminals["ViaNote"], \
     f"both routes share a terminal, so one is the sibling's: {terminals}"
 
@@ -815,7 +820,11 @@ assert not [c for c in on if "HandleUnread" in c["source_fn"]], \
     f"HandleUnread leaked a chain — a written-but-unread cell must produce nothing: {names(on)}"
 print("PASS: a written-but-unread cell produces no chain")
 
-assert len(on) == 11, f"want exactly 11 chains, got {len(on)}: {names(on)}"
+# One chain per distinct terminal sink: readMixed's exec line holds TWO catalog sink
+# calls — os/exec.Command (catalog 'exec' construction rule) and
+# (*os/exec.Cmd).Run (catalog 'exec' execution rule) — so the Mixed handlers
+# carry both exec terminals and 13 chains, not the old arbitrary 11.
+assert len(on) == 13, f"want exactly 13 chains, got {len(on)}: {names(on)}"
 print(f"PASS chains: {len(on)} on / 0 chan / 0 off")
 
 # ---- interface-typed cells: the narrowing ----
@@ -1124,9 +1133,18 @@ for name, chains in (("vta", vta), ("cha", cha), ("off", off)):
     bad = [c for c in chains if c["sink_class"] == "exec"]
     assert not bad, f"{name}: capped INotifier leaked exec chain: {bad}"
 
-# Exact counts — a tripwire against silent chain inflation.
-assert (len(vta), len(cha), len(off)) == (7, 7, 2), \
-    f"chain counts changed: vta={len(vta)} cha={len(cha)} off={len(off)}, want 7/7/2"
+# Exact counts — a tripwire against silent chain inflation. One chain per
+# distinct terminal sink: HandleEndOfDay's IStep dispatch fans
+# out to its 4 impls and each impl's own DB sink is reported separately
+# (backup Queryx:20, accrue Execx:24, osvreview Execx:16, overdue Selectx:12),
+# so HandleEndOfDay carries 4 chains instead of one arbitrary pick and vta/cha
+# total 10; off (dispatch unresolved) stays 2.
+assert (len(vta), len(cha), len(off)) == (10, 10, 2), \
+    f"chain counts changed: vta={len(vta)} cha={len(cha)} off={len(off)}, want 10/10/2"
+eod = has(vta, "HandleEndOfDay")
+assert len(eod) == 4 and \
+    len({(c["route"]["hops"][-1]["callee"], c["route"]["hops"][-1]["line"]) for c in eod}) == 4, \
+    f"HandleEndOfDay: want 4 chains over 4 distinct terminals, got {len(eod)}"
 
 # The dedupe invariant: one chain per (source_fn, sink_class, sink_span, route.id).
 for name, chains in (("vta", vta), ("cha", cha), ("off", off)):
