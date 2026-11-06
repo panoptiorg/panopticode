@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.0](https://github.com/panoptiorg/panopticode/compare/v0.4.3...v0.5.0) (2026-11-06)
+
+
+### Features
+
+* run summaries and chains in parallel with deterministic output ([#16](https://github.com/panoptiorg/panopticode/issues/16)) ([6db24a3](https://github.com/panoptiorg/panopticode/commit/6db24a3b01267da5c5cd34d6e8e4d4e85f3323c8))
+
 ## [0.4.3](https://github.com/panoptiorg/panopticode/compare/v0.4.2...v0.4.3) (2026-11-05)
 
 
