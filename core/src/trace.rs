@@ -47,18 +47,20 @@
 //
 // Not the same FILE, though: trace line order is per-process nondeterministic
 // (the engine walks a HashMap; the chains JSON is sorted before printing, which
-// is why findings are stable and this never showed up). Measured on wc-off: two
+// is why findings are stable and this never showed up). The summaries phase
+// runs on the rayon pool, so lines from concurrent SCCs interleave at the
+// Mutex — strictly more interleaving of the same kind. Measured on wc-off: two
 // runs of the same binary agree on the multiset and on every chain→widen
 // attribution pair, and disagree on the order of whole functions. So attribution
 // must always be computed WITHIN one trace file — never by diffing two.
-use std::cell::RefCell;
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
+use std::sync::Mutex;
 
 pub struct Trace {
-    out: RefCell<BufWriter<File>>,
+    out: Mutex<BufWriter<File>>,
     filter: Option<String>,
     kinds: Option<HashSet<String>>,
 }
@@ -82,7 +84,7 @@ impl Trace {
             }
         }
         Ok(Trace {
-            out: RefCell::new(BufWriter::new(File::create(path)?)),
+            out: Mutex::new(BufWriter::new(File::create(path)?)),
             filter,
             kinds,
         })
@@ -105,14 +107,16 @@ impl Trace {
     }
 
     pub fn log(&self, args: std::fmt::Arguments) {
-        let mut o = self.out.borrow_mut();
+        // Line-interlocked: a line is never torn by a concurrent worker. Line
+        // ORDER across workers is nondeterministic — see the module header.
+        let mut o = self.out.lock().unwrap();
         let _ = o.write_fmt(args);
         let _ = o.write_all(b"\n");
     }
 
     /// Flush at phase boundaries so a killed run still leaves a usable prefix.
     pub fn flush(&self) {
-        let _ = self.out.borrow_mut().flush();
+        let _ = self.out.lock().unwrap().flush();
     }
 }
 

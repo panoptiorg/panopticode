@@ -619,8 +619,8 @@ mod tests {
         assert_eq!(a.summary_keys, b.summary_keys);
         assert_eq!(a.contract_hashes, b.contract_hashes);
         assert_eq!(a.summaries.len(), b.summaries.len());
-        for (iid, sa) in &a.summaries {
-            let sb = &b.summaries[iid];
+        for (iid, sa) in a.summaries.iter() {
+            let sb = &b.summaries.get(&iid).unwrap();
             assert_eq!(sa.flows, sb.flows);
             assert_eq!(format!("{:?}", sa.sink_hits), format!("{:?}", sb.sink_hits));
         }

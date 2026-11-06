@@ -1,0 +1,19 @@
+# Contract snapshot shared with the federation fixture (the role .proto plays
+# for gRPC). Codegen writes this file in a real repo; here it is checked in.
+type Query {
+  searchByToken(token: String!): String!
+}
+
+type Account {
+  accountNumber: String!
+  details: AccountDetails
+  archive: ArchiveResult
+}
+
+type AccountDetails {
+  account: String!
+}
+
+type ArchiveResult {
+  ok: Boolean!
+}

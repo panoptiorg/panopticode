@@ -140,7 +140,7 @@ pub fn fixpoint(engine: &mut Engine) -> HeapStats {
     // accumulator apart from a pipe (debt A14).
     let mut readers: HashMap<String, HashSet<IidHex>> = HashMap::new();
 
-    for (iid, sum) in &engine.summaries {
+    for (iid, sum) in engine.summaries.iter() {
         for (isl, osl) in &sum.flows {
             if let Some((from, _)) = global_of(isl) {
                 readers.entry(from.to_string()).or_default().insert(iid.clone());
@@ -504,6 +504,7 @@ mod tests {
     use crate::graph::{hexid, Program};
     use crate::ifds::Summary;
     use std::collections::HashMap as Map;
+    use std::sync::Arc;
 
     fn cell(n: u8) -> String {
         hex::encode([n; 4])
@@ -551,8 +552,8 @@ mod tests {
         ));
         let mut rs = Summary::default();
         rs.sink_hits.push(sink(&c, "sqli"));
-        e.summaries.insert(w, ws);
-        e.summaries.insert(r.clone(), rs);
+        e.summaries.insert(w, Arc::new(ws));
+        e.summaries.insert(r.clone(), Arc::new(rs));
 
         let st = fixpoint(&mut e);
         assert_eq!(st.cells, 1, "one written cell");
@@ -594,7 +595,9 @@ mod tests {
             let tr = crate::trace::Trace::open(&p, None, kinds).expect("trace");
             let mut e = Engine::new(&prog, &cat);
             e.trace = Some(&tr);
-            e.summaries = summaries.clone();
+            for (k, v) in &summaries {
+                e.summaries.insert(k.clone(), Arc::new(v.clone()));
+            }
             fixpoint(&mut e);
             drop(tr);
             let got = std::fs::read_to_string(&p).unwrap_or_default();
@@ -630,9 +633,9 @@ mod tests {
             .insert((Slot::Global(c1.clone()).into(), Slot::Global(c2.clone()).into()));
         let mut rs = Summary::default();
         rs.sink_hits.push(sink(&c2, "log"));
-        e.summaries.insert(w, ws);
-        e.summaries.insert(mid, ms);
-        e.summaries.insert(r, rs);
+        e.summaries.insert(w, Arc::new(ws));
+        e.summaries.insert(mid, Arc::new(ms));
+        e.summaries.insert(r, Arc::new(rs));
 
         let st = fixpoint(&mut e);
         assert!(st.iters >= 2, "a 2-hop chain needs a real fixpoint, not one pass");
@@ -670,8 +673,8 @@ mod tests {
             via_heap: None,
             terminal: crate::ifds::SinkOrigin { fn_iid: r.clone(), callsite: 0 },
         });
-        e.summaries.insert(w, ws);
-        e.summaries.insert(r, rs);
+        e.summaries.insert(w, Arc::new(ws));
+        e.summaries.insert(r, Arc::new(rs));
 
         let st = fixpoint(&mut e);
         assert_eq!(st.spliced, 0, "[0] written, [1] read — different fields");
@@ -704,8 +707,8 @@ mod tests {
             .insert((Slot::Param(0).into(), Slot::Global(c.clone()).into()));
         let mut rs = Summary::default();
         rs.sink_hits.push(sink(&tagged(&c, "domain.SBPParam"), "sqli"));
-        e.summaries.insert(w, ws);
-        e.summaries.insert(r, rs);
+        e.summaries.insert(w, Arc::new(ws));
+        e.summaries.insert(r, Arc::new(rs));
 
         fixpoint(&mut e);
         let entries = e
@@ -732,12 +735,12 @@ mod tests {
         let mut ws = Summary::default();
         ws.flows
             .insert((Slot::Param(0).into(), Slot::Global(c.clone()).into()));
-        e.summaries.insert(hexid(&[1u8; 32]), ws);
+        e.summaries.insert(hexid(&[1u8; 32]), Arc::new(ws));
 
         let mut rs = Summary::default();
         rs.sink_hits.push(sink(&tagged(&c, "domain.SBPParam"), "sqli"));
         rs.sink_hits.push(sink(&c, "log"));
-        e.summaries.insert(hexid(&[2u8; 32]), rs);
+        e.summaries.insert(hexid(&[2u8; 32]), Arc::new(rs));
 
         fixpoint(&mut e);
         let entries = e.heap_cells.get(&c).expect("cell carries both sinks");
@@ -770,9 +773,9 @@ mod tests {
             .insert((Slot::Global(c1.clone()).into(), Slot::Global(c2.clone()).into()));
         let mut rs = Summary::default();
         rs.sink_hits.push(sink(&tagged(&c2, "domain.SBPParam"), "sqli"));
-        e.summaries.insert(hexid(&[1u8; 32]), ws);
-        e.summaries.insert(hexid(&[2u8; 32]), ms);
-        e.summaries.insert(hexid(&[3u8; 32]), rs);
+        e.summaries.insert(hexid(&[1u8; 32]), Arc::new(ws));
+        e.summaries.insert(hexid(&[2u8; 32]), Arc::new(ms));
+        e.summaries.insert(hexid(&[3u8; 32]), Arc::new(rs));
 
         fixpoint(&mut e);
         assert_eq!(
@@ -829,7 +832,7 @@ mod tests {
         let mut s = Summary::default();
         s.flows
             .insert((Slot::Param(0).into(), Slot::Return(0).into()));
-        e.summaries.insert(hexid(&[9u8; 32]), s);
+        e.summaries.insert(hexid(&[9u8; 32]), Arc::new(s));
         let st = fixpoint(&mut e);
         assert_eq!(st.cells, 0);
         assert_eq!(st.spliced, 0);
@@ -929,7 +932,7 @@ mod topic_cell_tests {
         let hs = super::fixpoint(&mut eng);
         assert_eq!(hs.cells, 1, "one written cell: {hs:?}");
         crate::compose::fixpoint_with_leaves(&mut eng, HashMap::new());
-        crate::report::intra_chains(&eng, None)
+        crate::report::intra_chains(&eng, None, false)
     }
 
     #[test]

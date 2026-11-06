@@ -9,6 +9,7 @@ use anyhow::{Context, Result};
 use moka::sync::Cache;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// contract_hash = behavior-only hash (flows ∪ sinks), body-independent.
@@ -54,8 +55,10 @@ pub struct SummaryStore {
     /// catalog-namespaced FS dir; None = in-process only (plain `taint` runs, tests)
     dir: Option<PathBuf>,
     lru: Cache<ids::Hash, Arc<Cached>>,
-    pub hits: u64,
-    pub misses: u64,
+    /// Atomic because the parallel tabulation shares one `&SummaryStore` across
+    /// the rayon pool (the phase reads them back into RunStats at the end).
+    pub hits: AtomicU64,
+    pub misses: AtomicU64,
 }
 
 /// Namespace for the on-disk store: the catalog is an input to `summarize()`
@@ -101,8 +104,8 @@ impl SummaryStore {
         Ok(SummaryStore {
             dir,
             lru: Cache::new(capacity),
-            hits: 0,
-            misses: 0,
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
         })
     }
 
@@ -111,14 +114,18 @@ impl SummaryStore {
         SummaryStore {
             dir: None,
             lru: Cache::new(100_000),
-            hits: 0,
-            misses: 0,
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
         }
     }
 
-    pub fn get(&mut self, key: &ids::Hash) -> Option<Arc<Cached>> {
+    /// `&self`: concurrent workers call this. The moka LRU is already
+    /// concurrent; the FS read is per-key and read-only. Concurrent `put`s of
+    /// the same key cannot happen inside one run (a fn is tabulated once), and
+    /// a blob's bytes are content-derived, so no write-write race exists.
+    pub fn get(&self, key: &ids::Hash) -> Option<Arc<Cached>> {
         if let Some(c) = self.lru.get(key) {
-            self.hits += 1;
+            self.hits.fetch_add(1, Ordering::Relaxed);
             return Some(c);
         }
         if let Some(dir) = &self.dir {
@@ -127,16 +134,16 @@ impl SummaryStore {
                 if let Ok(stored) = serde_json::from_slice::<StoredSummary>(&bytes) {
                     let c = Arc::new(stored.into_cached());
                     self.lru.insert(*key, c.clone());
-                    self.hits += 1;
+                    self.hits.fetch_add(1, Ordering::Relaxed);
                     return Some(c);
                 }
             }
         }
-        self.misses += 1;
+        self.misses.fetch_add(1, Ordering::Relaxed);
         None
     }
 
-    pub fn put(&mut self, key: ids::Hash, sum: &Summary, ch: ids::Hash) -> Result<()> {
+    pub fn put(&self, key: ids::Hash, sum: &Summary, ch: ids::Hash) -> Result<()> {
         let cached = Arc::new(Cached {
             summary: sum.clone(),
             contract_hash: ch,
@@ -149,6 +156,17 @@ impl SummaryStore {
             std::fs::write(&path, blob).with_context(|| format!("write {path:?}"))?;
         }
         Ok(())
+    }
+
+    /// Free the in-memory LRU now, not at drop time: the store is the second
+    /// copy of many summaries, and after the summaries phase nothing reads it
+    /// (the only callers — cli.rs `taint` and impact.rs — scope it to the
+    /// phase; FS blobs are already durable, hits/misses live in RunStats).
+    /// moka evicts lazily through a background housekeeper, so force the
+    /// pending invalidations before returning or RSS would not fall.
+    pub fn free_lru(&mut self) {
+        self.lru.invalidate_all();
+        self.lru.run_pending_tasks();
     }
 }
 
@@ -187,20 +205,34 @@ impl StoredSummary {
     fn from_summary(s: &Summary, ch: &ids::Hash) -> StoredSummary {
         let mut flows: Vec<(SlotP, SlotP)> = s.flows.iter().cloned().collect();
         flows.sort_by_key(|(a, b)| (slot_str(a), slot_str(b))); // deterministic blobs
+        // sink_hits too: a warm store must serve byte-identical blobs for
+        // byte-identical summaries. The Vec's order is deterministic now
+        // (propagate applies callee flows in sorted order), but sorting here
+        // makes blob bytes independent of that order entirely.
+        let mut sink_hits: Vec<StoredSinkHit> = s
+            .sink_hits
+            .iter()
+            .map(|h| StoredSinkHit {
+                in_slot: h.in_slot.clone(),
+                class: h.class.clone(),
+                callsite: h.callsite,
+                span: h.span.as_ref().map(|sp| (sp.file.clone(), sp.line, sp.col)),
+                terminal_fn: h.terminal.fn_iid.clone(),
+                terminal_callsite: h.terminal.callsite,
+            })
+            .collect();
+        sink_hits.sort_by(|a, b| {
+            slot_str(&a.in_slot)
+                .cmp(&slot_str(&b.in_slot))
+                .then(a.class.cmp(&b.class))
+                .then(a.callsite.cmp(&b.callsite))
+                .then(a.span.cmp(&b.span))
+                .then(a.terminal_fn.cmp(&b.terminal_fn))
+                .then(a.terminal_callsite.cmp(&b.terminal_callsite))
+        });
         StoredSummary {
             flows,
-            sink_hits: s
-                .sink_hits
-                .iter()
-                .map(|h| StoredSinkHit {
-                    in_slot: h.in_slot.clone(),
-                    class: h.class.clone(),
-                    callsite: h.callsite,
-                    span: h.span.as_ref().map(|sp| (sp.file.clone(), sp.line, sp.col)),
-                    terminal_fn: h.terminal.fn_iid.clone(),
-                    terminal_callsite: h.terminal.callsite,
-                })
-                .collect(),
+            sink_hits,
             confidence: s.confidence,
             contract_hash: ids::hex(ch),
         }
@@ -306,13 +338,13 @@ mod tests {
         let s = sample();
         let ch = contract_hash(&s);
         {
-            let mut w = SummaryStore::open(Some(&tmp), &cat, 16).unwrap();
+            let w = SummaryStore::open(Some(&tmp), &cat, 16).unwrap();
             w.put(key, &s, ch).unwrap();
         }
         // fresh store instance = empty LRU, must fall back to FS
-        let mut r = SummaryStore::open(Some(&tmp), &cat, 16).unwrap();
+        let r = SummaryStore::open(Some(&tmp), &cat, 16).unwrap();
         let c = r.get(&key).expect("fs hit");
-        assert_eq!(r.hits, 1);
+        assert_eq!(r.hits.load(Ordering::Relaxed), 1);
         assert_eq!(c.contract_hash, ch);
         assert_eq!(c.summary.flows, s.flows);
         assert_eq!(c.summary.sink_hits.len(), 1);
@@ -330,11 +362,11 @@ mod tests {
         let key: ids::Hash = [9u8; 32];
         let s = sample();
         let ch = contract_hash(&s);
-        let mut a = SummaryStore::open(Some(&tmp), &[1u8; 32], 16).unwrap();
+        let a = SummaryStore::open(Some(&tmp), &[1u8; 32], 16).unwrap();
         a.put(key, &s, ch).unwrap();
-        let mut b = SummaryStore::open(Some(&tmp), &[2u8; 32], 16).unwrap();
+        let b = SummaryStore::open(Some(&tmp), &[2u8; 32], 16).unwrap();
         assert!(b.get(&key).is_none(), "other catalog namespace must miss");
-        assert_eq!(b.misses, 1);
+        assert_eq!(b.misses.load(Ordering::Relaxed), 1);
         std::fs::remove_dir_all(&tmp).unwrap();
     }
 }

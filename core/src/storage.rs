@@ -3,6 +3,9 @@
 // reverse index, and content-addressed summary blobs (doc 06 §8.1). Everything
 // runs in one transaction; edges/invokes have no unique key, so they are
 // refreshed per analyzed repo (delete + bulk insert) to stay idempotent.
+// Bulk writes go through COPY FROM STDIN; tables that need upsert semantics
+// stage into a temp table and merge with INSERT ... SELECT ... ON CONFLICT
+// (see the plumbing block below `PersistStats`).
 use crate::graph::{hexid, IidHex, Program};
 use crate::ids;
 use crate::ifds::{slot_parse, slot_str, Engine, SinkHit, Summary};
@@ -11,7 +14,7 @@ use crate::summarystore::contract_hash;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use sqlx::postgres::PgPoolOptions;
+use sqlx::postgres::{PgConnection, PgCopyIn, PgPoolOptions};
 use sqlx::{Postgres, Transaction};
 use std::collections::{HashMap, HashSet};
 
@@ -200,7 +203,6 @@ async fn persist_async(prog: &Program, eng: &Engine<'_>, pg_url: &str) -> Result
                     kind: KIND_CONTRACT,
                     iid: c.iid.to_vec(),
                     bid: Vec::new(),
-                    fqn: c.full_name.to_string(),
                     generated: true,
                     origin: 0,
                     span_file: String::new(),
@@ -213,9 +215,8 @@ async fn persist_async(prog: &Program, eng: &Engine<'_>, pg_url: &str) -> Result
     // registry (populated by an earlier analysis of the defining repo)
     let foreign_repo_ids = resolve_foreign_contracts(&mut tx, prog, &mut rows).await?;
 
-    let node_rows: Vec<NodeRow> = rows.into_values().collect();
-    let nodes = node_rows.len();
-    upsert_nodes(&mut tx, &node_rows).await?;
+    let nodes = rows.len();
+    upsert_nodes(&mut tx, rows).await?;
 
     // iid -> node_id maps over every repo we touched
     let mut all_rids: Vec<i32> = repo_ids.values().copied().collect();
@@ -246,6 +247,129 @@ async fn persist_async(prog: &Program, eng: &Engine<'_>, pg_url: &str) -> Result
     })
 }
 
+// --- COPY FROM STDIN plumbing ------------------------------------------------
+//
+// `COPY ... FROM STDIN` needs one field per column in COPY text format:
+// backslash escapes for \, \n, \r, \t inside text, `\N` for NULL. Staging
+// tables keep bytea-ish columns as hex TEXT and decode with `decode(x,'hex')`
+// in the merge, so only `invokes.iid`/`endpoints.iid` (direct COPY) need the
+// bytea escape format.
+
+/// One `COPY FROM STDIN` in flight: rows are appended to a rolling buffer and
+/// flushed to the wire every COPY_CHUNK bytes, so a table's row set is never
+/// held in memory twice next to the engine data it comes from.
+const COPY_CHUNK: usize = 1 << 20;
+
+struct CopyIn<'a> {
+    sink: PgCopyIn<&'a mut PgConnection>,
+    buf: Vec<u8>,
+}
+
+impl<'a> CopyIn<'a> {
+    async fn begin(conn: &'a mut PgConnection, stmt: &str) -> Result<Self> {
+        Ok(Self {
+            sink: conn.copy_in_raw(stmt).await?,
+            buf: Vec::with_capacity(COPY_CHUNK),
+        })
+    }
+
+    /// Field writers append the columns of one row here, tab-separated.
+    fn row(&mut self) -> &mut Vec<u8> {
+        &mut self.buf
+    }
+
+    /// Terminate the row written into `row()`; flush when the buffer is full.
+    async fn end_row(&mut self) -> Result<()> {
+        self.buf.push(b'\n');
+        if self.buf.len() >= COPY_CHUNK {
+            self.flush().await?;
+        }
+        Ok(())
+    }
+
+    async fn flush(&mut self) -> Result<()> {
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        let buf = std::mem::take(&mut self.buf);
+        self.sink.send(&buf[..]).await?;
+        self.buf = buf;
+        self.buf.clear();
+        Ok(())
+    }
+
+    /// Flush the tail and end the COPY. On error the PgCopyIn Drop sends
+    /// CopyFail, so the connection is reusable inside the same transaction.
+    async fn finish(mut self) -> Result<()> {
+        self.flush().await?;
+        self.sink.finish().await?;
+        Ok(())
+    }
+}
+
+fn put_int(b: &mut Vec<u8>, v: i64) {
+    let mut buf = [0u8; 20];
+    let mut i = buf.len();
+    let neg = v < 0;
+    let mut u = (if neg { v.unsigned_abs() } else { v as u64 }) as u128;
+    loop {
+        i -= 1;
+        buf[i] = b'0' + (u % 10) as u8;
+        u /= 10;
+        if u == 0 {
+            break;
+        }
+    }
+    if neg {
+        i -= 1;
+        buf[i] = b'-';
+    }
+    b.extend_from_slice(&buf[i..]);
+}
+
+fn put_bool(b: &mut Vec<u8>, v: bool) {
+    b.push(if v { b't' } else { b'f' });
+}
+
+/// COPY text format: escape the four sequences Postgres treats specially.
+fn put_text(b: &mut Vec<u8>, s: &str) {
+    for c in s.bytes() {
+        match c {
+            b'\\' => b.extend_from_slice(b"\\\\"),
+            b'\n' => b.extend_from_slice(b"\\n"),
+            b'\r' => b.extend_from_slice(b"\\r"),
+            b'\t' => b.extend_from_slice(b"\\t"),
+            _ => b.push(c),
+        }
+    }
+}
+
+/// NULL for nullable columns (endpoints' optional handler span).
+fn put_opt_text(b: &mut Vec<u8>, s: Option<&str>) {
+    match s {
+        Some(s) => put_text(b, s),
+        None => b.extend_from_slice(b"\\N"),
+    }
+}
+
+/// bytea in COPY text format: printable ASCII except backslash goes literal,
+/// backslash is doubled, every other byte is a 3-digit octal escape.
+fn put_bytea(b: &mut Vec<u8>, v: &[u8]) {
+    for &c in v {
+        match c {
+            b'\\' => b.extend_from_slice(b"\\\\"),
+            0x20..=0x7e => b.push(c),
+            _ => {
+                b.push(b'\\');
+                let o = c as u32;
+                b.push(b'0' + ((o >> 6) & 7) as u8);
+                b.push(b'0' + ((o >> 3) & 7) as u8);
+                b.push(b'0' + (o & 7) as u8);
+            }
+        }
+    }
+}
+
 async fn upsert_repos(
     tx: &mut Transaction<'_, Postgres>,
     prog: &Program,
@@ -269,26 +393,53 @@ async fn upsert_repos(
     Ok(repo_id)
 }
 
+/// The contract registry (was one INSERT round trip per contract): staged
+/// with COPY, merged with one INSERT ... ON CONFLICT (iid) DO NOTHING. The
+/// old per-row loop was first-writer-wins in enumeration order; duplicates
+/// inside a DO NOTHING merge resolve the same way (scan order = staging order
+/// = enumeration order).
 async fn upsert_contracts(tx: &mut Transaction<'_, Postgres>, prog: &Program) -> Result<()> {
+    sqlx::query(
+        "CREATE TEMP TABLE stage_contracts(
+           iid TEXT, kind INT2, full_name TEXT, repo TEXT,
+           input_msg TEXT, output_msg TEXT) ON COMMIT DROP",
+    )
+    .execute(&mut **tx)
+    .await?;
+    let mut cp = CopyIn::begin(
+        &mut **tx,
+        "COPY stage_contracts(iid, kind, full_name, repo, input_msg, output_msg) FROM STDIN",
+    )
+    .await?;
     for p in &prog.packages {
         // gRPC methods (kind 0) and GraphQL fields (kind 1, doc 36 §3.3) —
         // `kind` is what distinguishes them; a field's full_name is its
         // SDL type_field and it has no input/output message.
         for c in persisted_contracts(p) {
-            sqlx::query(
-                "INSERT INTO contracts(iid, kind, full_name, repo, input_msg, output_msg)
-                 VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT (iid) DO NOTHING",
-            )
-            .bind(c.iid)
-            .bind(c.kind)
-            .bind(c.full_name.as_ref())
-            .bind(&p.repo)
-            .bind(c.input_msg)
-            .bind(c.output_msg)
-            .execute(&mut **tx)
-            .await?;
+            let b = cp.row();
+            put_text(b, &hexid(c.iid));
+            b.push(b'\t');
+            put_int(b, c.kind as i64);
+            b.push(b'\t');
+            put_text(b, c.full_name.as_ref());
+            b.push(b'\t');
+            put_text(b, &p.repo);
+            b.push(b'\t');
+            put_text(b, c.input_msg);
+            b.push(b'\t');
+            put_text(b, c.output_msg);
+            cp.end_row().await?;
         }
     }
+    cp.finish().await?;
+    sqlx::query(
+        "INSERT INTO contracts(iid, kind, full_name, repo, input_msg, output_msg)
+         SELECT decode(iid,'hex'), kind, full_name, repo, input_msg, output_msg
+         FROM stage_contracts
+         ON CONFLICT (iid) DO NOTHING",
+    )
+    .execute(&mut **tx)
+    .await?;
     Ok(())
 }
 
@@ -297,13 +448,14 @@ struct NodeRow {
     kind: i16,
     iid: Vec<u8>,
     bid: Vec<u8>,
-    fqn: String,
     generated: bool,
     origin: i16,
     span_file: String,
     span_line: i32,
 }
 
+// The fqn lives only in the map key (it is the dedupe key), not duplicated in
+// the row value — at 1.7M rows the second copy of every fqn is real memory.
 fn collect_fn_nodes(
     prog: &Program,
     repo_ids: &HashMap<String, i32>,
@@ -324,7 +476,6 @@ fn collect_fn_nodes(
                 kind: KIND_FN,
                 iid: hex::decode(iid).unwrap_or_default(),
                 bid: f.id.as_ref().map(|i| i.bid.clone()).unwrap_or_default(),
-                fqn: f.fqn.clone(),
                 generated: f.generated,
                 origin: f.origin as i16,
                 span_file,
@@ -374,7 +525,6 @@ async fn resolve_foreign_contracts(
                 kind: KIND_CONTRACT,
                 iid,
                 bid: Vec::new(),
-                fqn: full_name,
                 generated: true,
                 origin: 0,
                 span_file: String::new(),
@@ -385,47 +535,62 @@ async fn resolve_foreign_contracts(
     Ok(rids)
 }
 
-async fn upsert_nodes(tx: &mut Transaction<'_, Postgres>, rows: &[NodeRow]) -> Result<()> {
+/// Node rows (was one giant UNNEST INSERT: nine 1.7M-element bind arrays,
+/// materialized server-side, then ON CONFLICT): COPY the dedupe map into a
+/// staging table row by row — the map is consumed, so each NodeRow is freed
+/// as soon as it is encoded — then merge once with the same
+/// ON CONFLICT (repo_id, kind, fqn) DO UPDATE as before. Staging rows are
+/// already unique on the conflict key (the map deduped them), so no
+/// duplicate-conflict hazard.
+async fn upsert_nodes(
+    tx: &mut Transaction<'_, Postgres>,
+    rows: HashMap<(i32, i16, String), NodeRow>,
+) -> Result<()> {
     if rows.is_empty() {
         return Ok(());
     }
-    let mut rid = Vec::with_capacity(rows.len());
-    let mut kind = Vec::with_capacity(rows.len());
-    let mut iid = Vec::with_capacity(rows.len());
-    let mut bid = Vec::with_capacity(rows.len());
-    let mut fqn = Vec::with_capacity(rows.len());
-    let mut generated = Vec::with_capacity(rows.len());
-    let mut origin = Vec::with_capacity(rows.len());
-    let mut span_file = Vec::with_capacity(rows.len());
-    let mut span_line = Vec::with_capacity(rows.len());
-    for r in rows {
-        rid.push(r.repo_id);
-        kind.push(r.kind);
-        iid.push(r.iid.clone());
-        bid.push(r.bid.clone());
-        fqn.push(r.fqn.clone());
-        generated.push(r.generated);
-        origin.push(r.origin);
-        span_file.push(r.span_file.clone());
-        span_line.push(r.span_line);
+    sqlx::query(
+        "CREATE TEMP TABLE stage_nodes(
+           repo_id INT4, kind INT2, iid TEXT, bid TEXT, fqn TEXT,
+           generated BOOL, origin INT2, span_file TEXT, span_line INT4) ON COMMIT DROP",
+    )
+    .execute(&mut **tx)
+    .await?;
+    let mut cp = CopyIn::begin(
+        &mut **tx,
+        "COPY stage_nodes(repo_id, kind, iid, bid, fqn, generated, origin, span_file, span_line) FROM STDIN",
+    )
+    .await?;
+    for ((_, _, fqn), r) in rows {
+        let b = cp.row();
+        put_int(b, r.repo_id as i64);
+        b.push(b'\t');
+        put_int(b, r.kind as i64);
+        b.push(b'\t');
+        put_text(b, &hex::encode(r.iid));
+        b.push(b'\t');
+        put_text(b, &hex::encode(r.bid));
+        b.push(b'\t');
+        put_text(b, &fqn);
+        b.push(b'\t');
+        put_bool(b, r.generated);
+        b.push(b'\t');
+        put_int(b, r.origin as i64);
+        b.push(b'\t');
+        put_text(b, &r.span_file);
+        b.push(b'\t');
+        put_int(b, r.span_line as i64);
+        cp.end_row().await?;
     }
+    cp.finish().await?;
     sqlx::query(
         "INSERT INTO nodes(repo_id, kind, iid, bid, fqn, generated, origin, span_file, span_line)
-         SELECT * FROM UNNEST($1::int4[], $2::int2[], $3::bytea[], $4::bytea[], $5::text[],
-                              $6::bool[], $7::int2[], $8::text[], $9::int4[])
+         SELECT repo_id, kind, decode(iid,'hex'), decode(bid,'hex'), fqn, generated, origin, span_file, span_line
+         FROM stage_nodes
          ON CONFLICT (repo_id, kind, fqn) DO UPDATE
            SET iid=EXCLUDED.iid, bid=EXCLUDED.bid,
                span_file=EXCLUDED.span_file, span_line=EXCLUDED.span_line",
     )
-    .bind(&rid)
-    .bind(&kind)
-    .bind(&iid)
-    .bind(&bid)
-    .bind(&fqn)
-    .bind(&generated)
-    .bind(&origin)
-    .bind(&span_file)
-    .bind(&span_line)
     .execute(&mut **tx)
     .await?;
     Ok(())
@@ -482,14 +647,15 @@ async fn refresh_edges(
         .execute(&mut **tx)
         .await?;
 
-    struct EdgeRow {
-        from: i64,
-        to: i64,
-        rel: i16,
-        repo_id: i32,
-        meta: serde_json::Value,
-    }
-    let mut out: Vec<EdgeRow> = Vec::new();
+    // Edges have no unique key: rows stream straight into the table (no
+    // staging merge), encoded one at a time — no intermediate edge Vec and no
+    // columnar clones like the old UNNEST insert.
+    let mut cp = CopyIn::begin(
+        &mut **tx,
+        "COPY edges(from_id, to_id, rel_type, direction, repo_id, meta) FROM STDIN",
+    )
+    .await?;
+    let mut out: usize = 0;
     let mut seen: HashSet<(i64, i64, i16)> = HashSet::new();
 
     for (iid, f) in &prog.funcs {
@@ -509,17 +675,26 @@ async fn refresh_edges(
                         .as_ref()
                         .map(|s| format!("{}:{}", s.file, s.line))
                         .unwrap_or_default();
-                    out.push(EdgeRow {
-                        from,
-                        to,
-                        rel: REL_INVOKES_REMOTE,
-                        repo_id: rid,
-                        meta: json!({
-                            "callee_fqn": cs.callee_fqn,
-                            "span": span,
-                            "stream_op": cs.stream_op,
-                        }),
-                    });
+                    let meta = json!({
+                        "callee_fqn": cs.callee_fqn,
+                        "span": span,
+                        "stream_op": cs.stream_op,
+                    })
+                    .to_string();
+                    let b = cp.row();
+                    put_int(b, from);
+                    b.push(b'\t');
+                    put_int(b, to);
+                    b.push(b'\t');
+                    put_int(b, REL_INVOKES_REMOTE as i64);
+                    b.push(b'\t');
+                    put_bool(b, true);
+                    b.push(b'\t');
+                    put_int(b, rid as i64);
+                    b.push(b'\t');
+                    put_text(b, &meta);
+                    cp.end_row().await?;
+                    out += 1;
                 }
             } else {
                 for cid in &cs.callee_iids {
@@ -527,13 +702,21 @@ async fn refresh_edges(
                     if !seen.insert((from, to, REL_CALLS)) {
                         continue;
                     }
-                    out.push(EdgeRow {
-                        from,
-                        to,
-                        rel: REL_CALLS,
-                        repo_id: rid,
-                        meta: json!({ "callee_fqn": cs.callee_fqn }),
-                    });
+                    let meta = json!({ "callee_fqn": cs.callee_fqn }).to_string();
+                    let b = cp.row();
+                    put_int(b, from);
+                    b.push(b'\t');
+                    put_int(b, to);
+                    b.push(b'\t');
+                    put_int(b, REL_CALLS as i64);
+                    b.push(b'\t');
+                    put_bool(b, true);
+                    b.push(b'\t');
+                    put_int(b, rid as i64);
+                    b.push(b'\t');
+                    put_text(b, &meta);
+                    cp.end_row().await?;
+                    out += 1;
                 }
             }
         }
@@ -552,46 +735,26 @@ async fn refresh_edges(
             if !seen.insert((from, to, REL_BINDS_TO)) {
                 continue;
             }
-            out.push(EdgeRow {
-                from,
-                to,
-                rel: REL_BINDS_TO,
-                repo_id: rid,
-                meta: json!({ "full_name": c.full_name }),
-            });
+            let meta = json!({ "full_name": c.full_name }).to_string();
+            let b = cp.row();
+            put_int(b, from);
+            b.push(b'\t');
+            put_int(b, to);
+            b.push(b'\t');
+            put_int(b, REL_BINDS_TO as i64);
+            b.push(b'\t');
+            put_bool(b, true);
+            b.push(b'\t');
+            put_int(b, rid as i64);
+            b.push(b'\t');
+            put_text(b, &meta);
+            cp.end_row().await?;
+            out += 1;
         }
     }
 
-    if out.is_empty() {
-        return Ok(0);
-    }
-    let mut from = Vec::with_capacity(out.len());
-    let mut to = Vec::with_capacity(out.len());
-    let mut rel = Vec::with_capacity(out.len());
-    let mut dir = Vec::with_capacity(out.len());
-    let mut rid = Vec::with_capacity(out.len());
-    let mut meta = Vec::with_capacity(out.len());
-    for e in &out {
-        from.push(e.from);
-        to.push(e.to);
-        rel.push(e.rel);
-        dir.push(true);
-        rid.push(e.repo_id);
-        meta.push(e.meta.clone());
-    }
-    sqlx::query(
-        "INSERT INTO edges(from_id, to_id, rel_type, direction, repo_id, meta)
-         SELECT * FROM UNNEST($1::int8[], $2::int8[], $3::int2[], $4::bool[], $5::int4[], $6::jsonb[])",
-    )
-    .bind(&from)
-    .bind(&to)
-    .bind(&rel)
-    .bind(&dir)
-    .bind(&rid)
-    .bind(&meta)
-    .execute(&mut **tx)
-    .await?;
-    Ok(out.len())
+    cp.finish().await?;
+    Ok(out)
 }
 
 /// One row of the reverse index: a distinct remote call from a function to a
@@ -821,9 +984,25 @@ async fn persist_summaries(
     prog: &Program,
     eng: &Engine<'_>,
 ) -> Result<()> {
-    // content-addressed summaries
-    for (iid, sum) in &eng.summaries {
-        let f = match prog.funcs.get(iid) {
+    // Content-addressed summaries (was one INSERT round trip per summary —
+    // the single largest cost at scale): staged with COPY, merged once.
+    // ON CONFLICT (summary_key) DO NOTHING keeps first-writer-wins; duplicate
+    // summary_keys inside one DO NOTHING merge are resolved in staging order,
+    // like the old statement order was.
+    sqlx::query(
+        "CREATE TEMP TABLE stage_summaries(
+           summary_key TEXT, fn_iid TEXT, bid TEXT, contract_hash TEXT,
+           blob TEXT, repo TEXT) ON COMMIT DROP",
+    )
+    .execute(&mut **tx)
+    .await?;
+    let mut cp = CopyIn::begin(
+        &mut **tx,
+        "COPY stage_summaries(summary_key, fn_iid, bid, contract_hash, blob, repo) FROM STDIN",
+    )
+    .await?;
+    for (iid, sum) in eng.summaries.iter() {
+        let f = match prog.funcs.get(&iid) {
             Some(f) => f,
             None => continue, // contract-iid alias, skip (published below)
         };
@@ -832,29 +1011,41 @@ async fn persist_summaries(
         // members have a contract_hash but no cacheable summary_key)
         let ch = eng
             .contract_hashes
-            .get(iid)
-            .copied()
-            .unwrap_or_else(|| contract_hash(sum));
+            .get(&iid)
+            .unwrap_or_else(|| contract_hash(&sum));
         let sk = eng
             .summary_keys
-            .get(iid)
+            .get(&iid)
             .copied()
-            .unwrap_or_else(|| ids::summary_key(iid, &bid, &f.source_params, vec![ch]));
-        let blob = serde_json::to_vec(&project(sum))?;
-        let repo = prog.repo_of.get(iid).cloned().unwrap_or_default();
-        sqlx::query(
-            "INSERT INTO summaries(summary_key, fn_iid, bid, contract_hash, blob, repo)
-             VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT (summary_key) DO NOTHING",
-        )
-        .bind(sk.to_vec())
-        .bind(hex::decode(iid).unwrap_or_default())
-        .bind(&bid)
-        .bind(ch.to_vec())
-        .bind(&blob)
-        .bind(&repo)
-        .execute(&mut **tx)
-        .await?;
+            .unwrap_or_else(|| ids::summary_key(&iid, &bid, &f.source_params, vec![ch]));
+        let blob = serde_json::to_vec(&project(&sum))?;
+        // serde_json output is valid UTF-8, so this cannot fail
+        let blob = String::from_utf8(blob)?;
+        let repo = prog.repo_of.get(&iid).cloned().unwrap_or_default();
+        let b = cp.row();
+        put_text(b, &hex::encode(sk));
+        b.push(b'\t');
+        put_text(b, iid.as_str());
+        b.push(b'\t');
+        put_text(b, &hex::encode(bid));
+        b.push(b'\t');
+        put_text(b, &hex::encode(ch));
+        b.push(b'\t');
+        put_text(b, &blob);
+        b.push(b'\t');
+        put_text(b, &repo);
+        cp.end_row().await?;
     }
+    cp.finish().await?;
+    sqlx::query(
+        "INSERT INTO summaries(summary_key, fn_iid, bid, contract_hash, blob, repo)
+         SELECT decode(summary_key,'hex'), decode(fn_iid,'hex'), decode(bid,'hex'),
+                decode(contract_hash,'hex'), convert_to(blob,'UTF8'), repo
+         FROM stage_summaries
+         ON CONFLICT (summary_key) DO NOTHING",
+    )
+    .execute(&mut **tx)
+    .await?;
 
     // Publish each LOCAL contract's post-fixpoint VIEW (doc 18 B.1):
     // eng.summaries[contract_iid] is the handler summary already remapped into
@@ -868,8 +1059,8 @@ async fn persist_summaries(
                 continue; // consumed-only contract: no local handler, skip
             }
             if let Some(view) = eng.summaries.get(&hexid(gm.iid)) {
-                let ch = contract_hash(view);
-                let blob = serde_json::to_vec(&project(view))?;
+                let ch = contract_hash(&view);
+                let blob = serde_json::to_vec(&project(&view))?;
                 sqlx::query(
                     "INSERT INTO contract_summaries(contract_iid, contract_hash, blob, repo, commit_sha)
                      VALUES($1,$2,$3,$4,$5) ON CONFLICT (contract_iid) DO UPDATE
@@ -1402,6 +1593,56 @@ mod tests {
         // different primary key.
         assert_eq!(a.len(), b.len());
         assert_ne!(a[0].repo, b[0].repo);
+    }
+
+    /// COPY field encoders: the escapes Postgres's text parser treats
+    /// specially, a NULL, and the bytea escape representation (printable
+    /// ASCII literal, backslash doubled, other bytes 3-digit octal).
+    #[test]
+    fn copy_field_encoders_escape_correctly() {
+        let t = |s: &str| {
+            let mut b = Vec::new();
+            put_text(&mut b, s);
+            String::from_utf8(b).unwrap()
+        };
+        assert_eq!(t("plain"), "plain");
+        assert_eq!(t("a\tb"), "a\\tb");
+        assert_eq!(t("a\nb"), "a\\nb");
+        assert_eq!(t("a\\b"), "a\\\\b");
+        assert_eq!(t("do_rust::x<y>"), "do_rust::x<y>");
+
+        let mut b = Vec::new();
+        put_opt_text(&mut b, None);
+        b.push(b'\t');
+        put_opt_text(&mut b, Some("x"));
+        assert_eq!(String::from_utf8(b).unwrap(), "\\N\tx");
+
+        let y = |v: &[u8]| {
+            let mut b = Vec::new();
+            put_bytea(&mut b, v);
+            String::from_utf8(b).unwrap()
+        };
+        assert_eq!(y(&[]), "");
+        assert_eq!(y(b"ab"), "ab");
+        assert_eq!(y(b"a\\b"), "a\\\\b");
+        assert_eq!(y(&[0x00, 0x01, 0x7f, 0xff]), "\\000\\001\\177\\377");
+        assert_eq!(y(&[0x09, 0x0a]), "\\011\\012");
+
+        let n = |v: i64| {
+            let mut b = Vec::new();
+            put_int(&mut b, v);
+            String::from_utf8(b).unwrap()
+        };
+        assert_eq!(n(0), "0");
+        assert_eq!(n(42), "42");
+        assert_eq!(n(-7), "-7");
+        assert_eq!(n(i64::MIN), "-9223372036854775808");
+        assert_eq!(n(i64::MAX), "9223372036854775807");
+
+        let mut b = Vec::new();
+        put_bool(&mut b, true);
+        put_bool(&mut b, false);
+        assert_eq!(String::from_utf8(b).unwrap(), "tf");
     }
 
     #[test]

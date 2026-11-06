@@ -7,6 +7,7 @@ use crate::graph::{hexid, IidHex};
 use crate::ifds::{summary_changed, Engine, Slot, SlotP, Summary};
 use crate::proto::cgf;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 /// What kind of contract a published view belongs to — the shape decides how a
 /// handler's slot frame maps onto the client's call frame.
@@ -203,23 +204,54 @@ pub fn contract_view(sum: &Summary, client_streaming: bool, server_streaming: bo
     out
 }
 
-/// Publish the CURRENT handler summary as `contract`'s view, replacing any
+/// The view published under `contract`: the UNION of every local handler's
+/// view, each remapped through its own shape.
+///
+/// A `ContractIID` is derived from the contract's NAME alone (graph.rs), so
+/// several loaded repos can define one contract — the same GraphQL field, gRPC
+/// method or HTTP route — each with its own handler and slot frame. A client's
+/// INVOKES_REMOTE site names only the contract, never the defining repo, and
+/// nothing in the facts says which server a call reaches, so the honest
+/// summary is the disjunction: data flows if ANY handler's frame lets it
+/// through. Union (set semantics on flows, dedup on sink hits) is commutative,
+/// so the published view cannot depend on the order handlers are published in
+/// — a previous last-publisher-wins rule let the engine's per-process HashMap
+/// iteration order decide which repo's view survived, and the whole finding
+/// set downstream of such a contract differed from run to run even at
+/// `--threads 1`. Union also loses no finding, where a pick keeps only one
+/// repo's behaviour.
+fn merged_view(engine: &Engine, handlers: &[(IidHex, ContractShape)]) -> Option<Summary> {
+    let mut acc: Option<Summary> = None;
+    for (h, shape) in handlers {
+        let Some(sum) = engine.summaries.get(h) else {
+            continue; // handler body not loaded: contributes no view
+        };
+        let view = shape.view(&sum);
+        match &mut acc {
+            None => acc = Some(view),
+            Some(out) => {
+                out.flows.extend(view.flows);
+                out.sink_hits.extend(view.sink_hits);
+                out.confidence = out.confidence.max(view.confidence);
+            }
+        }
+    }
+    let mut out = acc?;
+    crate::ifds::dedup_sink_hits(&mut out.sink_hits);
+    Some(out)
+}
+
+/// Publish the CURRENT union view of `contract`'s handlers, replacing any
 /// earlier publication (or_insert would freeze the iteration-0 view and kill
 /// the fixpoint). Returns whether the stored view changed.
-fn publish_view(
-    engine: &mut Engine,
-    contract: &IidHex,
-    handler: &IidHex,
-    shape: &ContractShape,
-) -> bool {
-    let Some(sum) = engine.summaries.get(handler) else {
+fn publish_view(engine: &mut Engine, contract: &IidHex, handlers: &[(IidHex, ContractShape)]) -> bool {
+    let Some(view) = merged_view(engine, handlers) else {
         return false;
     };
-    let view = shape.view(sum);
     match engine.summaries.get(contract) {
-        Some(prev) if !summary_changed(prev, &view) => false,
+        Some(prev) if !summary_changed(&prev, &view) => false,
         _ => {
-            engine.summaries.insert(contract.clone(), view);
+            engine.summaries.insert(contract.clone(), Arc::new(view));
             true
         }
     }
@@ -267,12 +299,28 @@ pub fn fixpoint_with_leaves(
     // fields (doc 36 §3.2: a resolver is a contract handler like any other) and
     // HTTP routes (coverage wave 1 §4.4) — from the one enumeration witness and
     // the backward pass also read, so all three agree on keys and shapes.
-    let mut contracts: Vec<(IidHex, IidHex, ContractShape)> = Vec::new();
+    //
     // handler iid -> contracts it serves (republish targets on handler change).
     let mut handler_of: HashMap<IidHex, Vec<(IidHex, ContractShape)>> = HashMap::new();
+    // contract key -> EVERY handler that serves it, in package order. Several
+    // repos can define one contract (the ContractIID is the name alone); the
+    // published view is the union of all their frames (merged_view).
+    let mut handlers_of: HashMap<IidHex, Vec<(IidHex, ContractShape)>> = HashMap::new();
+    // the distinct contract keys, in first-seen (package) order — the publish
+    // loop walks this, one union view per key
+    let mut keys: Vec<IidHex> = Vec::new();
     for c in crate::graph::contracts(engine.prog) {
-        contracts.push((c.key.clone(), c.handler.clone(), c.shape.clone()));
-        handler_of.entry(c.handler).or_default().push((c.key, c.shape));
+        handler_of
+            .entry(c.handler.clone())
+            .or_default()
+            .push((c.key.clone(), c.shape.clone()));
+        handlers_of
+            .entry(c.key.clone())
+            .or_insert_with(|| {
+                keys.push(c.key.clone());
+                Vec::new()
+            })
+            .push((c.handler, c.shape));
     }
 
     // Reverse deps, built once. prog.callees drops contract iids (no body), so
@@ -302,18 +350,19 @@ pub fn fixpoint_with_leaves(
     // whose view is new or changed.
     let mut linked = 0;
     let mut dirty: HashSet<IidHex> = HashSet::new();
-    for (c, h, shape) in &contracts {
-        if engine.summaries.contains_key(h) {
+    for c in &keys {
+        let hs = &handlers_of[c];
+        if hs.iter().any(|(h, _)| engine.summaries.contains_key(h)) {
             linked += 1;
         }
-        if publish_view(engine, c, h, shape) {
+        if publish_view(engine, c, hs) {
             if let Some(callers) = remote_callers.get(c) {
                 dirty.extend(callers.iter().cloned());
             }
         }
     }
     // ... plus PG leaves for contracts we don't define locally (local wins).
-    let local: HashSet<&IidHex> = contracts.iter().map(|(c, ..)| c).collect();
+    let local: HashSet<&IidHex> = handlers_of.keys().collect();
     let mut remote_leaves = 0;
     for (c, view) in leaves {
         if local.contains(&c) {
@@ -323,12 +372,12 @@ pub fn fixpoint_with_leaves(
         if let Some(callers) = remote_callers.get(&c) {
             dirty.extend(callers.iter().cloned());
         }
-        engine.summaries.insert(c, view);
+        engine.summaries.insert(c, Arc::new(view));
     }
 
     // Local propagation resolves fully inside each resummarize pass, so every
     // productive iteration here must change >= 1 contract view.
-    let max_iters = contracts.len() + 1;
+    let max_iters = keys.len() + 1;
     let mut iters = 0;
     while !dirty.is_empty() {
         if iters >= max_iters {
@@ -343,9 +392,16 @@ pub fn fixpoint_with_leaves(
         dirty = HashSet::new();
         for f in &changed {
             if let Some(served) = handler_of.get(f) {
-                for (c, shape) in served.clone() {
-                    if publish_view(engine, &c, f, &shape) {
-                        if let Some(callers) = remote_callers.get(&c) {
+                // A handler can serve the same key through several defs; the
+                // view is per key, so republish each key once. The union view
+                // is order-free (merged_view), so walking `changed` in any
+                // order — it is a HashSet — publishes the same views.
+                let mut ks: Vec<&IidHex> = served.iter().map(|(c, _)| c).collect();
+                ks.sort_unstable();
+                ks.dedup();
+                for c in ks {
+                    if publish_view(engine, c, &handlers_of[c]) {
+                        if let Some(callers) = remote_callers.get(c) {
                             dirty.extend(callers.iter().cloned());
                         }
                     }
@@ -643,7 +699,10 @@ arg = "any"
     }
 
     fn has_sink(engine: &Engine, iid: u8, slot: Slot) -> bool {
-        engine.summaries[&hexid(&[iid; 32])]
+        engine
+            .summaries
+            .get(&hexid(&[iid; 32]))
+            .unwrap()
             .sink_hits
             .iter()
             .any(|h| h.class == "sqli" && h.in_slot == slot)
@@ -727,11 +786,43 @@ arg = "any"
         assert!(
             has_sink(&eng, 0x0A, Slot::Param(1)),
             "the sink must land on `token` (R's Param(1)), not on positional arg 0: {:?}",
-            eng.summaries[&hexid(&[0x0A; 32])].sink_hits
+            eng.summaries.get(&hexid(&[0x0A; 32])).unwrap().sink_hits
         );
         assert!(
             !has_sink(&eng, 0x0A, Slot::Param(0)),
             "`mode` never reaches the resolver's tainted param"
+        );
+    }
+
+    /// Two packages define the SAME contract iid (the ContractIID is derived
+    /// from the name alone) with different handlers: one reaches a sink, one
+    /// drops the fact. The published view is the UNION of both frames, so the
+    /// caller keeps the finding — a last-publisher-wins rule used to let the
+    /// engine's per-process HashMap order decide which handler's view
+    /// survived, and with it whether the finding existed at all.
+    #[test]
+    fn contested_contract_unions_both_handlers_views() {
+        let cat = Catalog::load_str(CAT).unwrap();
+        // The quiet handler's body is loaded but reaches nothing.
+        let quiet = func(0x2D, cgf::LocalFlow::default());
+        let mut prog = program(
+            vec![root_caller(0x0A, 0xC1), sink_handler(0x2C), quiet],
+            vec![gm(0xC1, 0x2C, false, false)],
+        );
+        prog.packages.push(cgf::CgfPackage {
+            repo: "other".into(),
+            language: "go".into(),
+            grpc_methods: vec![gm(0xC1, 0x2D, false, false)],
+            ..Default::default()
+        });
+        let mut eng = Engine::new(&prog, &cat);
+        eng.run();
+        let linked = fixpoint(&mut eng);
+        assert_eq!(linked, 1, "both defs share one contract key");
+        assert!(
+            has_sink(&eng, 0x0A, Slot::Param(0)),
+            "the union view keeps the sink the loaded handler contributes: {:?}",
+            eng.summaries.get(&hexid(&[0x0A; 32])).unwrap().sink_hits
         );
     }
 
@@ -752,7 +843,7 @@ arg = "any"
         let mut eng = Engine::new(&prog, &cat);
         eng.run();
         assert!(
-            eng.summaries[&hexid(&[0x1B; 32])].sink_hits.is_empty(),
+            eng.summaries.get(&hexid(&[0x1B; 32])).unwrap().sink_hits.is_empty(),
             "pre-fixpoint: H1 must have the stale default-leaf view of C2"
         );
         let linked = fixpoint(&mut eng);
@@ -784,7 +875,7 @@ arg = "any"
         );
         let mut eng = Engine::new(&prog, &cat);
         eng.run();
-        assert!(eng.summaries[&hexid(&[0x0A; 32])].sink_hits.is_empty());
+        assert!(eng.summaries.get(&hexid(&[0x0A; 32])).unwrap().sink_hits.is_empty());
         fixpoint(&mut eng);
         assert!(has_sink(&eng, 0x3D, Slot::Param(0)), "remote sink must fold into helper");
         assert!(has_sink(&eng, 0x0A, Slot::Param(0)), "and surface in the root via local call");
@@ -851,7 +942,7 @@ arg = "any"
         let mut eng = Engine::new(&prog, &cat);
         eng.run();
         assert_eq!(eng.summary_keys, plain.summary_keys);
-        assert!(eng.summaries[&hexid(&[0x0A; 32])].sink_hits.is_empty());
+        assert!(eng.summaries.get(&hexid(&[0x0A; 32])).unwrap().sink_hits.is_empty());
 
         let mut leaves = HashMap::new();
         leaves.insert(hexid(&[0xC9; 32]), leaf_with_sink());
@@ -892,7 +983,7 @@ arg = "any"
         assert_eq!(fx.remote_leaves, 0, "local contract must shadow the leaf");
         assert_eq!(fx.linked, 1);
         assert!(
-            eng.summaries[&hexid(&[0x0A; 32])].sink_hits.is_empty(),
+            eng.summaries.get(&hexid(&[0x0A; 32])).unwrap().sink_hits.is_empty(),
             "stale leaf sink must NOT surface through the local sinkless handler"
         );
     }
@@ -923,7 +1014,7 @@ arg = "any"
         eng.run();
         fixpoint(&mut eng);
         assert!(has_sink(&eng, 0x51, Slot::Param(0)), "handler frame: sink at Param(0)");
-        let view = &eng.summaries[&hexid(&[0xC1; 32])];
+        let view = &eng.summaries.get(&hexid(&[0xC1; 32])).unwrap();
         assert!(
             view.sink_hits
                 .iter()
@@ -1038,7 +1129,7 @@ mod http_tests {
         eng.run();
         crate::heap::fixpoint(&mut eng);
         fixpoint_with_leaves(&mut eng, HashMap::new());
-        crate::report::intra_chains(&eng, None)
+        crate::report::intra_chains(&eng, None, false)
     }
 
     #[test]
@@ -1178,11 +1269,9 @@ mod http_tests {
         let mut eng = Engine::new(&prog, &cat);
         eng.run();
         fixpoint_with_leaves(&mut eng, HashMap::new());
-        let mut chains = crate::report::intra_chains(&eng, None);
+        let mut chains = crate::report::intra_chains(&eng, None, false);
         assert_eq!(chains.len(), 1);
-        crate::backward::set_opts(crate::backward::BackOpts { unview: true, ..Default::default() });
-        crate::report::backward_check(&eng, &mut chains, false);
-        crate::backward::set_opts(Default::default());
+        crate::report::backward_check(&eng, &mut chains, crate::backward::BackOpts { unview: true, ..Default::default() });
         assert_eq!(chains[0].backward.as_ref().unwrap().verdict, crate::backward::Verdict::Confirmed);
     }
 
@@ -1208,11 +1297,9 @@ mod http_tests {
             (false, crate::backward::Verdict::Undecided),
             (true, crate::backward::Verdict::Confirmed),
         ] {
-            let mut chains = crate::report::intra_chains(&eng, None);
-            crate::backward::set_opts(crate::backward::BackOpts { unview, ..Default::default() });
-            crate::report::backward_check(&eng, &mut chains, false);
+            let mut chains = crate::report::intra_chains(&eng, None, false);
+            crate::report::backward_check(&eng, &mut chains, crate::backward::BackOpts { unview, ..Default::default() });
             assert_eq!(chains[0].backward.as_ref().unwrap().verdict, want, "unview={unview}");
         }
-        crate::backward::set_opts(Default::default());
     }
 }

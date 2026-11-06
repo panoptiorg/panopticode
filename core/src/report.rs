@@ -1,9 +1,11 @@
 // Taint chains (JSON). A chain is a source→…→sink path, possibly spanning repos
 // (doc 04 §6, doc 08). MVP: intra-repo chains from unconditional catalog sources;
 // cross-repo hops are added by the composer (Phase 4) via invokes_remote.
+use crate::graph::IidHex;
 use crate::ifds::{Engine, FnCtx};
 use crate::proto::cgf;
 use crate::witness::{self, Route, Walk};
+use rayon::prelude::*;
 use serde::Serialize;
 use std::collections::HashMap;
 
@@ -76,6 +78,11 @@ pub struct Chain {
     /// share a `chain_key` and merge.
     #[serde(skip)]
     pub sink_terminal: (String, usize),
+    /// the firing vertex of the sink hit (`PropSink::last`) — internal. Two
+    /// same-class sinks under one call site share (class, callsite, terminal)
+    /// but fire at different vertices; this is what tells them apart.
+    #[serde(skip)]
+    pub sink_last: u32,
     /// doc 35: the sink-seeded backward confirmation of this chain. None unless
     /// `taint --backward` ran; then confirmed / refuted / undecided plus the
     /// source-side field the terminal actually reads.
@@ -168,160 +175,174 @@ fn to_span(s: &Option<cgf::Span>) -> Option<Span> {
 
 /// Build intra-repo chains: functions whose body has an unconditional catalog
 /// source that reaches a sink.
-pub fn intra_chains(engine: &Engine, filter: Option<&str>) -> Vec<Chain> {
+pub fn intra_chains(engine: &Engine, filter: Option<&str>, verify_routes: bool) -> Vec<Chain> {
     // contract -> handler, so a route can descend across service boundaries.
     // Built once; a scan of the loaded packages.
     let handlers = witness::contract_handlers(engine.prog);
-    let walk = Walk::new(engine, &handlers);
-    let mut chains = Vec::new();
-    for (iid, f) in &engine.prog.funcs {
-        let flow = match &f.flow {
-            Some(fl) => fl,
-            None => continue,
-        };
-        let ctx = FnCtx::build(f, engine.cat);
-        if ctx.source_seeds.is_empty() {
-            continue;
-        }
-        if let Some(pat) = filter {
-            if !f.fqn.contains(pat) {
-                continue;
-            }
-        }
-        crate::trace_ev!(
-            engine.trace,
-            "seed",
-            &f.fqn,
-            "seed      fn={} vertices={:?}",
-            f.fqn,
-            ctx.source_seeds
-        );
-        let r = engine.propagate(f, &ctx, &ctx.source_seeds);
-        let repo = engine.prog.repo_of.get(iid).cloned().unwrap_or_default();
+    // Source candidates in a sorted, content-determined order: (fqn, iid) —
+    // both are content-derived, so every process and every --threads value
+    // walks the same sequence. The parallel path concatenates per-source chain
+    // vectors in exactly this order; the dedupe and the final sort below are
+    // total orders, so the output would not depend on the order anyway.
+    let mut cands: Vec<(&IidHex, &cgf::Function)> = engine
+        .prog
+        .funcs
+        .iter()
+        .filter(|(_, f)| f.flow.is_some())
+        .filter(|(_, f)| filter.map_or(true, |pat| f.fqn.contains(pat)))
+        .collect();
+    cands.sort_by(|a, b| {
+        (a.1.fqn.as_str(), a.0.as_str()).cmp(&(b.1.fqn.as_str(), b.0.as_str()))
+    });
+    // Debug: walk the sorted sources in REVERSE (PC_CHAIN_ORDER=reverse). A
+    // route must be a pure function of (engine state, source iid, seeds, sink
+    // class, SinkTarget) — independent of which routes the same Walk computed
+    // before it. Reversal changes exactly that "before" set for every source
+    // while leaving chunking alone, so a forward leak the chunk boundaries
+    // happen to mask still shows up as a stdout diff between this run and the
+    // normal one. Not part of the flag set because it exists to be set by
+    // scripts, not typed by hand.
+    if std::env::var("PC_CHAIN_ORDER").as_deref() == Ok("reverse") {
+        cands.reverse();
+    }
 
-        // vertex -> callsite id (for hop labelling)
-        let mut vcs: HashMap<u32, usize> = HashMap::new();
-        for v in &flow.vertices {
-            if v.kind == cgf::VertexKind::CallArgPort as i32
-                || v.kind == cgf::VertexKind::CallResultPort as i32
-            {
-                vcs.insert(v.id, v.callsite_id as usize);
-            }
+    let mut chains: Vec<Chain> = Vec::new();
+    let mut wstats = witness::WalkStats::default();
+    if rayon::current_num_threads() <= 1 {
+        // Sequential fast path (--threads 1): one Walk over every source, so
+        // its memos are shared across sources exactly as before.
+        let mut walk = Walk::new(engine, &handlers);
+        walk.quiet();
+        for (iid, f) in &cands {
+            chains.extend(chains_for_source(engine, &walk, iid, f));
         }
-
-        for sink in &r.sinks {
-            // backtrace vertex path sink.last -> seed via pred
-            let mut path = vec![sink.last];
-            let mut cur = sink.last;
-            let mut guard = 0;
-            while let Some(&p) = r.pred.get(&cur) {
-                path.push(p);
-                cur = p;
-                guard += 1;
-                if guard > 10_000 {
-                    break;
+        wstats = walk.stats();
+    } else {
+        // One Walk per CHUNK of sources, on the global rayon pool. A Walk's
+        // memos are RefCell maps behind `&self`, so a Walk is neither Send nor
+        // Sync — each chunk builds its own and drops it with its memos, which
+        // bounds the memo memory to ~thread-count live copies instead of the
+        // one run-wide map the sequential path keeps. Memo sharing ACROSS
+        // chunks is lost on purpose, and that is a cost (re-propagation),
+        // never a route difference: the invariant is that a route is a pure
+        // function of (engine state, source iid, seeds, sink class, SinkTarget),
+        // and the Walk only memoises values that are pure functions of their
+        // key — the FnCtx of a function, the PropResult of (iid, seeds). A memo
+        // hit therefore always returns exactly what a fresh computation would;
+        // what would break the invariant is memoising a CONTEXT-CUT result
+        // (one computed under a depth budget, a visited set, or a partial
+        // route), and no Walk memo does that.
+        let chunk = (cands.len() / (rayon::current_num_threads() * 8)).max(1);
+        let parts: Vec<(Vec<Chain>, witness::WalkStats)> = cands
+            .par_chunks(chunk)
+            .map(|srcs| {
+                let mut walk = Walk::new(engine, &handlers);
+                walk.quiet();
+                let mut out = Vec::new();
+                for (iid, f) in srcs {
+                    out.extend(chains_for_source(engine, &walk, iid, f));
                 }
-            }
-            path.reverse();
-
-            let mut hops = Vec::new();
-            let mut seen_cs = std::collections::HashSet::new();
-            // Product of per-site dispatch confidences over the source-fn call
-            // sites on the path (intra_chains labels hops in the source function
-            // only). 0.0 = unset (legacy CGF / proto3 default) => treat as 1.0.
-            let mut confidence: f32 = 1.0;
-            for &v in &path {
-                if let Some(&cs_idx) = vcs.get(&v) {
-                    if seen_cs.insert(cs_idx) {
-                        let cs = &flow.callsites[cs_idx];
-                        if cs.dispatch_confidence > 0.0 {
-                            confidence *= cs.dispatch_confidence;
-                        }
-                        hops.push(Hop {
-                            repo: repo.clone(),
-                            func: f.fqn.clone(),
-                            detail: cs.callee_fqn.clone(),
-                            span: to_span(&cs.span),
-                            crossed_service_boundary: cs.kind
-                                == cgf::call_site::Kind::InvokesRemote as i32,
-                        });
-                    }
-                }
-            }
-            crate::trace_ev!(
-                engine.trace,
-                "chain",
-                &f.fqn,
-                "chain     src={} sink={} hops={} conf={}",
-                f.fqn,
-                sink.class,
-                hops.len(),
-                confidence
-            );
-            let sink_field = flow.vertices.iter().find(|v| v.id == sink.last).and_then(|v| {
-                if v.field_path.is_empty() {
-                    None
-                } else if v.field_names.len() == v.field_path.len() {
-                    Some(v.field_names.join("."))
-                } else {
-                    Some(
-                        v.field_path
-                            .iter()
-                            .map(|i| i.to_string())
-                            .collect::<Vec<_>>()
-                            .join("."),
-                    )
-                }
+                (out, walk.stats())
+            })
+            .collect();
+        wstats = parts
+            .iter()
+            .fold(witness::WalkStats::default(), |mut a, (_, s)| {
+                a.widened += s.widened;
+                a.ctx_builds += s.ctx_builds;
+                a.ctx_hits += s.ctx_hits;
+                a.prop_runs += s.prop_runs;
+                a.prop_hits += s.prop_hits;
+                a.cands_tried += s.cands_tried;
+                a.cand_capped += s.cand_capped;
+                a
             });
-            // Full route. The target pins THIS sink instance: the (callsite,
-            // firing vertex) pin at the entry frame, and the terminal sink
-            // identity at every level below — so two same-class sinks under one
-            // call site (even two levels down) get two distinct routes.
-            let route = walk.route(
-                iid,
-                &ctx.source_seeds,
-                &sink.class,
-                Some(witness::SinkTarget {
-                    at: Some((sink.callsite, sink.last)),
-                    terminal: sink.terminal.clone(),
-                }),
-            );
-            // 0.0 = unset (legacy) => 1.0, same convention as the source-fn product.
-            let route_confidence = route
-                .hops
-                .iter()
-                .map(|h| h.confidence)
-                .filter(|c| *c > 0.0)
-                .fold(1.0f32, f32::min);
-            chains.push(Chain {
-                source_repo: repo.clone(),
-                source_fn: f.fqn.clone(),
-                sink_class: sink.class.clone(),
-                sink_span: to_span(&sink.span),
-                sink_field,
-                sink_fields: Vec::new(),
-                hops,
-                route: Some(route),
-                sanitized: false,
-                confidence,
-                route_confidence,
-                source_iid: iid.clone(),
-                source_callsite: sink.callsite,
-                sink_terminal: (sink.terminal.fn_iid.clone(), sink.terminal.callsite),
-                backward: None,
-            });
-        }
+        chains = parts.into_iter().flat_map(|(c, _)| c).collect();
     }
     // A route that could not reproduce its sink from the narrowed fact fell back
     // to the widened one (witness.rs). That only happens when the chain depends
     // on pass-through widening, so the count sizes the residual false-positive
     // population — see doc 25 §3 R1. stderr, not the JSON: it is a property of
     // the run, not of any one chain.
-    if walk.widened_routes() > 0 {
+    if wstats.widened > 0 {
         eprintln!(
             "route-warn: {} descent(s) fell back to the widened fact (field-path widening)",
-            walk.widened_routes()
+            wstats.widened
         );
+    }
+    // route-stats, one line, summed over every Walk that ran (per-Walk drops
+    // are quiet). Same condition and format as the Walk Drop line.
+    if wstats.ctx_builds > 0 || wstats.ctx_hits > 0 {
+        eprintln!(
+            "route-stats: fnctx {} built / {} memo-hit, propagate {} run / {} memo-hit, \
+             dispatch candidates tried {}, fan-outs capped at {} {}",
+            wstats.ctx_builds,
+            wstats.ctx_hits,
+            wstats.prop_runs,
+            wstats.prop_hits,
+            wstats.cands_tried,
+            witness::MAX_DISPATCH_CANDIDATES,
+            wstats.cand_capped
+        );
+    }
+    // Debug (--verify-routes): recompute every chain's route with a FRESH Walk
+    // (cold memos, nothing shared with the runs above) and compare it with the
+    // route the shared/per-chunk Walk produced. A mismatch means some memo
+    // served a value that depends on the visit context it was first computed
+    // in — exactly the leak this flag exists to catch, since a fresh Walk
+    // cannot have inherited any context. stderr, like verify-summaries: a
+    // property of the run, not of any one chain.
+    if verify_routes {
+        // group the shared-Walk chains by source, first-appearance order
+        let mut order: Vec<&IidHex> = Vec::new();
+        let mut by_src: HashMap<&IidHex, Vec<&Chain>> = HashMap::new();
+        for c in &chains {
+            if !by_src.contains_key(&c.source_iid) {
+                order.push(&c.source_iid);
+            }
+            by_src.entry(&c.source_iid).or_default().push(c);
+        }
+        // Pair by INDEX, not by identity: chains_for_source iterates the same
+        // pure propagate result both times, so the k-th sink hit produces the
+        // k-th chain on both sides — two hits can tie on every stored identity
+        // field and still be distinct sink instances (heap rows from two
+        // readers), which would break a key-based pairing.
+        let mut bad = 0usize;
+        let mut shown = 0usize;
+        for iid in &order {
+            let group = &by_src[*iid];
+            let f = &engine.prog.funcs[*iid];
+            let mut fresh = Walk::new(engine, &handlers);
+            fresh.quiet();
+            let fresh_chains = chains_for_source(engine, &fresh, iid, f);
+            if fresh_chains.len() != group.len() {
+                bad += 1;
+                if shown < 8 {
+                    eprintln!(
+                        "verify-routes:   {} — chain count: shared={} fresh={}",
+                        f.fqn,
+                        group.len(),
+                        fresh_chains.len()
+                    );
+                    shown += 1;
+                }
+                continue;
+            }
+            for (sc, fc) in group.iter().zip(fresh_chains.iter()) {
+                if !route_eq(sc.route.as_ref(), fc.route.as_ref()) {
+                    bad += 1;
+                    if shown < 8 {
+                        report_route_diff(sc, fc.route.as_ref());
+                        shown += 1;
+                    }
+                }
+            }
+        }
+        if bad == 0 {
+            eprintln!("verify-routes: 0 differences");
+        } else {
+            eprintln!("verify-routes: {} DIFFERENCES", bad);
+        }
     }
     let mut chains = dedupe(chains);
     // prog.funcs is a HashMap — sort so identical runs emit identical JSON.
@@ -355,17 +376,225 @@ pub fn intra_chains(engine: &Engine, filter: Option<&str>) -> Vec<Chain> {
     chains
 }
 
+/// Full route equality for --verify-routes: every field the JSON carries.
+/// Hops compare through their Debug rendering — RouteHop has no PartialEq,
+/// and the Debug form covers all of its fields including hop kinds.
+fn route_eq(a: Option<&Route>, b: Option<&Route>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => {
+            a.id == b.id
+                && a.fingerprint == b.fingerprint
+                && a.boundaries == b.boundaries
+                && format!("{:?}", a.incomplete) == format!("{:?}", b.incomplete)
+                && a.hops.len() == b.hops.len()
+                && a
+                    .hops
+                    .iter()
+                    .zip(b.hops.iter())
+                    .all(|(x, y)| format!("{x:?}") == format!("{y:?}"))
+        }
+        _ => false,
+    }
+}
+
+/// One verify-routes example on stderr: source, class, and the FIRST place the
+/// two routes part ways — a hop index with both renderings, or the ids when
+/// only the id (line/col-sensitive) moved.
+fn report_route_diff(shared: &Chain, fresh: Option<&Route>) {
+    let head = format!("verify-routes:   {} class={}", shared.source_fn, shared.sink_class);
+    let Some(sr) = shared.route.as_ref() else {
+        eprintln!("{head} — shared route missing");
+        return;
+    };
+    let Some(fr) = fresh else {
+        eprintln!("{head} — fresh route missing");
+        return;
+    };
+    for (i, (x, y)) in sr.hops.iter().zip(fr.hops.iter()).enumerate() {
+        if format!("{x:?}") != format!("{y:?}") {
+            eprintln!("{head} — hop {i}: shared={x:?} fresh={y:?}");
+            return;
+        }
+    }
+    if sr.hops.len() != fr.hops.len() {
+        eprintln!(
+            "{head} — hop count: shared={} fresh={}",
+            sr.hops.len(),
+            fr.hops.len()
+        );
+        return;
+    }
+    eprintln!("{head} — id {} vs {} (hops equal)", sr.id, fr.id);
+}
+
+/// Chains from ONE source function — the unit of work of the chains phase,
+/// run sequentially or on a rayon worker (`intra_chains`). Pure function of
+/// (engine state, handlers, this function), so per-source results are
+/// independent of which worker runs them and in what order.
+fn chains_for_source<'a, 'e>(
+    engine: &'a Engine<'e>,
+    walk: &Walk<'a, 'e>,
+    iid: &IidHex,
+    f: &cgf::Function,
+) -> Vec<Chain> {
+    let flow = match &f.flow {
+        Some(fl) => fl,
+        None => return Vec::new(),
+    };
+    let ctx = FnCtx::build(f, engine.cat);
+    if ctx.source_seeds.is_empty() {
+        return Vec::new();
+    }
+    crate::trace_ev!(
+        engine.trace,
+        "seed",
+        &f.fqn,
+        "seed      fn={} vertices={:?}",
+        f.fqn,
+        ctx.source_seeds
+    );
+    let r = engine.propagate(f, &ctx, &ctx.source_seeds);
+    let repo = engine.prog.repo_of.get(iid).cloned().unwrap_or_default();
+
+    // vertex -> callsite id (for hop labelling)
+    let mut vcs: HashMap<u32, usize> = HashMap::new();
+    for v in &flow.vertices {
+        if v.kind == cgf::VertexKind::CallArgPort as i32
+            || v.kind == cgf::VertexKind::CallResultPort as i32
+        {
+            vcs.insert(v.id, v.callsite_id as usize);
+        }
+    }
+
+    let mut chains = Vec::new();
+    for sink in &r.sinks {
+        // backtrace vertex path sink.last -> seed via pred
+        let mut path = vec![sink.last];
+        let mut cur = sink.last;
+        let mut guard = 0;
+        while let Some(&p) = r.pred.get(&cur) {
+            path.push(p);
+            cur = p;
+            guard += 1;
+            if guard > 10_000 {
+                break;
+            }
+        }
+        path.reverse();
+
+        let mut hops = Vec::new();
+        let mut seen_cs = std::collections::HashSet::new();
+        // Product of per-site dispatch confidences over the source-fn call
+        // sites on the path (intra_chains labels hops in the source function
+        // only). 0.0 = unset (legacy CGF / proto3 default) => treat as 1.0.
+        let mut confidence: f32 = 1.0;
+        for &v in &path {
+            if let Some(&cs_idx) = vcs.get(&v) {
+                if seen_cs.insert(cs_idx) {
+                    let cs = &flow.callsites[cs_idx];
+                    if cs.dispatch_confidence > 0.0 {
+                        confidence *= cs.dispatch_confidence;
+                    }
+                    hops.push(Hop {
+                        repo: repo.clone(),
+                        func: f.fqn.clone(),
+                        detail: cs.callee_fqn.clone(),
+                        span: to_span(&cs.span),
+                        crossed_service_boundary: cs.kind
+                            == cgf::call_site::Kind::InvokesRemote as i32,
+                    });
+                }
+            }
+        }
+        crate::trace_ev!(
+            engine.trace,
+            "chain",
+            &f.fqn,
+            "chain     src={} sink={} hops={} conf={}",
+            f.fqn,
+            sink.class,
+            hops.len(),
+            confidence
+        );
+        let sink_field = flow.vertices.iter().find(|v| v.id == sink.last).and_then(|v| {
+            if v.field_path.is_empty() {
+                None
+            } else if v.field_names.len() == v.field_path.len() {
+                Some(v.field_names.join("."))
+            } else {
+                Some(
+                    v.field_path
+                        .iter()
+                        .map(|i| i.to_string())
+                        .collect::<Vec<_>>()
+                        .join("."),
+                )
+            }
+        });
+        // Full route. The target pins THIS sink instance: the (callsite,
+        // firing vertex) pin at the entry frame, and the terminal sink
+        // identity at every level below — so two same-class sinks under one
+        // call site (even two levels down) get two distinct routes.
+        let route = walk.route(
+            iid,
+            &ctx.source_seeds,
+            &sink.class,
+            Some(witness::SinkTarget {
+                at: Some((sink.callsite, sink.last)),
+                terminal: sink.terminal.clone(),
+            }),
+        );
+        // 0.0 = unset (legacy) => 1.0, same convention as the source-fn product.
+        let route_confidence = route
+            .hops
+            .iter()
+            .map(|h| h.confidence)
+            .filter(|c| *c > 0.0)
+            .fold(1.0f32, f32::min);
+        chains.push(Chain {
+            source_repo: repo.clone(),
+            source_fn: f.fqn.clone(),
+            sink_class: sink.class.clone(),
+            sink_span: to_span(&sink.span),
+            sink_field,
+            sink_fields: Vec::new(),
+            hops,
+            route: Some(route),
+            sanitized: false,
+            confidence,
+            route_confidence,
+            source_iid: iid.clone(),
+            source_callsite: sink.callsite,
+            sink_terminal: (sink.terminal.fn_iid.clone(), sink.terminal.callsite),
+            sink_last: sink.last,
+            backward: None,
+        });
+    }
+    chains
+}
+
 /// doc 35: run the sink-seeded backward confirmation over every reported chain
-/// and attach its verdict. With `prune`, refuted chains are dropped — the only
-/// place this pass ever removes a finding, and only behind its own flag.
+/// and attach its verdict. With `prune` (also `opts.prune`), refuted chains are
+/// dropped — the only place this pass ever removes a finding, and only behind
+/// its own flag.
+///
+/// Deliberately SEQUENTIAL at every thread count. A `Back` memoises walks per
+/// (function, demand) and (function, sink, terminal), and a memo entry's
+/// content depends on the DEPTH BUDGET left when it was first computed
+/// (`MAX_DEPTH`) — so a chain's verdict can depend on which chains ran before
+/// it in the same `Back`. Sharding chains over threads would change which
+/// sub-walk a fresh memo computes first, and 21 of broker-v1's 3007 chains
+/// flipped `exact` under a chunked `Back` (verdicts stable, but the JSON is
+/// not byte-stable). The memo wins are exactly what would be lost anyway.
 pub fn backward_check(
     engine: &Engine,
     chains: &mut Vec<Chain>,
-    prune: bool,
+    opts: crate::backward::BackOpts,
 ) -> crate::backward::BackStats {
     use crate::backward::{Back, BackStats, Verdict};
     let handlers = witness::contract_handlers(engine.prog);
-    let back = Back::new(engine, &handlers);
+    let back = Back::new(engine, &handlers, opts);
     let mut st = BackStats::default();
     for c in chains.iter_mut() {
         let r = back.check(&c.source_iid, &c.sink_class, c.source_callsite, c.route.as_ref());
@@ -384,7 +613,8 @@ pub fn backward_check(
         }
         c.backward = Some(r);
     }
-    if prune {
+    st.unview_flips = back.flips();
+    if opts.prune {
         let before = chains.len();
         chains.retain(|c| {
             c.backward
@@ -438,7 +668,7 @@ fn chain_key(c: &Chain) -> ChainKey {
 /// HashSet walk (ifds.rs:624) and Rust reseeds hashes per process, so a
 /// representative chosen by "first seen" would make the JSON differ run to run.
 /// `e2e-route.sh` gates exactly that.
-fn rep_rank(c: &Chain) -> (std::cmp::Reverse<usize>, String, Vec<String>, u32, usize) {
+fn rep_rank(c: &Chain) -> (std::cmp::Reverse<usize>, String, Vec<String>, u32, usize, String) {
     let f = c.sink_field.clone().unwrap_or_default();
     let depth = if f.is_empty() { 0 } else { f.split('.').count() };
     let hop_fields = c
@@ -457,7 +687,67 @@ fn rep_rank(c: &Chain) -> (std::cmp::Reverse<usize>, String, Vec<String>, u32, u
         hop_fields,
         c.confidence.to_bits(),
         c.hops.len(),
+        // Total-order tail. Everything above can still tie inside a dedupe
+        // group: chain_key carries route_id, which deliberately excludes hop
+        // `file`/`col`, and it says nothing about sink_span.col, the source-fn
+        // `hops` spans, route_confidence or the fingerprint. A tie used to fall
+        // to "first seen" — and the chains Vec's order follows the funcs
+        // HashMap's per-process iteration, so the surviving JSON differed run
+        // to run. Serialize the remaining content to make the choice a total
+        // order on the chain itself.
+        content_key(c),
     )
+}
+
+/// Canonical serialization of every Chain field the earlier rep_rank components
+/// do not cover. Any difference inside a dedupe group breaks the tie here.
+fn content_key(c: &Chain) -> String {
+    let span = |s: &Option<Span>| {
+        s.as_ref()
+            .map(|s| format!("{}/{}/{}", s.file, s.line, s.col))
+            .unwrap_or_default()
+    };
+    let mut k = String::with_capacity(256);
+    k.push_str(&span(&c.sink_span));
+    for h in &c.hops {
+        k.push('\u{1}');
+        k.push_str(&h.repo);
+        k.push('\u{1}');
+        k.push_str(&h.func);
+        k.push('\u{1}');
+        k.push_str(&h.detail);
+        k.push('\u{1}');
+        k.push_str(&span(&h.span));
+        k.push('\u{1}');
+        k.push_str(if h.crossed_service_boundary { "1" } else { "0" });
+    }
+    if let Some(r) = &c.route {
+        k.push('\u{2}');
+        k.push_str(&r.fingerprint);
+        k.push('\u{1}');
+        k.push_str(&format!("{:?}", r.incomplete));
+        for h in &r.hops {
+            k.push('\u{1}');
+            k.push_str(h.file.as_deref().unwrap_or(""));
+            k.push('\u{1}');
+            k.push_str(&h.line.unwrap_or(-1).to_string());
+            k.push('\u{1}');
+            k.push_str(&h.col.unwrap_or(-1).to_string());
+            k.push('\u{1}');
+            k.push_str(&h.field.clone().unwrap_or_default());
+        }
+    }
+    k.push('\u{2}');
+    k.push_str(&c.route_confidence.to_bits().to_string());
+    k.push('\u{1}');
+    k.push_str(&c.source_iid);
+    k.push('\u{1}');
+    k.push_str(&c.source_callsite.to_string());
+    k.push('\u{1}');
+    k.push_str(&format!("{:?}", c.sink_terminal));
+    k.push('\u{1}');
+    k.push_str(if c.sanitized { "1" } else { "0" });
+    k
 }
 
 fn dedupe(chains: Vec<Chain>) -> Vec<Chain> {
@@ -573,6 +863,7 @@ mod tests {
             source_iid: String::new(),
             source_callsite: 0,
             sink_terminal: (String::new(), 0),
+            sink_last: 0,
             backward: None,
         }
     }
