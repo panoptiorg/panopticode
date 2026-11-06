@@ -67,13 +67,10 @@ const MAX_DEPTH: usize = 64;
 
 /// Flag-gated behaviour for this pass.
 ///
-/// Held in a thread-local rather than threaded through `Back::new`, so that
-/// `report::backward_check`'s signature — and every one of its callers — is
-/// untouched by a flag that only this module reads. `Back::new` snapshots it
-/// once, so a walk never sees the options change under it. Thread-local and
-/// not a global because `Back` is single-threaded anyway (RefCell throughout)
-/// and the unit tests below would otherwise leak one test's flags into
-/// another's walk.
+/// Passed explicitly to `report::backward_check` / `Back::new` rather than
+/// held in a global: the pass stays a pure function of its inputs, and cargo
+/// runs the unit tests below on several threads, so a global would race them.
+/// `Back` snapshots it once, so a walk never sees the options change under it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct BackOpts {
     /// Cross a contract whose published view is NOT the handler's own frame
@@ -88,30 +85,6 @@ pub struct BackOpts {
     pub prune: bool,
     /// …unless this says unviewed refutations are trusted for pruning too.
     pub prune_unviewed: bool,
-}
-
-thread_local! {
-    static OPTS: Cell<BackOpts> = Cell::new(BackOpts { unview: false, prune: false, prune_unviewed: false });
-    /// chains whose verdict differs from the one the same walk would have
-    /// returned with `unview` off
-    static FLIPS: Cell<usize> = Cell::new(0);
-}
-
-/// Install the options for the next `report::backward_check` (same thread) and
-/// reset the flip counter.
-pub fn set_opts(o: BackOpts) {
-    OPTS.with(|c| c.set(o));
-    FLIPS.with(|c| c.set(0));
-}
-
-pub fn opts() -> BackOpts {
-    OPTS.with(|c| c.get())
-}
-
-/// How many chains the unview step moved off the verdict they would have got
-/// without it. Printed in the backward summary line.
-pub fn unview_flips() -> usize {
-    FLIPS.with(|c| c.get())
 }
 
 fn is_false(b: &bool) -> bool {
@@ -306,6 +279,9 @@ pub struct BackStats {
     /// confirmed chains whose route terminal is refuted: real finding, wrong
     /// route label
     pub mislabelled: usize,
+    /// chains whose verdict the unview step moved off the one the same walk
+    /// would return without it (the old module-level `unview_flips()`)
+    pub unview_flips: usize,
 }
 
 /// A field path with optional reporting names (`names.len() == ids.len()` or
@@ -544,13 +520,17 @@ pub struct Back<'a, 'e> {
     flow_memo: RefCell<HashMap<(IidHex, String), Rc<FlowSum>>>,
     sink_memo: RefCell<HashMap<(IidHex, String, Option<Terminal>), Rc<SinkSum>>>,
     in_progress: RefCell<HashSet<String>>,
-    /// snapshot of the thread-local flags, taken once so a walk cannot see
-    /// them change (and so the memo tables stay coherent with them)
+    /// flag-gated behaviour, snapshotted at construction so a walk never sees
+    /// the options change under it (and so the memo tables stay coherent)
     opts: BackOpts,
+    /// chains whose verdict differs from the one the same walk would have
+    /// returned with `unview` off — summed across workers into
+    /// `BackStats::unview_flips`
+    flips: Cell<usize>,
 }
 
 impl<'a, 'e> Back<'a, 'e> {
-    pub fn new(engine: &'a Engine<'e>, handlers: &'a ContractHandlers) -> Self {
+    pub fn new(engine: &'a Engine<'e>, handlers: &'a ContractHandlers, opts: BackOpts) -> Self {
         Back {
             engine,
             handlers,
@@ -558,8 +538,15 @@ impl<'a, 'e> Back<'a, 'e> {
             flow_memo: RefCell::new(HashMap::new()),
             sink_memo: RefCell::new(HashMap::new()),
             in_progress: RefCell::new(HashSet::new()),
-            opts: opts(),
+            opts,
+            flips: Cell::new(0),
         }
+    }
+
+    /// How many chains the unview step moved off the verdict they would have
+    /// got without it. Printed in the backward summary line.
+    pub fn flips(&self) -> usize {
+        self.flips.get()
     }
 
     fn ctx(&self, iid: &IidHex) -> Option<Rc<BCtx<'e>>> {
@@ -633,7 +620,7 @@ impl<'a, 'e> Back<'a, 'e> {
             Verdict::Refuted
         };
         if v_off != v_any {
-            FLIPS.with(|c| c.set(c.get() + 1));
+            self.flips.set(self.flips.get() + 1);
         }
         // Doc 35 §safety, restated for the unview step: a wrong unview yields a
         // wrong REFUTATION, and under --backward-prune a refutation deletes a
@@ -818,14 +805,29 @@ impl<'a, 'e> Back<'a, 'e> {
                 // without --backward-unview there is no unview step here, so
                 // the crossing is reported incomplete rather than followed
                 // into the wrong slot — the pre-flag behaviour, byte for byte.
-                let (target, shape) = match self.handlers.get(&h) {
-                    Some((hh, sh)) => (hh.clone(), Some(sh.clone())),
-                    None => (h.clone(), None),
+                let (target, shape, contested) = match self.handlers.get(&h) {
+                    Some(hs) => {
+                        // One contract name can have several local handlers
+                        // (the ContractIID is the name alone) and compose
+                        // publishes the UNION of their views; a single-frame
+                        // walk can explore only one. The pinned terminal names
+                        // the frame the chain ended in — descend that handler.
+                        // Without a terminal match the walk is incomplete: what
+                        // it finds may confirm, never refute.
+                        let pinned = term.and_then(|t| hs.iter().find(|(hh, _)| *hh == t.fn_iid));
+                        let contested = pinned.is_none() && hs.len() > 1;
+                        let (hh, sh) = pinned.unwrap_or(&hs[0]);
+                        (hh.clone(), Some(sh.clone()), contested)
+                    }
+                    None => (h.clone(), None, false),
                 };
                 let remapped = shape.as_ref().map_or(false, |sh| !sh.is_identity());
                 if remapped && !self.opts.unview {
                     fo.incomplete = true;
                     continue;
+                }
+                if contested {
+                    fo.incomplete = true;
                 }
                 let has_body = self
                     .engine
@@ -1053,14 +1055,26 @@ impl<'a, 'e> Back<'a, 'e> {
             // out-slot goes client -> handler on the way down
             // (`unview_out_slot`), the demands that come back go handler ->
             // client (`view_slot`, in `land_viewed`).
-            let (target, shape) = match self.handlers.get(&h) {
-                Some((hh, sh)) => (hh.clone(), Some(sh.clone())),
-                None => (h.clone(), None),
+            let (target, shape, contested) = match self.handlers.get(&h) {
+                Some(hs) => {
+                    // see back_sink: a contested contract name has several
+                    // local handlers and the published view is their union.
+                    // A flow demand carries no pinned terminal, so only the
+                    // first handler is walked and the result may confirm,
+                    // never refute.
+                    let contested = hs.len() > 1;
+                    let (hh, sh) = &hs[0];
+                    (hh.clone(), Some(sh.clone()), contested)
+                }
+                None => (h.clone(), None, false),
             };
             let remapped = shape.as_ref().map_or(false, |sh| !sh.is_identity());
             if remapped && !self.opts.unview {
                 fo.incomplete = true;
                 continue;
+            }
+            if contested {
+                fo.incomplete = true;
             }
             let has_body = self
                 .engine
@@ -1446,14 +1460,13 @@ mod tests {
     }
 
     fn run(leaf_reads: (u32, &str)) -> (crate::backward::BackStats, Vec<crate::report::Chain>) {
-        set_opts(BackOpts::default());
         let cat = Catalog::load_str(CAT).unwrap();
         let prog = program(leaf_reads);
         let mut eng = Engine::new(&prog, &cat);
         eng.run();
-        let mut chains = crate::report::intra_chains(&eng, None);
+        let mut chains = crate::report::intra_chains(&eng, None, false);
         assert_eq!(chains.len(), 1, "forward widening reports the chain in both cases");
-        let st = crate::report::backward_check(&eng, &mut chains, false);
+        let st = crate::report::backward_check(&eng, &mut chains, BackOpts::default());
         (st, chains)
     }
 
@@ -1506,18 +1519,17 @@ mod tests {
             prog.repo_of.insert(h.clone(), "test".into());
             prog.funcs.insert(h, f);
         }
-        set_opts(BackOpts::default());
         let cat = Catalog::load_str(CAT).unwrap();
         let mut eng = Engine::new(&prog, &cat);
         eng.run();
-        let mut chains = crate::report::intra_chains(&eng, None);
+        let mut chains = crate::report::intra_chains(&eng, None, false);
         assert_eq!(chains.len(), 2, "two terminals below one call site = two chains");
         // distinct routes: each chain ends at its own sink instance
         let r0 = chains[0].route.as_ref().unwrap();
         let r1 = chains[1].route.as_ref().unwrap();
         assert_ne!(r0.id, r1.id, "each terminal gets its own route");
         assert_ne!(r0.terminal, r1.terminal, "distinct terminals");
-        let st = crate::report::backward_check(&eng, &mut chains, false);
+        let st = crate::report::backward_check(&eng, &mut chains, BackOpts::default());
         // each chain names only its own terminal's field, and both fields are
         // covered across the two chains
         let mut tfs: Vec<Vec<String>> = chains
@@ -1587,11 +1599,10 @@ mod tests {
             prog.repo_of.insert(h.clone(), "test".into());
             prog.funcs.insert(h, f);
         }
-        set_opts(BackOpts::default());
         let cat = Catalog::load_str(CAT).unwrap();
         let mut eng = Engine::new(&prog, &cat);
         eng.run();
-        let mut chains = crate::report::intra_chains(&eng, None);
+        let mut chains = crate::report::intra_chains(&eng, None, false);
         assert_eq!(chains.len(), 2, "both terminals reported, two levels down");
         let terms: Vec<_> = chains
             .iter()
@@ -1604,7 +1615,7 @@ mod tests {
             terms.contains(&(leaf2.clone(), 1)) && terms.contains(&(leaf3, 0)),
             "terminals are the leaf sinks, not the intermediate call sites: {terms:?}"
         );
-        let st = crate::report::backward_check(&eng, &mut chains, false);
+        let st = crate::report::backward_check(&eng, &mut chains, BackOpts::default());
         let mut tfs: Vec<Vec<String>> = chains
             .iter()
             .map(|c| c.backward.as_ref().unwrap().terminal_fields.clone())
@@ -1645,11 +1656,10 @@ mod tests {
             prog.repo_of.insert(h.clone(), "test".into());
             prog.funcs.insert(h, f);
         }
-        set_opts(BackOpts::default());
         let cat = Catalog::load_str(CAT).unwrap();
         let mut eng = Engine::new(&prog, &cat);
         eng.run();
-        let mut chains = crate::report::intra_chains(&eng, None);
+        let mut chains = crate::report::intra_chains(&eng, None, false);
         assert_eq!(
             chains.len(), 2,
             "direct row + composed row below one call site = two chains, not one"
@@ -1677,7 +1687,7 @@ mod tests {
             (3, "db.Exec", crate::witness::HopKind::Sink),
             "{hops:?}"
         );
-        let st = crate::report::backward_check(&eng, &mut chains, false);
+        let st = crate::report::backward_check(&eng, &mut chains, BackOpts::default());
         assert_eq!((st.confirmed, st.refuted, st.undecided), (2, 0, 0));
     }
 
@@ -1698,7 +1708,6 @@ mod tests {
         let h = hexid(&s.id.as_ref().unwrap().iid);
         prog.repo_of.insert(h.clone(), "test".into());
         prog.funcs.insert(h, s);
-        set_opts(BackOpts::default());
         let cat = Catalog::load_str(CAT).unwrap();
         let mut eng = Engine::new(&prog, &cat);
         eng.run();
@@ -1707,7 +1716,7 @@ mod tests {
         // never descend into it.
         eng.summaries.insert(
             hexid(&[2; 32]),
-            crate::ifds::Summary {
+            std::sync::Arc::new(crate::ifds::Summary {
                 flows: HashSet::new(),
                 sink_hits: vec![
                     crate::ifds::SinkHit {
@@ -1734,9 +1743,9 @@ mod tests {
                     },
                 ],
                 confidence: 1.0,
-            },
+            }),
         );
-        let chains = crate::report::intra_chains(&eng, None);
+        let chains = crate::report::intra_chains(&eng, None, false);
         assert_eq!(chains.len(), 2, "two terminals = two chains even when no route rebuilds");
         let r0 = chains[0].route.as_ref().unwrap();
         let r1 = chains[1].route.as_ref().unwrap();
@@ -1798,13 +1807,12 @@ mod tests {
             prog.repo_of.insert(h.clone(), "test".into());
             prog.funcs.insert(h, f);
         }
-        set_opts(BackOpts::default());
         let cat = Catalog::load_str(CAT).unwrap();
         let mut eng = Engine::new(&prog, &cat);
         eng.run();
-        let mut chains = crate::report::intra_chains(&eng, None);
+        let mut chains = crate::report::intra_chains(&eng, None, false);
         assert_eq!(chains.len(), 1, "forward finds the chain through the leaf");
-        let st = crate::report::backward_check(&eng, &mut chains, false);
+        let st = crate::report::backward_check(&eng, &mut chains, BackOpts::default());
         let b = chains[0].backward.as_ref().unwrap();
         assert_eq!(b.verdict, Verdict::Confirmed, "{b:?}");
         assert_eq!((st.refuted, st.confirmed), (0, 1));
@@ -1899,11 +1907,10 @@ mod tests {
         .unwrap();
         let mut eng = Engine::new(&prog, &cat);
         eng.run();
-        let sites: Vec<usize> = eng.summaries[&h].sink_hits.iter().map(|x| x.callsite).collect();
+        let sites: Vec<usize> = eng.summaries.get(&h).unwrap().sink_hits.iter().map(|x| x.callsite).collect();
         assert_eq!(sites, vec![1], "forward: only the req sink");
-        set_opts(BackOpts::default());
         let handlers = crate::witness::ContractHandlers::new();
-        let back = Back::new(&eng, &handlers);
+        let back = Back::new(&eng, &handlers, BackOpts::default());
         let req = back.top_frame(&h, "sqli", 1, None);
         assert!(!req.seeds.is_empty(), "the req sink meets the seed along the write-back");
         let err = back.top_frame(&h, "sqli", 2, None);
@@ -2074,15 +2081,14 @@ mod tests {
     }
 
     fn run_gql(leaf_reads: (u32, &str), o: BackOpts) -> (crate::backward::BackStats, Vec<crate::report::Chain>) {
-        set_opts(o);
         let cat = Catalog::load_str(CAT).unwrap();
         let prog = program_gql(leaf_reads);
         let mut eng = Engine::new(&prog, &cat);
         eng.run();
         crate::compose::fixpoint(&mut eng);
-        let mut chains = crate::report::intra_chains(&eng, None);
+        let mut chains = crate::report::intra_chains(&eng, None, false);
         assert_eq!(chains.len(), 1, "forward widening reports the cross-contract chain either way");
-        let st = crate::report::backward_check(&eng, &mut chains, o.prune);
+        let st = crate::report::backward_check(&eng, &mut chains, o);
         (st, chains)
     }
 
@@ -2094,7 +2100,7 @@ mod tests {
             assert_eq!(b.verdict, Verdict::Undecided, "{leaf:?}: {b:?}");
             assert!(!b.unviewed, "no crossing happened: {b:?}");
             assert_eq!(st.undecided, 1);
-            assert_eq!(unview_flips(), 0);
+            assert_eq!(st.unview_flips, 0);
         }
     }
 
@@ -2106,7 +2112,7 @@ mod tests {
         assert!(b.unviewed, "the verdict rests on an unviewed crossing: {b:?}");
         assert_eq!(b.source_fields, vec!["Amount".to_string()]);
         assert_eq!((st.confirmed, st.refuted, st.undecided), (1, 0, 0));
-        assert_eq!(unview_flips(), 1, "undecided -> confirmed is a flip");
+        assert_eq!(st.unview_flips, 1, "undecided -> confirmed is a flip");
     }
 
     #[test]
@@ -2116,7 +2122,7 @@ mod tests {
         assert_eq!(b.verdict, Verdict::Refuted, "{b:?}");
         assert!(b.unviewed);
         assert_eq!((st.confirmed, st.refuted, st.undecided), (0, 1, 0));
-        assert_eq!(unview_flips(), 1);
+        assert_eq!(st.unview_flips, 1);
     }
 
     #[test]
@@ -2138,13 +2144,12 @@ mod tests {
 
     #[test]
     fn prune_drops_only_refuted_chains() {
-        set_opts(BackOpts::default());
         let cat = Catalog::load_str(CAT).unwrap();
         let prog = program((2, "ClientId"));
         let mut eng = Engine::new(&prog, &cat);
         eng.run();
-        let mut chains = crate::report::intra_chains(&eng, None);
-        let st = crate::report::backward_check(&eng, &mut chains, true);
+        let mut chains = crate::report::intra_chains(&eng, None, false);
+        let st = crate::report::backward_check(&eng, &mut chains, BackOpts { prune: true, ..Default::default() });
         assert_eq!(st.pruned, 1);
         assert!(chains.is_empty());
     }
@@ -2225,7 +2230,7 @@ to   = "receiver"
         let prog = handler_prog();
         let mut eng = Engine::new(&prog, &cat);
         eng.run();
-        let mut chains = crate::report::intra_chains(&eng, None);
+        let mut chains = crate::report::intra_chains(&eng, None, false);
         assert_eq!(chains.len(), 1, "forward: the propagator carries req into the SQL sink");
         let route = chains[0].route.as_ref().expect("route");
         assert!(route.incomplete.is_none(), "route must reach the sink: {:?}", route.incomplete);
@@ -2233,7 +2238,7 @@ to   = "receiver"
             route.hops.iter().any(|h| h.callee.ends_with("WriteString")),
             "the propagator call is a visible hop"
         );
-        let st = crate::report::backward_check(&eng, &mut chains, true);
+        let st = crate::report::backward_check(&eng, &mut chains, BackOpts { prune: true, ..Default::default() });
         let b = chains.first().and_then(|c| c.backward.as_ref()).expect("chain kept, with a verdict");
         assert_eq!(b.verdict, Verdict::Confirmed, "{b:?}");
         assert_eq!(st.pruned, 0, "--backward-prune must not drop a propagator chain");
@@ -2250,7 +2255,7 @@ to   = "receiver"
         let mut eng = Engine::new(&prog, &cat);
         eng.report_unmodeled = true;
         eng.run();
-        let mut chains = crate::report::intra_chains(&eng, None);
+        let mut chains = crate::report::intra_chains(&eng, None, false);
         assert_eq!(chains.len(), 1);
         let r = chains[0].route.as_ref().expect("route");
         assert!(r.incomplete.is_none(), "witness must end the route at the unmodeled call: {:?}", r.incomplete);

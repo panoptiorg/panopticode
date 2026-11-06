@@ -20,6 +20,8 @@ mod backward;
 mod storage;
 mod query;
 mod cli;
+mod phase;
+mod shard;
 
 fn main() -> anyhow::Result<()> {
     cli::run()

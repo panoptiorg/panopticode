@@ -28,7 +28,7 @@ use crate::compose::ContractShape;
 use crate::graph::{hexid, IidHex, Program};
 use crate::ifds::{
     arg_to_callee_slot, compose_path, residual_after, slot_compat, slot_str, stream_of, Engine,
-    FnCtx, PropResult, Slot, SlotP,
+    FnCtx, PropResult, PropSink, SinkOrigin, Slot, SlotP,
 };
 use crate::proto::cgf;
 use serde::Serialize;
@@ -36,21 +36,29 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
-/// contract iid -> (handler iid, contract shape).
+/// contract iid -> EVERY local (handler iid, contract shape) pair, sorted by
+/// handler iid.
 ///
-/// The inverse of the `handler_of` map compose::fixpoint_with_leaves builds
+/// The inverse of the `handlers_of` map compose::fixpoint_with_leaves builds
 /// internally (compose.rs). Rebuilt here from the packages rather than
 /// threaded out of compose, so witness reconstruction stays independent of the
 /// composer's internals — but from the SAME enumeration (`graph::contracts`),
 /// so the two agree on every key. Covers gRPC methods, GraphQL fields and HTTP
 /// routes alike — the descent has to undo whichever view compose published.
-pub type ContractHandlers = HashMap<IidHex, (IidHex, ContractShape)>;
+/// A contract may have several handlers (the ContractIID is the name alone,
+/// so several repos can define it, and compose publishes the UNION of their
+/// views); the descent picks among them with `pick_handler`.
+pub type ContractHandlers = HashMap<IidHex, Vec<(IidHex, ContractShape)>>;
 
 pub fn contract_handlers(prog: &Program) -> ContractHandlers {
-    crate::graph::contracts(prog)
-        .into_iter()
-        .map(|c| (c.key, (c.handler, c.shape)))
-        .collect()
+    let mut out: ContractHandlers = HashMap::new();
+    for c in crate::graph::contracts(prog) {
+        out.entry(c.key).or_default().push((c.handler, c.shape));
+    }
+    for hs in out.values_mut() {
+        hs.sort_by(|a, b| a.0.cmp(&b.0));
+    }
+    out
 }
 
 #[derive(Serialize, Clone, Copy, PartialEq, Eq, Debug)]
@@ -251,6 +259,9 @@ pub struct Walk<'a, 'e> {
     /// hits in practice and makes the memo provably route-identical.
     props: RefCell<HashMap<(IidHex, String), Rc<PropResult>>>,
     stats: Cell<WalkStats>,
+    /// emit the Drop `route-stats` line (false for the parallel chains phase,
+    /// which sums the per-Walk stats into one line)
+    report: bool,
     /// HTTP contract key -> how its crossing renders (`http GET /x/{id} (chi)`).
     /// The client site's own `callee_fqn` is its TEMPLATE, which after a suffix
     /// or fan-out link is not the route the descent actually enters
@@ -269,11 +280,59 @@ impl<'a, 'e> Walk<'a, 'e> {
             ctxs: RefCell::new(HashMap::new()),
             props: RefCell::new(HashMap::new()),
             stats: Cell::new(WalkStats::default()),
+            report: true,
             http_labels: crate::graph::contracts(engine.prog)
                 .into_iter()
                 .filter_map(|c| Some((c.key, c.http?.label)))
                 .collect(),
         }
+    }
+
+    /// Suppress the Drop `route-stats` line (`report::intra_chains` prints one
+    /// summed line for all of its parallel chunk walks instead).
+    pub(crate) fn quiet(&mut self) {
+        self.report = false;
+    }
+
+    /// Which of a contract's handlers a boundary descent re-enters. Compose
+    /// publishes the UNION of every handler's view (compose `merged_view`), so
+    /// the matched sink may sit in any of them. Content decides, in order:
+    ///
+    /// 1. the handler whose frame the sink_hit's terminal names — the terminal
+    ///    is the function the composed chain ended in, which for a sink in a
+    ///    handler's own body is that handler;
+    /// 2. else a handler whose own summary carries a `class` row for the
+    ///    un-viewed in-slot — the frame the fact actually fits;
+    /// 3. else the lexicographically first handler — a total order on content,
+    ///    never on load or map iteration order.
+    fn pick_handler(
+        &self,
+        hs: &[(IidHex, ContractShape)],
+        callee_in: &SlotP,
+        class: &str,
+        term: &SinkOrigin,
+    ) -> (IidHex, ContractShape) {
+        hs.iter()
+            .min_by_key(|(h, shape)| {
+                let target = self.unview_for(callee_in, shape, h, class);
+                let slot_ok = self
+                    .engine
+                    .summaries
+                    .get(h)
+                    .map(|sum| {
+                        sum.sink_hits
+                            .iter()
+                            .any(|sh| sh.class == class && slot_compat(&sh.in_slot, &target))
+                    })
+                    .unwrap_or(false);
+                (
+                    *h != term.fn_iid,
+                    !slot_ok,
+                    h.clone(),
+                )
+            })
+            .map(|(h, shape)| (h.clone(), shape.clone()))
+            .expect("handler vec is never empty")
     }
 
     /// `unview_slot`, except that an HTTP view folded SEVERAL handler params
@@ -293,11 +352,6 @@ impl<'a, 'e> Walk<'a, 'e> {
             }
         }
         unview_slot(s, shape)
-    }
-
-    /// Routes that fell back to the widened fact — see `Walk::widened`.
-    pub fn widened_routes(&self) -> usize {
-        self.widened.get()
     }
 
     /// Cost/reach counters for this walk.
@@ -481,7 +535,11 @@ impl<'a, 'e> Walk<'a, 'e> {
         // With a target, only rows whose TERMINAL matches can produce the
         // chain the caller asked for; the (callsite, last) pin — entry level
         // only — disambiguates among rows sharing a terminal, else the lowest
-        // (callsite, last) wins. Without a target, the old deterministic pick.
+        // (callsite, last, terminal) wins. Without a target, the same total
+        // order. Terminal is part of the key because two PropSinks can share
+        // (callsite, last) yet name different sink origins (two sinks at one
+        // call, or the same call reached via different contracts) — leaving
+        // the tie to input order made the chosen hop chain unstable.
         let Some(ps) = (match &target {
             Some(t) => {
                 let matching = || {
@@ -491,16 +549,17 @@ impl<'a, 'e> Walk<'a, 'e> {
                 };
                 match t.at {
                     Some((cs, last)) => matching()
-                        .find(|s| s.callsite == cs && s.last == last)
-                        .or_else(|| matching().min_by_key(|s| (s.callsite, s.last))),
-                    None => matching().min_by_key(|s| (s.callsite, s.last)),
+                        .filter(|s| s.callsite == cs && s.last == last)
+                        .min_by_key(|s| sink_pick_key(s))
+                        .or_else(|| matching().min_by_key(|s| sink_pick_key(s))),
+                    None => matching().min_by_key(|s| sink_pick_key(s)),
                 }
             }
             None => r
                 .sinks
                 .iter()
                 .filter(|s| s.class == class)
-                .min_by_key(|s| (s.callsite, s.last)),
+                .min_by_key(|s| sink_pick_key(s)),
         }) else {
             return Some(Incomplete::NotReproduced);
         };
@@ -769,12 +828,17 @@ impl<'a, 'e> Walk<'a, 'e> {
                 });
 
                 // Resolve the descent target. At a boundary the callee iid IS
-                // the contract iid (compose aliased the handler's summary onto
-                // it), so we hop to the handler and undo contract_view's slot
+                // the contract iid (compose aliased the handlers' summary onto
+                // it), so we hop to a handler and undo contract_view's slot
                 // remap.
                 let (target_iid, target_slot) = if boundary {
                     match self.handlers.get(&callee_iid) {
-                        Some((h, shape)) => (h.clone(), self.unview_for(&callee_in, shape, h, class)),
+                        Some(hs) => {
+                            let (h, shape) =
+                                self.pick_handler(hs, &callee_in, class, &cand_term);
+                            let target_slot = self.unview_for(&callee_in, &shape, &h, class);
+                            (h, target_slot)
+                        }
                         // No local handler: the summary came from a PG leaf, so
                         // the route legitimately ends at the boundary in THIS
                         // analysis.
@@ -925,9 +989,13 @@ impl<'a, 'e> Walk<'a, 'e> {
 /// Emitted from `Drop` because the counters are only final once every route of
 /// the walk has been built, and a `Walk` is created once per reporting pass.
 /// Silent when the walk did nothing (no routes, e.g. the unit tests that only
-/// exercise helpers).
+/// exercise helpers), and when `quiet()` was set — the parallel chains phase
+/// builds one Walk per worker chunk and prints ONE summed line instead.
 impl Drop for Walk<'_, '_> {
     fn drop(&mut self) {
+        if !self.report {
+            return;
+        }
         let s = self.stats();
         if s.ctx_builds == 0 && s.ctx_hits == 0 {
             return;
@@ -949,6 +1017,38 @@ impl Drop for Walk<'_, '_> {
 /// `Span.col`, None when unset (0).
 fn col_of(s: Option<&cgf::Span>) -> Option<i32> {
     s.map(|s| s.col).filter(|c| *c > 0)
+}
+
+/// Total order on PropSink candidates for the deterministic pick. Two rows can
+/// share (callsite, last) but name different terminals (two sinks at one call,
+/// or the same call reached through different contracts); breaking the tie on
+/// the terminal keeps the pick independent of the sinks Vec's order. The span
+/// and via_heap tails extend the key over the remaining PropSink fields, so
+/// rows that tie all the way down are fully interchangeable and no input-order
+/// dependence can survive: min_by_key only falls back to Vec order on a tie.
+fn sink_pick_key(
+    s: &PropSink,
+) -> (
+    usize,
+    u32,
+    SinkOrigin,
+    Option<(String, i32, i32)>,
+    Option<(String, IidHex, String, Vec<u32>)>,
+) {
+    (
+        s.callsite,
+        s.last,
+        s.terminal.clone(),
+        s.span.as_ref().map(|sp| (sp.file.clone(), sp.line, sp.col)),
+        s.via_heap.as_ref().map(|h| {
+            (
+                h.cell.clone(),
+                h.reader.clone(),
+                slot_str(&h.reader_slot),
+                h.reader_slot.path.clone(),
+            )
+        }),
+    )
 }
 
 fn is_boundary(cs: &cgf::CallSite) -> bool {
@@ -1365,7 +1465,7 @@ arg = "any"
         // 0x11 has a summary but no body (cross-repo / stored summary).
         eng.summaries.insert(
             iid(0x11),
-            Summary {
+            std::sync::Arc::new(Summary {
                 flows: HashSet::new(),
                 sink_hits: vec![SinkHit {
                     in_slot: Slot::Param(0).into(),
@@ -1376,7 +1476,7 @@ arg = "any"
                     terminal: crate::ifds::SinkOrigin { fn_iid: iid(0x22), callsite: 0 },
                 }],
                 confidence: 1.0,
-            },
+            }),
         );
         let handlers = ContractHandlers::new();
         let w = Walk::new(&eng, &handlers);
@@ -1641,9 +1741,50 @@ mod tests {
         };
         let h = contract_handlers(&prog);
         assert_eq!(h.len(), 1, "handler-less contracts must be skipped");
-        let (handler, shape) = h.get(&hexid(&[0xC1; 32])).unwrap();
-        assert_eq!(*handler, hexid(&[0x1A; 32]));
-        assert_eq!(*shape, ContractShape::Grpc(false, true));
+        let hs = h.get(&hexid(&[0xC1; 32])).unwrap();
+        assert_eq!(hs.len(), 1);
+        assert_eq!(hs[0].0, hexid(&[0x1A; 32]));
+        assert_eq!(hs[0].1, ContractShape::Grpc(false, true));
+    }
+
+    /// Two repos defining the same contract name (the ContractIID is the name
+    /// alone) both land in the vec, sorted by handler iid — the descent's pick
+    /// among them must see every candidate, not whichever was indexed last.
+    #[test]
+    fn contract_handlers_keeps_every_handler_of_a_shared_name() {
+        let prog = Program {
+            funcs: HashMap::new(),
+            repo_of: HashMap::new(),
+            packages: vec![
+                cgf::CgfPackage {
+                    graphql_fields: vec![cgf::GraphqlField {
+                        iid: vec![0xC3; 32],
+                        type_field: "Query.searchByToken".into(),
+                        resolver_iid: vec![0x2B; 32],
+                        args: vec![cgf::GraphqlArg { name: "token".into(), param_idx: 1 }],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+                cgf::CgfPackage {
+                    graphql_fields: vec![cgf::GraphqlField {
+                        iid: vec![0xC3; 32],
+                        type_field: "Query.searchByToken".into(),
+                        resolver_iid: vec![0x11; 32],
+                        args: vec![cgf::GraphqlArg { name: "token".into(), param_idx: 2 }],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            ],
+        };
+        let h = contract_handlers(&prog);
+        let hs = h.get(&hexid(&[0xC3; 32])).unwrap();
+        assert_eq!(hs.len(), 2, "both repos' resolvers are candidates");
+        assert_eq!(hs[0].0, hexid(&[0x11; 32]), "sorted by handler iid");
+        assert_eq!(hs[0].1, ContractShape::Graphql(vec![2]));
+        assert_eq!(hs[1].0, hexid(&[0x2B; 32]));
+        assert_eq!(hs[1].1, ContractShape::Graphql(vec![1]));
     }
 
     // --- GraphQL contracts (doc 36 §3.2)
@@ -1674,9 +1815,10 @@ mod tests {
         };
         let h = contract_handlers(&prog);
         assert_eq!(h.len(), 1, "resolver-less fields must be skipped");
-        let (handler, shape) = h.get(&hexid(&[0xC3; 32])).unwrap();
-        assert_eq!(*handler, hexid(&[0x2B; 32]));
-        assert_eq!(*shape, ContractShape::Graphql(vec![1]));
+        let hs = h.get(&hexid(&[0xC3; 32])).unwrap();
+        assert_eq!(hs.len(), 1);
+        assert_eq!(hs[0].0, hexid(&[0x2B; 32]));
+        assert_eq!(hs[0].1, ContractShape::Graphql(vec![1]));
     }
 
     /// The client's arg port j must land on the resolver's real param, not on

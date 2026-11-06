@@ -136,6 +136,25 @@ enum Cmd {
         /// List every inert catalog rule instead of counting them.
         #[arg(short, long)]
         verbose: bool,
+        /// Thread budget for the parallel phases (load decode, summaries,
+        /// chains). 0 = all available cores. Default 1, or
+        /// PANOPTICODE_THREADS when the flag is absent. Output is
+        /// byte-identical at any value.
+        #[arg(long)]
+        threads: Option<u32>,
+        /// Debug: after the summaries phase, recompute every summary
+        /// sequentially in SCC order and compare with the parallel result;
+        /// report the number of differences on stderr. Costs one extra
+        /// sequential pass. Hidden — diagnostics for the parallel scheduler.
+        #[arg(long, hide = true)]
+        verify_summaries: bool,
+        /// Debug: after the chains phase, recompute every chain's route with a
+        /// fresh Walk (cold memos) and compare with the shared-Walk route;
+        /// report the number of differences on stderr with up to 8 examples.
+        /// Catches a memo that serves a visit-context-dependent value. Hidden —
+        /// diagnostics for the parallel scheduler.
+        #[arg(long, hide = true)]
+        verify_routes: bool,
     },
     /// Dump the loaded function/contract counts.
     GraphDump {
@@ -151,6 +170,9 @@ enum Cmd {
         catalog: Option<PathBuf>,
         #[arg(long)]
         fn_: String,
+        /// Thread budget (see `taint --threads`).
+        #[arg(long)]
+        threads: Option<u32>,
     },
     /// MR impact report: re-extract repo at head (pc-fe --mode mr), reuse the
     /// summary store for unchanged fns, emit ImpactReport JSON.
@@ -188,6 +210,9 @@ enum Cmd {
         /// (makes --cgf of other repos optional) + PG-walked blast radius
         #[arg(long)]
         pg: Option<String>,
+        /// Thread budget (see `taint --threads`).
+        #[arg(long)]
+        threads: Option<u32>,
     },
     /// Pure Postgres graph reads (no extraction, no taint) over a graph
     /// persisted by a prior `taint --pg` run.
@@ -275,6 +300,9 @@ pub fn run() -> Result<()> {
             format,
             fail_on,
             verbose,
+            threads,
+            verify_summaries,
+            verify_routes,
         } => taint(
             &cgf,
             catalog.as_deref(),
@@ -295,9 +323,14 @@ pub fn run() -> Result<()> {
             },
             unmodeled.as_deref(),
             Output { format, fail_on, verbose },
+            threads,
+            verify_summaries,
+            verify_routes,
         ),
         Cmd::GraphDump { cgf } => graph_dump(&cgf),
-        Cmd::Summary { cgf, catalog, fn_ } => summary_dbg(&cgf, catalog.as_deref(), &fn_),
+        Cmd::Summary { cgf, catalog, fn_, threads } => {
+            summary_dbg(&cgf, catalog.as_deref(), &fn_, threads)
+        }
         Cmd::Impact {
             repo,
             scope,
@@ -310,6 +343,7 @@ pub fn run() -> Result<()> {
             fe,
             fe_arg,
             pg,
+            threads,
         } => crate::impact::impact(
             &repo,
             scope.as_deref(),
@@ -322,6 +356,7 @@ pub fn run() -> Result<()> {
             &fe,
             &fe_arg,
             pg.as_deref(),
+            threads,
         ),
         Cmd::Query { q } => match q {
             QueryCmd::Blast { pg, repo, files } => crate::query::blast(&pg, &repo, &files),
@@ -349,6 +384,25 @@ pub(crate) fn fe_err(fe: &str, e: std::io::Error) -> anyhow::Error {
     }
 }
 
+/// Resolve the thread budget and build the ONE global rayon pool every
+/// parallel phase (load decode, summaries, chains) shares. `--threads` wins;
+/// absent it, PANOPTICODE_THREADS; default 1. 0 = all available cores
+/// (rayon's default). A second build_global call panics, so each subcommand
+/// calls this exactly once, before any phase runs.
+pub(crate) fn init_threads(flag: Option<u32>) {
+    let n = flag
+        .or_else(|| {
+            std::env::var("PANOPTICODE_THREADS")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+        })
+        .unwrap_or(1);
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(n as usize)
+        .build_global()
+        .expect("build the global rayon thread pool");
+}
+
 fn extract(fe: &str, repo: &str, scope: Option<&str>, mode: &str, out: &PathBuf) -> Result<()> {
     let mut cmd = Command::new(fe);
     cmd.arg("build").arg(repo).arg("--out").arg(out).arg("--mode").arg(mode);
@@ -368,12 +422,21 @@ fn load(cgf: &[PathBuf], http_link: bool) -> Result<Program> {
         repo_of: Default::default(),
         packages: Default::default(),
     };
+    let mut dups = crate::graph::DupStats::default();
     for dir in cgf {
-        let p = Program::load_dir(dir)?;
-        prog.funcs.extend(p.funcs);
-        prog.repo_of.extend(p.repo_of);
+        let p = Program::load_dir_with_dups(dir, &mut dups)?;
+        // Cross-dir duplicate iids go through the same merge rule as
+        // within-dir ones: identical copies keep one, differing copies pick a
+        // content-order winner (not "last --cgf dir wins").
+        for (h, f) in p.funcs {
+            let repo = p.repo_of.get(&h).cloned().unwrap_or_default();
+            crate::graph::merge_function(&mut prog, h, f, repo, &mut dups);
+        }
         prog.packages.extend(p.packages);
     }
+    // Duplicate contract iids: counted and reported, semantics unchanged.
+    crate::graph::contract_duplicates(&prog, &mut dups);
+    crate::graph::report_duplicates(&dups);
     // doc 36 §3.1. Runs on the MERGED program, not per load_dir: a by-name
     // callsite in one --cgf dir routinely names a contract defined in another.
     normalize_loaded(&mut prog);
@@ -417,7 +480,11 @@ fn taint(
     opts: TaintOpts,
     unmodeled: Option<&std::path::Path>,
     out: Output,
+    threads: Option<u32>,
+    verify_summaries: bool,
+    verify_routes: bool,
 ) -> Result<()> {
+    init_threads(threads);
     let (cat, cat_hash) = Catalog::open(catalog)?;
     // a typo must not run the whole analysis, nor let CI pass
     let fail_on = match out.fail_on.as_deref().map(|s| FailOn::parse(s, &cat)) {
@@ -428,7 +495,20 @@ fn taint(
         Some(Ok(f)) => Some(f),
         None => None,
     };
+    // Per-phase wall/RSS lines on stderr. One clock read per phase; the counts
+    // on each line are the ones that explain that phase's memory.
+    let t_load = std::time::Instant::now();
     let prog = load(cgf, opts.http_link)?;
+    let callsites: usize = prog.funcs.values().filter_map(|f| f.flow.as_ref()).map(|fl| fl.callsites.len()).sum();
+    crate::phase::end(
+        "load",
+        t_load,
+        &[
+            ("functions", prog.funcs.len().into()),
+            ("packages", prog.packages.len().into()),
+            ("callsites", callsites.into()),
+        ],
+    );
     // Loud failures (measurements 2026-09-01, 00-report §4): a catalog rule
     // that matches nothing and a callee with no body both used to produce
     // "no finding" indistinguishable from "nothing there". stderr, once per
@@ -476,23 +556,68 @@ fn taint(
             );
         }
     }
+    let t_summaries = std::time::Instant::now();
     let stats = match store_dir {
         Some(dir) => {
             let cat_hash = crate::summarystore::env_hash(&cat_hash, &env_flags);
             let mut store = SummaryStore::open(Some(dir), &cat_hash, 1_000_000)?;
-            eng.run_with_store(&mut store)
+            let stats = eng.run_with_store(&store);
+            // The 1M-entry LRU is a second copy of many summaries. Nothing
+            // reads `store` past this point (last use in this function; the
+            // FS blobs are durable, hits/misses live in `stats`), so free it
+            // BEFORE the phase meter reads RSS — the whole point of the
+            // rss_now_bytes on the summaries line.
+            store.free_lru();
+            stats
         }
         None => {
             let mut store = SummaryStore::ephemeral();
-            eng.run_with_store(&mut store)
+            let stats = eng.run_with_store(&store);
+            store.free_lru();
+            stats
         }
     };
+    if verify_summaries {
+        let bad = eng.debug_verify_sequential();
+        if bad.is_empty() {
+            eprintln!("verify-summaries: 0 differences");
+        } else {
+            eprintln!("verify-summaries: {} DIFFERENCES", bad.len());
+            for iid in bad.iter().take(8) {
+                let fqn = prog
+                    .funcs
+                    .get(iid)
+                    .map(|f| f.fqn.clone())
+                    .unwrap_or_else(|| iid.clone());
+                eprintln!("  {fqn}");
+            }
+        }
+    }
+    crate::phase::end(
+        "summaries",
+        t_summaries,
+        &[
+            ("functions", prog.funcs.len().into()),
+            ("sccs", stats.sccs.into()),
+            ("scc_ms", stats.scc_ms.into()),
+            ("summaries", eng.summaries.len().into()),
+            ("cache_hits", stats.hits.into()),
+            ("cache_misses", stats.misses.into()),
+        ],
+    );
     // Remote contract views from PG for contracts no loaded CGF defines
     // (doc 18 B.3) — loaded AFTER phase 1 so cache environments stay identical.
     let leaves = match pg {
         Some(url) => {
+            let t_leaves = std::time::Instant::now();
             let missing = crate::storage::missing_remote_contracts(&prog);
-            crate::storage::load_contract_views(url, &missing)?
+            let leaves = crate::storage::load_contract_views(url, &missing)?;
+            crate::phase::end(
+                "remote-leaves",
+                t_leaves,
+                &[("contracts", missing.len().into()), ("leaves", leaves.len().into())],
+            );
+            leaves
         }
         None => Default::default(),
     };
@@ -503,7 +628,13 @@ fn taint(
     // only — see the discipline block in heap.rs. BEFORE compose so a
     // heap-mediated hit still gets a chance to cross a service boundary; a
     // no-op on any CGF extracted without --heap-slots.
+    let t_heap = std::time::Instant::now();
     let hs = crate::heap::fixpoint(&mut eng);
+    crate::phase::end(
+        "heap-fixpoint",
+        t_heap,
+        &[("cells", hs.cells.into()), ("iters", hs.iters.into())],
+    );
     if hs.cells > 0 {
         eprintln!(
             "heap-cells: {} written, {} writers, {} cell-sinks, {} spliced, {} iters, {} resummarized",
@@ -511,17 +642,47 @@ fn taint(
         );
     }
     // cross-repo composition at invokes_remote, iterated to fixpoint (doc 17)
+    let t_compose = std::time::Instant::now();
     let fx = compose::fixpoint_with_leaves(&mut eng, leaves);
+    crate::phase::end(
+        "compose",
+        t_compose,
+        &[
+            ("summaries", eng.summaries.len().into()),
+            ("contracts_linked", fx.linked.into()),
+            ("remote_leaves", fx.remote_leaves.into()),
+        ],
+    );
     if let Some(url) = pg {
+        let t_persist = std::time::Instant::now();
         let st = crate::storage::persist(&prog, &eng, url)?;
+        crate::phase::end(
+            "persist",
+            t_persist,
+            &[
+                ("nodes", st.nodes.into()),
+                ("edges", st.edges.into()),
+                ("invokes", st.invokes.into()),
+                ("endpoints", st.endpoints.into()),
+            ],
+        );
         eprintln!(
             "persisted nodes={} edges={} invokes={} endpoints={} to postgres",
             st.nodes, st.edges, st.invokes, st.endpoints
         );
     }
-    let mut chains = report::intra_chains(&eng, endpoint);
+    let t_chains = std::time::Instant::now();
+    let mut chains = report::intra_chains(&eng, endpoint, verify_routes);
     // --unmodeled pseudo-chains never reach stdout or the backward pass
     let unmodeled_calls = report::take_unmodeled(&mut chains);
+    crate::phase::end(
+        "chains",
+        t_chains,
+        &[
+            ("chains", chains.len().into()),
+            ("unmodeled", unmodeled_calls.len().into()),
+        ],
+    );
     if let Some(path) = unmodeled {
         std::fs::write(path, serde_json::to_string_pretty(&unmodeled_calls)?)
             .with_context(|| format!("write {path:?}"))?;
@@ -548,15 +709,18 @@ fn taint(
     // after witness (it keys on the route's terminal). Reads summaries only.
     if opts.backward {
         let t0 = std::time::Instant::now();
-        // Flag-gated behaviour of the backward pass. Installed here rather
-        // than passed through report::backward_check, which several callers
-        // share; backward::Back snapshots it at construction.
-        backward::set_opts(backward::BackOpts {
-            unview: opts.backward_unview,
-            prune: opts.backward_prune,
-            prune_unviewed: opts.backward_prune_unviewed,
-        });
-        let bs = report::backward_check(&eng, &mut chains, opts.backward_prune);
+        // Flag-gated behaviour of the backward pass, passed through to the
+        // pass (the pass stays a pure function of its options, so nothing
+        // here touches a global).
+        let bs = report::backward_check(
+            &eng,
+            &mut chains,
+            backward::BackOpts {
+                unview: opts.backward_unview,
+                prune: opts.backward_prune,
+                prune_unviewed: opts.backward_prune_unviewed,
+            },
+        );
         eprintln!(
             "backward: confirmed={} (exact={}, route-terminal-refuted={}) refuted={} undecided={} pruned={} unview-flips={} in {:.2}s",
             bs.confirmed,
@@ -565,14 +729,35 @@ fn taint(
             bs.refuted,
             bs.undecided,
             bs.pruned,
-            backward::unview_flips(),
+            bs.unview_flips,
             t0.elapsed().as_secs_f32()
+        );
+        crate::phase::end(
+            "backward",
+            t0,
+            &[
+                ("chains", chains.len().into()),
+                ("confirmed", bs.confirmed.into()),
+                ("refuted", bs.refuted.into()),
+                ("undecided", bs.undecided.into()),
+                ("pruned", bs.pruned.into()),
+            ],
         );
     }
     if let Some(t) = &tr {
         t.flush();
     }
-    println!("{}", output::render(out.format, &chains, &cat)?);
+    let t_output = std::time::Instant::now();
+    let rendered = output::render(out.format, &chains, &cat)?;
+    println!("{}", rendered);
+    crate::phase::end(
+        "output",
+        t_output,
+        &[
+            ("chains", chains.len().into()),
+            ("bytes", rendered.len().into()),
+        ],
+    );
     eprintln!(
         "functions={} summaries={} contracts_linked={} remote_leaves={} chains={} cache_hits={} cache_misses={}",
         prog.funcs.len(),
@@ -724,7 +909,13 @@ fn module_of(fqn: &str) -> Option<String> {
     })
 }
 
-fn summary_dbg(cgf: &[PathBuf], catalog: Option<&std::path::Path>, fnpat: &str) -> Result<()> {
+fn summary_dbg(
+    cgf: &[PathBuf],
+    catalog: Option<&std::path::Path>,
+    fnpat: &str,
+    threads: Option<u32>,
+) -> Result<()> {
+    init_threads(threads);
     let (cat, _) = Catalog::open(catalog)?;
     let prog = load(cgf, true)?;
     let mut eng = Engine::new(&prog, &cat);

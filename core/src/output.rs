@@ -356,6 +356,7 @@ mod tests {
             source_iid: String::new(),
             source_callsite: 0,
             sink_terminal: (String::new(), 0),
+            sink_last: 0,
             backward: None,
         }
     }

@@ -131,7 +131,9 @@ pub fn impact(
     fe: &str,
     fe_args: &[String],
     pg: Option<&str>,
+    threads: Option<u32>,
 ) -> Result<()> {
+    crate::cli::init_threads(threads);
     let tmp_out;
     let head_cgf = match out {
         Some(o) => o,
@@ -180,10 +182,10 @@ pub fn impact(
     // The store namespace must match `taint`'s: env_hash mixes in the blob
     // format token, so stores written by an older binary (pre-terminal
     // summaries) are never probed here.
-    let mut store =
+    let store =
         SummaryStore::open(Some(store_dir), &crate::summarystore::env_hash(&cat_hash, ""), 1_000_000)?;
     let mut eng = Engine::new(&prog, &cat);
-    let stats = eng.run_with_store(&mut store);
+    let stats = eng.run_with_store(&store);
     // PG leaves for contracts no loaded CGF defines (doc 18 Part C) — explicit
     // --cgf dirs win automatically (their contracts are local to the run).
     let leaves = match pg {
@@ -328,7 +330,7 @@ pub fn build_report(
         }
     }
 
-    let all_chains = report::intra_chains(eng, None);
+    let all_chains = report::intra_chains(eng, None, false);
     let taint_chains: Vec<Chain> = all_chains
         .into_iter()
         .filter(|c| {

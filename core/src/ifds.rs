@@ -10,9 +10,12 @@ use crate::catalog::Catalog;
 use crate::graph::{hexid, IidHex, Program};
 use crate::ids;
 use crate::proto::cgf;
+use crate::shard::ShardMap;
 use crate::summarystore::{self, SummaryStore};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Slot {
@@ -303,9 +306,15 @@ pub struct Summary {
 pub struct Engine<'a> {
     pub prog: &'a Program,
     pub cat: &'a Catalog,
-    pub summaries: HashMap<IidHex, Summary>,
-    /// behavior-only hash per summarized fn (feeds callers' summary_keys)
-    pub contract_hashes: HashMap<IidHex, ids::Hash>,
+    /// Concurrent because the parallel tabulation shares `&self` across the
+    /// rayon pool: workers read callee rows and publish completed ones. Values
+    /// are `Arc` so a lookup is an atomic increment, not a summary copy; the
+    /// map is written only by the SCC that owns an fn (readiness rule) and is
+    /// read-only afterwards (heap, compose, witness, persist).
+    pub summaries: ShardMap<Arc<Summary>>,
+    /// behavior-only hash per summarized fn (feeds callers' summary_keys);
+    /// concurrent for the same reason as `summaries`.
+    pub contract_hashes: ShardMap<ids::Hash>,
     /// summary_key per cacheable fn (persisted by storage.rs)
     pub summary_keys: HashMap<IidHex, ids::Hash>,
     /// fns actually (re)tabulated this run — cache misses + SCC members
@@ -346,6 +355,90 @@ pub struct RunStats {
     pub hits: usize,
     pub misses: usize,
     pub scc_recomputed: usize,
+    /// SCCs in the call graph (Tarjan, run once here) — phase-line count
+    pub sccs: usize,
+    /// wall ms Tarjan took inside this run — phase-line count
+    pub scc_ms: u64,
+}
+
+/// Per-run collection for the outputs that stay plain engine maps: worker
+/// tasks append under a mutex; `run_with_store` merges them into
+/// `self.summary_keys` / `self.recomputed` after the phase. Every value is
+/// keyed by iid and deterministic, so the merge order cannot change content.
+/// (summaries / contract_hashes go straight into their concurrent ShardMaps —
+/// no merge needed, the map IS the result.)
+struct TabOut {
+    summary_keys: Mutex<HashMap<IidHex, ids::Hash>>,
+    recomputed: Mutex<HashSet<IidHex>>,
+    scc_recomputed: AtomicUsize,
+    /// SCCs not yet completed; only read back in a debug assert.
+    remaining: AtomicUsize,
+}
+
+impl Default for TabOut {
+    fn default() -> Self {
+        TabOut {
+            summary_keys: Mutex::new(HashMap::new()),
+            recomputed: Mutex::new(HashSet::new()),
+            scc_recomputed: AtomicUsize::new(0),
+            remaining: AtomicUsize::new(0),
+        }
+    }
+}
+
+/// Everything the spawned SCC tasks share, all immutable once the scope runs.
+struct TabCtx<'c> {
+    eng: &'c Engine<'c>,
+    store: &'c SummaryStore,
+    sccs: &'c [Vec<IidHex>],
+    deps: &'c [AtomicUsize],
+    dependents: &'c [Vec<usize>],
+    started: &'c [AtomicBool],
+    out: &'c TabOut,
+}
+
+/// Claim SCC `i` for a one-time spawn: the initial ready-scan and a callee's
+/// release can both observe "ready" for the same SCC (a counter that was 1 at
+/// scan time may hit 0 while the scan is still walking the list), so both
+/// sites must atomically claim before spawning. Without the claim an SCC is
+/// tabulated twice and releases its dependents twice: a dependent counter can
+/// reach zero before all of its callees are complete, and the dependent then
+/// composes partial callee summaries (a subset of the sequential result).
+fn claim_scc(ctx: &TabCtx<'_>, i: usize) -> bool {
+    !ctx.started[i].swap(true, Ordering::SeqCst)
+}
+
+/// Schedule one SCC on the pool: tabulate it, then release its dependents —
+/// a counter reaching zero spawns the SCC it belongs to. Recursion here only
+/// *queues* (spawn returns immediately), so the call depth stays flat; the
+/// work happens on pool threads in readiness order.
+fn spawn_scc<'c>(scope: &rayon::Scope<'c>, ctx: &'c TabCtx<'c>, i: usize) {
+    scope.spawn(move |s| {
+        if std::env::var("PC_SCHED_SHUFFLE").is_ok() {
+            // Debug stress only: widen the interleaving windows by parking this
+            // worker a random sub-millisecond instant before it tabulates, so
+            // other ready SCCs run (and release their dependents) mid-flight.
+            let mut seed = (i as u64)
+                .wrapping_mul(0x9E3779B97F4A7C15)
+                ^ std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.subsec_nanos() as u64)
+                    .unwrap_or(0);
+            seed ^= seed >> 12;
+            seed = seed.wrapping_mul(0x2545F4914F6CDD1D);
+            let spins = (seed % 64) * 4096;
+            for _ in 0..spins {
+                std::hint::spin_loop();
+            }
+        }
+        ctx.eng.tabulate_scc(&ctx.sccs[i], ctx.store, ctx.out);
+        ctx.out.remaining.fetch_sub(1, Ordering::SeqCst);
+        for &d in &ctx.dependents[i] {
+            if ctx.deps[d].fetch_sub(1, Ordering::SeqCst) == 1 && claim_scc(ctx, d) {
+                spawn_scc(s, ctx, d);
+            }
+        }
+    });
 }
 
 impl<'a> Engine<'a> {
@@ -353,8 +446,8 @@ impl<'a> Engine<'a> {
         Engine {
             prog,
             cat,
-            summaries: HashMap::new(),
-            contract_hashes: HashMap::new(),
+            summaries: ShardMap::new(),
+            contract_hashes: ShardMap::new(),
             summary_keys: HashMap::new(),
             recomputed: HashSet::new(),
             heap_cells: HashMap::new(),
@@ -375,6 +468,7 @@ impl<'a> Engine<'a> {
         cs.callee_iids.is_empty()
             || cs.callee_iids.iter().any(|c| !self.summaries.contains_key(&hexid(c)))
     }
+
 
     /// Is arg port `arg_idx` of call site `cs_idx` a place `--unmodeled`
     /// reports? True when the report is on, the call has a body-less library
@@ -444,170 +538,396 @@ impl<'a> Engine<'a> {
 
     /// Compute all summaries bottom-up; recursive SCCs iterate to fixpoint.
     pub fn run(&mut self) {
-        let mut store = SummaryStore::ephemeral();
-        self.run_with_store(&mut store);
+        let store = SummaryStore::ephemeral();
+        self.run_with_store(&store);
     }
 
     /// Same as run() but probes/populates a summary store: unchanged fns
     /// (same summary_key = H(bid ++ sorted callee contract_hashes)) reuse
-    /// cached summaries instead of re-tabulating. SCC order is bottom-up, so
-    /// callee contract_hashes are always known when the caller's key is built.
+    /// cached summaries instead of re-tabulating. Callee contract_hashes are
+    /// always known when the caller's key is built — sequentially because SCC
+    /// order is bottom-up, in parallel because of the readiness rule below.
     /// NOTE cache soundness: compose::fixpoint (contract aliasing + phase-2
     /// re-summarize) runs AFTER this, so invokes_remote callees (incl. stream
     /// data ports) are default-leaf during summarize in every run — cached and
     /// fresh summaries see identical callee environments. Phase-2 summaries
     /// are in-memory only and never written back to the store. Stream-port structure (stream_op,
     /// stream_client_side) is bid-covered, so it invalidates correctly.
-    pub fn run_with_store(&mut self, store: &mut SummaryStore) -> RunStats {
+    ///
+    /// Parallel bottom-up tabulation. The SCCs of `prog.scc_order()` form a
+    /// condensation DAG; a readiness counter per SCC (its unfinished
+    /// body-bearing callee SCCs) schedules each component onto the global rayon
+    /// pool the moment its last callee completes — a ready-queue with
+    /// dependency counters, never level-synchronous barriers. This preserves
+    /// the one invariant the sequential order guarantees:
+    /// `site_has_unsummarized_target` must see exactly the summaries the
+    /// sequential run sees when an SCC tabulates (callees WITH a body are
+    /// complete; callees WITHOUT a body never get one, in either order), or a
+    /// call site would silently take the default leaf instead of composing.
+    /// Inside one SCC the fixpoint is unchanged and sequential: its rounds
+    /// must observe their own writes.
+    ///
+    /// Determinism: a summary is a pure function of the body, the catalog and
+    /// the callees' completed summaries — the least fixpoint over a monotone
+    /// lattice does not depend on SCC processing order — so the maps built
+    /// here have exactly the sequential run's content for any thread count.
+    /// The per-worker outputs (summary_keys, recomputed, counters) are merged
+    /// after the phase; every insert is keyed by iid and every value is
+    /// deterministic, so the merge order cannot change the result.
+    pub fn run_with_store(&mut self, store: &SummaryStore) -> RunStats {
         let mut stats = RunStats::default();
-        for scc in self.prog.scc_order() {
-            // A singleton SCC that calls ITSELF is a recursive SCC too — Tarjan
-            // just has no second member to prove it with. It must iterate to
-            // fixpoint like any other, or the recursive call site never sees a
-            // summary and the default leaf fires there: every result tainted,
-            // and NO sink hit, so any sink reachable only at depth >= 1 is
-            // silently lost.
-            let self_rec = scc.len() == 1 && self.is_self_recursive(&scc[0]);
-            let cacheable = scc.len() == 1 && !self_rec;
-            if cacheable {
-                let iid = &scc[0];
-                let f = &self.prog.funcs[iid];
-                let key = self.key_of(iid, f);
-                if let Some(key) = key {
-                    self.summary_keys.insert(iid.clone(), key);
-                    if let Some(c) = store.get(&key) {
-                        stats.hits += 1;
-                        crate::trace_ev!(self.trace, "summary", &f.fqn, "summary   fn={} CACHE-HIT", f.fqn);
-                        self.contract_hashes.insert(iid.clone(), c.contract_hash);
-                        self.summaries.insert(iid.clone(), c.summary.clone());
-                        continue;
-                    }
-                    stats.misses += 1;
-                    let s = self.summarize(f);
-                    crate::trace_ev!(
-                        self.trace,
-                        "summary",
-                        &f.fqn,
-                        "summary   fn={} computed flows={} sink_hits={}",
-                        f.fqn,
-                        s.flows.len(),
-                        s.sink_hits.len()
-                    );
-                    let ch = summarystore::contract_hash(&s);
-                    let _ = store.put(key, &s, ch); // store write failure ≠ run failure
-                    self.contract_hashes.insert(iid.clone(), ch);
-                    self.recomputed.insert(iid.clone());
-                    self.summaries.insert(iid.clone(), s);
-                    continue;
-                }
-                // no bid (shouldn't happen with pc-fe output): fall through
+        let t_scc = std::time::Instant::now();
+        let sccs = self.prog.scc_order();
+        stats.sccs = sccs.len();
+        stats.scc_ms = t_scc.elapsed().as_millis() as u64;
+
+        // ---- condensation readiness ----
+        // For each SCC: the set of DISTINCT callee SCCs that have bodies and
+        // are not itself (a self-recursive singleton depends on its own
+        // fixpoint, not on a callee). `prog.callees` is exactly the population
+        // `site_has_unsummarized_target` is answered from — call-site callee
+        // iids that have bodies — so a zero counter means the SCC sees the
+        // same callee summaries the sequential order produced.
+        let n = sccs.len();
+        let mut scc_of: HashMap<&IidHex, usize> = HashMap::with_capacity(n * 2);
+        for (i, scc) in sccs.iter().enumerate() {
+            for iid in scc {
+                scc_of.insert(iid, i);
             }
-            // recursive SCC (or keyless fn): fixpoint, never cached (MVP)
-            // `iterate` is the real predicate: a multi-fn SCC, or a singleton
-            // that is its own callee. A NON-recursive singleton still runs
-            // exactly one round below and never calls summarize twice, so its
-            // cost is unchanged.
-            let iterate = scc.len() > 1 || self_rec;
-            // `scc-start` deliberately stays multi-member: it announces a
-            // CONDENSED component, and existing recipes count it to separate
-            // dispatch-induced cycles from direct recursion (e2e-miniledger
-            // asserts zero of them with dispatch off, where `walkDepth` is
-            // still self-recursive). The rounds below are emitted for both, so
-            // a singleton's iteration is still visible — as `scc-iter size=1`,
-            // which also names the function.
-            if scc.len() > 1 {
-                if let Some(f) = self.prog.funcs.get(&scc[0]) {
-                    crate::trace_ev!(
-                        self.trace,
-                        "scc-start",
-                        &f.fqn,
-                        "scc-start size={} first={}",
-                        scc.len(),
-                        f.fqn
-                    );
-                }
-            }
-            if self_rec {
-                // Start the ascent at ⊥ (bottom), not at the default leaf's ⊤.
-                // With an EMPTY summary present, every target of the recursive
-                // call site has a summary, so `propagate` applies no default
-                // leaf there and round 1 composes against "nothing flows,
-                // nothing sinks" and each round can
-                // only add. The result is the LEAST fixpoint: every real flow
-                // and sink hit is found, and the recursive site contributes no
-                // taint it cannot justify. (Seeding ⊤ instead would be sound
-                // but strictly coarser.) `summary_changed` sees this differ
-                // from the first real summary, so it is always replaced.
-                self.summaries.entry(scc[0].clone()).or_insert(Summary {
-                    confidence: 1.0,
-                    ..Default::default()
-                });
-            }
-            let mut iters = 0usize;
-            loop {
-                let mut changed = false;
-                let mut n_changed = 0usize;
-                for iid in &scc {
-                    if let Some(f) = self.prog.funcs.get(iid) {
-                        let s = self.summarize(f);
-                        let differs = self
-                            .summaries
-                            .get(iid)
-                            .map(|p| summary_changed(p, &s))
-                            .unwrap_or(true);
-                        if differs {
-                            self.summaries.insert(iid.clone(), s);
-                            changed = true;
-                            n_changed += 1;
+        }
+        let mut dep_sets: Vec<HashSet<usize>> = vec![HashSet::new(); n];
+        for (i, scc) in sccs.iter().enumerate() {
+            for iid in scc {
+                if let Some(f) = self.prog.funcs.get(iid) {
+                    for c in self.prog.callees(f) {
+                        if let Some(&j) = scc_of.get(&c) {
+                            if j != i {
+                                dep_sets[i].insert(j);
+                            }
                         }
                     }
                 }
-                iters += 1;
-                if iterate {
-                    if let Some(f) = self.prog.funcs.get(&scc[0]) {
-                        crate::trace_ev!(
-                            self.trace,
-                            "scc-iter",
-                            &f.fqn,
-                            "scc-iter  size={} iter={} changed={}",
-                            scc.len(),
-                            iters,
-                            n_changed
-                        );
-                    }
-                }
-                if !changed || !iterate {
-                    break;
-                }
-                // Backstop: with set semantics the boolean lattice converges in
-                // O(SCC diameter) rounds; hitting this cap means a regression
-                // to non-monotone/multiset behavior. Warn loudly, keep the
-                // current (sound-so-far) summaries, and move on.
-                if iters >= 4 * scc.len() + 8 {
-                    let first = self
-                        .prog
-                        .funcs
-                        .get(&scc[0])
-                        .map(|f| f.fqn.as_str())
-                        .unwrap_or("?");
-                    eprintln!(
-                        "warning: SCC fixpoint hit iteration cap ({iters}) without converging: size={} first={first} — summaries may be incomplete",
-                        scc.len(),
-                    );
-                    break;
-                }
-            }
-            // members' contract_hashes still recorded so CALLERS of the SCC can hit
-            for iid in &scc {
-                if let Some(s) = self.summaries.get(iid) {
-                    self.contract_hashes
-                        .insert(iid.clone(), summarystore::contract_hash(s));
-                }
-                self.recomputed.insert(iid.clone());
-                stats.scc_recomputed += 1;
             }
         }
+        drop(scc_of);
+        let deps: Vec<AtomicUsize> = dep_sets
+            .iter()
+            .map(|s| AtomicUsize::new(s.len()))
+            .collect();
+        let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for (i, ds) in dep_sets.iter().enumerate() {
+            for &j in ds {
+                dependents[j].push(i);
+            }
+        }
+        drop(dep_sets);
+        let started: Vec<AtomicBool> = (0..n).map(|_| AtomicBool::new(false)).collect();
+
+        let out = TabOut::default();
+        out.remaining.store(n, Ordering::SeqCst);
+        let eng: &Engine<'_> = &*self;
+        let ctx = TabCtx {
+            eng,
+            store,
+            sccs: &sccs,
+            deps: &deps,
+            dependents: &dependents,
+            started: &started,
+            out: &out,
+        };
+        if rayon::current_num_threads() <= 1 {
+            // Sequential fast path (--threads 1): the old sequential loop over
+            // the SCC order, no scheduler overhead. Same per-SCC code and the
+            // same result as the parallel path — only the spawn layer differs.
+            for scc in &sccs {
+                self.tabulate_scc(scc, store, &out);
+                out.remaining.fetch_sub(1, Ordering::SeqCst);
+            }
+        } else {
+            // PC_SCHED_SHUFFLE=1 (debug stress): walk the ready scan in a
+            // random order and let each task spin a random instant before
+            // tabulating. The ready scan and a concurrent release can then
+            // race for the same SCC far more often than the sorted walk
+            // allows. Only the schedule changes — the result must not, which
+            // is exactly what --verify-summaries (or a cmp of two runs)
+            // checks.
+            let mut scan: Vec<usize> = (0..n).collect();
+            let stress = std::env::var("PC_SCHED_SHUFFLE").is_ok();
+            if stress {
+                let mut seed = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.subsec_nanos() as u64)
+                    .unwrap_or(0x9E3779B97F4A7C15)
+                    | 1;
+                for i in (1..scan.len()).rev() {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    scan.swap(i, (seed % (i as u64 + 1)) as usize);
+                }
+            }
+            rayon::scope(|scope| {
+                for i in scan {
+                    if deps[i].load(Ordering::SeqCst) == 0 && claim_scc(&ctx, i) {
+                        spawn_scc(scope, &ctx, i);
+                    }
+                }
+            });
+        }
+        debug_assert_eq!(out.remaining.load(Ordering::SeqCst), 0);
+
+        // Merge the per-worker output. Everything is keyed by iid and every
+        // value is deterministic, so insertion order cannot change these maps
+        // — they equal the sequential run's by construction.
+        self.summary_keys.extend(out.summary_keys.into_inner().unwrap());
+        self.recomputed.extend(out.recomputed.into_inner().unwrap());
+        stats.scc_recomputed = out.scc_recomputed.load(Ordering::SeqCst);
+        stats.hits = store.hits.load(Ordering::SeqCst) as usize;
+        stats.misses = store.misses.load(Ordering::SeqCst) as usize;
+        // Tabulation transients (propagate sets, per-fn contexts, the store
+        // LRU's evicted tail) are freed here; hand their pages back before
+        // compose and the chain walk allocate.
+        crate::phase::pressure_relief();
         stats
+    }
+
+    /// Debug check for the parallel tabulation (`--verify-summaries`): recompute
+    /// every summary SEQUENTIALLY in SCC order into fresh maps and compare with
+    /// the phase's result by content — summaries, contract_hashes and
+    /// summary_keys. Returns the iids whose parallel result differs from, or is
+    /// missing against, the sequential one; empty means the readiness scheduler
+    /// covered every callee edge the tabulation reads, at this thread count, on
+    /// this input. The engine's maps are restored before returning, so the rest
+    /// of the run stays exactly the parallel run's.
+    /// Debug-only: one extra sequential pass over the program plus an `Arc` per
+    /// summary held twice.
+    pub fn debug_verify_sequential(&mut self) -> Vec<IidHex> {
+        let sccs = self.prog.scc_order();
+        let par_s: ShardMap<Arc<Summary>> = std::mem::take(&mut self.summaries);
+        let par_ch: ShardMap<ids::Hash> = std::mem::take(&mut self.contract_hashes);
+        let par_keys = std::mem::take(&mut self.summary_keys);
+        // tabulate_scc in SCC order IS the old sequential run: bottom-up order,
+        // so every callee summary is complete when a caller summarizes.
+        self.summaries = ShardMap::new();
+        self.contract_hashes = ShardMap::new();
+        let store = SummaryStore::ephemeral();
+        let out = TabOut::default();
+        for scc in &sccs {
+            self.tabulate_scc(scc, &store, &out);
+        }
+        let seq_keys = out.summary_keys.into_inner().unwrap();
+        // Same predicate the SCC fixpoint uses for "changed": flows as a set,
+        // sink_hits as a set (order-insensitive — the Vec order is a run artifact).
+        let mut bad: Vec<IidHex> = Vec::new();
+        for (iid, p) in par_s.iter() {
+            match self.summaries.get(&iid) {
+                Some(s) => {
+                    if summary_changed(&p, &s) {
+                        bad.push(iid.clone());
+                    }
+                }
+                None => bad.push(iid.clone()),
+            }
+        }
+        if self.summaries.len() != par_s.len() {
+            // a summary the parallel phase never produced (or dropped): name
+            // the extras too, they are equally a scheduler defect
+            for (iid, _) in self.summaries.iter() {
+                if par_s.get(&iid).is_none() && !bad.contains(&iid) {
+                    bad.push(iid);
+                }
+            }
+        }
+        // contract_hashes: same key set, same per-fn hash. The hash is a pure
+        // function of the summary, so a hash diff implies a summary diff — but
+        // the parallel phase can also miss or drop a hash entry on its own.
+        for (iid, h) in par_ch.iter() {
+            if !bad.contains(&iid) {
+                match self.contract_hashes.get(&iid) {
+                    Some(sh) if sh == h => {}
+                    _ => bad.push(iid.clone()),
+                }
+            }
+        }
+        for (iid, _) in self.contract_hashes.iter() {
+            if par_ch.get(&iid).is_none() && !bad.contains(&iid) {
+                bad.push(iid);
+            }
+        }
+        // summary_keys: both runs record one per cacheable fn (cache hit or
+        // miss — the key is recorded before the store lookup), and the key is
+        // a pure function of (bid, callee contract_hashes), so the sets must
+        // match exactly.
+        for (iid, k) in par_keys.iter() {
+            if !bad.contains(iid) {
+                match seq_keys.get(iid) {
+                    Some(sk) if *sk == *k => {}
+                    _ => bad.push(iid.clone()),
+                }
+            }
+        }
+        for iid in seq_keys.keys() {
+            if !par_keys.contains_key(iid) && !bad.contains(iid) {
+                bad.push(iid.clone());
+            }
+        }
+        self.summaries = par_s;
+        self.contract_hashes = par_ch;
+        self.summary_keys = par_keys;
+        bad
+    }
+
+    /// Tabulate ONE SCC to fixpoint. Runs entirely on the calling worker: the
+    /// fixpoint rounds must observe their own writes, and running the SCC
+    /// sequentially is what makes a parallel SCC identical to a sequential
+    /// one. The body is the per-SCC loop of the old sequential `run_with_store`
+    /// verbatim, modulo where the results land.
+    fn tabulate_scc(&self, scc: &[IidHex], store: &SummaryStore, out: &TabOut) {
+        // A singleton SCC that calls ITSELF is a recursive SCC too — Tarjan
+        // just has no second member to prove it with. It must iterate to
+        // fixpoint like any other, or the recursive call site never sees a
+        // summary and the default leaf fires there: every result tainted,
+        // and NO sink hit, so any sink reachable only at depth >= 1 is
+        // silently lost.
+        let self_rec = scc.len() == 1 && self.is_self_recursive(&scc[0]);
+        let cacheable = scc.len() == 1 && !self_rec;
+        if cacheable {
+            let iid = &scc[0];
+            let f = &self.prog.funcs[iid];
+            let key = self.key_of(iid, f);
+            if let Some(key) = key {
+                out.summary_keys.lock().unwrap().insert(iid.clone(), key);
+                if let Some(c) = store.get(&key) {
+                    crate::trace_ev!(self.trace, "summary", &f.fqn, "summary   fn={} CACHE-HIT", f.fqn);
+                    self.contract_hashes.insert(iid.clone(), c.contract_hash);
+                    self.summaries.insert(iid.clone(), Arc::new(c.summary.clone()));
+                    return;
+                }
+                let s = self.summarize(f);
+                crate::trace_ev!(
+                    self.trace,
+                    "summary",
+                    &f.fqn,
+                    "summary   fn={} computed flows={} sink_hits={}",
+                    f.fqn,
+                    s.flows.len(),
+                    s.sink_hits.len()
+                );
+                let ch = summarystore::contract_hash(&s);
+                let _ = store.put(key, &s, ch); // store write failure ≠ run failure
+                self.contract_hashes.insert(iid.clone(), ch);
+                out.recomputed.lock().unwrap().insert(iid.clone());
+                self.summaries.insert(iid.clone(), Arc::new(s));
+                return;
+            }
+            // no bid (shouldn't happen with pc-fe output): fall through
+        }
+        // recursive SCC (or keyless fn): fixpoint, never cached (MVP)
+        // `iterate` is the real predicate: a multi-fn SCC, or a singleton
+        // that is its own callee. A NON-recursive singleton still runs
+        // exactly one round below and never calls summarize twice, so its
+        // cost is unchanged.
+        let iterate = scc.len() > 1 || self_rec;
+        // `scc-start` deliberately stays multi-member: it announces a
+        // CONDENSED component, and existing recipes count it to separate
+        // dispatch-induced cycles from direct recursion (e2e-miniledger
+        // asserts zero of them with dispatch off, where `walkDepth` is
+        // still self-recursive). The rounds below are emitted for both, so
+        // a singleton's iteration is still visible — as `scc-iter size=1`,
+        // which also names the function.
+        if scc.len() > 1 {
+            if let Some(f) = self.prog.funcs.get(&scc[0]) {
+                crate::trace_ev!(
+                    self.trace,
+                    "scc-start",
+                    &f.fqn,
+                    "scc-start size={} first={}",
+                    scc.len(),
+                    f.fqn
+                );
+            }
+        }
+        if self_rec {
+            // Start the ascent at ⊥ (bottom), not at the default leaf's ⊤.
+            // With an EMPTY summary present, every target of the recursive
+            // call site has a summary, so `propagate` applies no default
+            // leaf there and round 1 composes against "nothing flows,
+            // nothing sinks" and each round can
+            // only add. The result is the LEAST fixpoint: every real flow
+            // and sink hit is found, and the recursive site contributes no
+            // taint it cannot justify. (Seeding ⊤ instead would be sound
+            // but strictly coarser.) `summary_changed` sees this differ
+            // from the first real summary, so it is always replaced.
+            self.summaries.get_or_insert(scc[0].clone(), || {
+                Arc::new(Summary {
+                    confidence: 1.0,
+                    ..Default::default()
+                })
+            });
+        }
+        let mut iters = 0usize;
+        loop {
+            let mut changed = false;
+            let mut n_changed = 0usize;
+            for iid in scc {
+                if let Some(f) = self.prog.funcs.get(iid) {
+                    let s = self.summarize(f);
+                    let differs = self
+                        .summaries
+                        .get(iid)
+                        .map(|p| summary_changed(&p, &s))
+                        .unwrap_or(true);
+                    if differs {
+                        self.summaries.insert(iid.clone(), Arc::new(s));
+                        changed = true;
+                        n_changed += 1;
+                    }
+                }
+            }
+            iters += 1;
+            if iterate {
+                if let Some(f) = self.prog.funcs.get(&scc[0]) {
+                    crate::trace_ev!(
+                        self.trace,
+                        "scc-iter",
+                        &f.fqn,
+                        "scc-iter  size={} iter={} changed={}",
+                        scc.len(),
+                        iters,
+                        n_changed
+                    );
+                }
+            }
+            if !changed || !iterate {
+                break;
+            }
+            // Backstop: with set semantics the boolean lattice converges in
+            // O(SCC diameter) rounds; hitting this cap means a regression
+            // to non-monotone/multiset behavior. Warn loudly, keep the
+            // current (sound-so-far) summaries, and move on.
+            if iters >= 4 * scc.len() + 8 {
+                let first = self
+                    .prog
+                    .funcs
+                    .get(&scc[0])
+                    .map(|f| f.fqn.as_str())
+                    .unwrap_or("?");
+                eprintln!(
+                    "warning: SCC fixpoint hit iteration cap ({iters}) without converging: size={} first={first} — summaries may be incomplete",
+                    scc.len(),
+                );
+                break;
+            }
+        }
+        // members' contract_hashes still recorded so CALLERS of the SCC can hit
+        for iid in scc {
+            if let Some(s) = self.summaries.get(iid) {
+                self.contract_hashes
+                    .insert(iid.clone(), summarystore::contract_hash(&s));
+            }
+            out.recomputed.lock().unwrap().insert(iid.clone());
+            out.scc_recomputed.fetch_add(1, Ordering::SeqCst);
+        }
     }
 
     /// Phase-2 re-tabulation (compose::fixpoint): recompute summaries for
@@ -651,7 +971,7 @@ impl<'a> Engine<'a> {
                         let differs = self
                             .summaries
                             .get(iid)
-                            .map(|p| summary_changed(p, &s))
+                            .map(|p| summary_changed(&p, &s))
                             .unwrap_or(true);
                         if differs {
                             round.push((iid.clone(), s));
@@ -662,7 +982,7 @@ impl<'a> Engine<'a> {
                     break;
                 }
                 for (iid, s) in round {
-                    self.summaries.insert(iid.clone(), s);
+                    self.summaries.insert(iid.clone(), Arc::new(s));
                     changed.insert(iid.clone());
                     if let Some(callers) = local_callers.get(&iid) {
                         work.extend(callers.iter().cloned());
@@ -718,7 +1038,7 @@ impl<'a> Engine<'a> {
         for c in &callees {
             if seen.insert(c) {
                 if let Some(h) = self.contract_hashes.get(c) {
-                    hashes.push(*h);
+                    hashes.push(h);
                 }
             }
         }
@@ -781,6 +1101,7 @@ impl<'a> Engine<'a> {
         // surfaced by same-repo helpers that were handed the stream object
         // (bottom-up order ⇒ their summaries already exist).
         let mut stream_seeds = ctx.stream_in_seeds.clone();
+        let mut stream_verts: Vec<u32> = Vec::new();
         if let Some(flow) = &f.flow {
             for (cs_idx, cs) in flow.callsites.iter().enumerate() {
                 if stream_of(cs).is_some()
@@ -813,11 +1134,20 @@ impl<'a> Engine<'a> {
                         if osl.slot == Slot::StreamOut {
                             out.flows.insert((Slot::StreamIn.into(), Slot::StreamOut.into()));
                         } else {
-                            stream_seeds.extend(ctx.callee_out_to_vertices(cs_idx, osl));
+                            // Collect, don't extend: sum.flows iterates in
+                            // per-process HashSet order, and stream_seeds seeds
+                            // the propagate worklist (same route-order hazard as
+                            // the apply loop). Sorted+deduped before use below.
+                            stream_verts.extend(ctx.callee_out_to_vertices(cs_idx, osl));
                         }
                     }
                 }
             }
+        }
+        if !stream_verts.is_empty() {
+            stream_seeds.extend(stream_verts);
+            stream_seeds.sort_unstable();
+            stream_seeds.dedup();
         }
         if !stream_seeds.is_empty() {
             let r = self.propagate(f, &ctx, &stream_seeds);
@@ -975,10 +1305,24 @@ impl<'a> Engine<'a> {
                                 });
                             }
                         }
-                        for (isl, osl) in &sum.flows {
-                            if !slot_compat(isl, &callee_slot) {
-                                continue;
-                            }
+                        // sum.flows is a HashSet whose iteration order is
+                        // randomized per process (SipHash seed). The rows all
+                        // get applied either way, but the ORDER they taint
+                        // vertices in sets the worklist order, which sets the
+                        // `pred.entry(w).or_insert(v)` winners — and the pred
+                        // tree is what a witness backtrace walks. So the route
+                        // (hops, fingerprint) differed run to run with identical
+                        // findings. Apply the rows in sorted (content) order to
+                        // make the whole worklist deterministic. Keys are built
+                        // once, not per comparison — slot_str allocates.
+                        let mut rows: Vec<((String, String), (SlotP, SlotP))> = sum
+                            .flows
+                            .iter()
+                            .filter(|(isl, _)| slot_compat(isl, &callee_slot))
+                            .map(|(isl, osl)| ((slot_str(isl), slot_str(osl)), (isl.clone(), osl.clone())))
+                            .collect();
+                        rows.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                        for (_, (_isl, osl)) in rows {
                             if osl.slot == Slot::StreamOut {
                                 if cs.kind == cgf::call_site::Kind::InvokesRemote as i32 {
                                     // contract sends our data back over the
@@ -998,7 +1342,7 @@ impl<'a> Engine<'a> {
                                 }
                                 continue;
                             }
-                            for w in ctx.callee_out_to_vertices(cs_idx, osl) {
+                            for w in ctx.callee_out_to_vertices(cs_idx, &osl) {
                                 if tainted.insert(w) {
                                     pred.entry(w).or_insert(v);
                                     work.push(w);
@@ -1513,10 +1857,28 @@ pub fn arg_to_callee_slot(cs: &cgf::CallSite, arg_idx: u32, path: &[u32]) -> Slo
     SlotP { slot, path: path.to_vec() }
 }
 
-/// Drop exact-duplicate SinkHits, keeping first-seen order (propagation order
-/// is deterministic, so summaries stay byte-stable). Debug-format keying
+/// Canonicalize a summary's sink_hits: sort into a content order, then drop
+/// exact duplicates (which are adjacent after the sort). Set semantics with a
+/// deterministic order — summaries built in this run and the same summaries
+/// served back from the store (summarystore sorts the blobs the same way)
+/// then agree element for element, so a warm cache cannot change which
+/// duplicate a downstream keep-first consumer keeps. Debug-format keying
 /// mirrors summary_changed; SinkHit holds a prost Span, which has no Hash/Ord.
-fn dedup_sink_hits(hits: &mut Vec<SinkHit>) {
+pub(crate) fn dedup_sink_hits(hits: &mut Vec<SinkHit>) {
+    hits.sort_by(|a, b| {
+        slot_str(&a.in_slot)
+            .cmp(&slot_str(&b.in_slot))
+            .then(a.class.cmp(&b.class))
+            .then(a.callsite.cmp(&b.callsite))
+            .then(a
+                .span
+                .as_ref()
+                .map(|s| (s.file.clone(), s.line, s.col))
+                .cmp(&b.span.as_ref().map(|sp| (sp.file.clone(), sp.line, sp.col))))
+            .then(a.via_heap.as_ref().map(|v| (v.cell.clone(), v.reader.clone(), slot_str(&v.reader_slot))).cmp(&b.via_heap.as_ref().map(|v| (v.cell.clone(), v.reader.clone(), slot_str(&v.reader_slot)))))
+            .then(a.terminal.fn_iid.cmp(&b.terminal.fn_iid))
+            .then(a.terminal.callsite.cmp(&b.terminal.callsite))
+    });
     let mut seen = std::collections::HashSet::new();
     hits.retain(|h| seen.insert(format!("{h:?}")));
 }
@@ -1750,7 +2112,7 @@ arg = "any"
         let r1 = e1.run_with_store(&mut s1);
         assert_eq!((r1.hits, r1.misses), (0, 2));
         let a_hex = hexid(&[0xAA; 32]);
-        assert_eq!(e1.summaries[&a_hex].sink_hits.len(), 1, "sink through callee");
+        assert_eq!(e1.summaries.get(&a_hex).unwrap().sink_hits.len(), 1, "sink through callee");
 
         // fresh engine + fresh store instance over the same dir
         let mut s2 = SummaryStore::open(Some(&dir), &[0u8; 32], 1024).unwrap();
@@ -1758,8 +2120,8 @@ arg = "any"
         let r2 = e2.run_with_store(&mut s2);
         assert_eq!((r2.hits, r2.misses), (2, 0));
         assert!(e2.recomputed.is_empty());
-        assert_eq!(e2.summaries[&a_hex].flows, e1.summaries[&a_hex].flows);
-        assert_eq!(e2.summaries[&a_hex].sink_hits.len(), 1);
+        assert_eq!(e2.summaries.get(&a_hex).unwrap().flows, e1.summaries.get(&a_hex).unwrap().flows);
+        assert_eq!(e2.summaries.get(&a_hex).unwrap().sink_hits.len(), 1);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1802,7 +2164,7 @@ arg = "any"
         assert_eq!((r.hits, r.misses), (0, 2));
         let a_hex = hexid(&[0xAA; 32]);
         assert!(
-            e.summaries[&a_hex]
+            e.summaries.get(&a_hex).unwrap()
                 .flows
                 .contains(&(Slot::Param(0).into(), Slot::Return(0).into())),
             "new callee flow must surface in caller summary"
@@ -2166,7 +2528,7 @@ arg = "any"
         let prog = engine_prog(vec![f]);
         let mut eng = Engine::new(&prog, &cat);
         eng.run();
-        let sum = &eng.summaries[&hexid(&[0x01; 32])];
+        let sum = &eng.summaries.get(&hexid(&[0x01; 32])).unwrap();
         let classes: Vec<_> = sum
             .sink_hits
             .iter()
@@ -2209,7 +2571,7 @@ arg = "any"
         let prog = engine_prog(vec![f]);
         let mut eng = Engine::new(&prog, &cat);
         eng.run();
-        let sum = &eng.summaries[&hexid(&[0x03; 32])];
+        let sum = &eng.summaries.get(&hexid(&[0x03; 32])).unwrap();
         let hits: Vec<_> = sum
             .sink_hits
             .iter()
@@ -2242,7 +2604,7 @@ arg = "any"
         let prog2 = engine_prog(vec![unseeded]);
         let mut eng2 = Engine::new(&prog2, &cat);
         eng2.run();
-        let sum2 = &eng2.summaries[&hexid(&[0x04; 32])];
+        let sum2 = &eng2.summaries.get(&hexid(&[0x04; 32])).unwrap();
         assert!(
             !sum2.sink_hits.iter().any(|h| h.in_slot == Slot::Source),
             "unseeded ctx flow must not be a Source hit: {:?}",
@@ -2285,7 +2647,7 @@ arg = "1"
         let mut eng = Engine::new(&prog, &cat);
         eng.run();
         assert!(
-            eng.summaries[&hexid(&[0x11; 32])]
+            eng.summaries.get(&hexid(&[0x11; 32])).unwrap()
                 .sink_hits
                 .iter()
                 .any(|h| h.class == "sqli"),
@@ -2295,7 +2657,7 @@ arg = "1"
         let mut eng = Engine::new(&prog, &cat);
         eng.run();
         assert!(
-            eng.summaries[&hexid(&[0x12; 32])].sink_hits.is_empty(),
+            eng.summaries.get(&hexid(&[0x12; 32])).unwrap().sink_hits.is_empty(),
             "taint at arg 0 must not match arg = \"1\""
         );
     }
@@ -2323,7 +2685,7 @@ arg = "1"
         let prog = engine_prog(vec![f]);
         let mut eng = Engine::new(&prog, &cat);
         eng.run();
-        let sum = &eng.summaries[&hexid(&[0x02; 32])];
+        let sum = &eng.summaries.get(&hexid(&[0x02; 32])).unwrap();
         assert!(
             sum.flows.contains(&(Slot::Param(0).into(), Slot::StreamOut.into())),
             "flows: {:?}",
@@ -2376,9 +2738,9 @@ arg = "1"
         let prog = engine_prog(vec![helper, handler]);
         let mut eng = Engine::new(&prog, &cat);
         eng.run();
-        let hsum = &eng.summaries[&hexid(&[0x03; 32])];
+        let hsum = &eng.summaries.get(&hexid(&[0x03; 32])).unwrap();
         assert!(hsum.flows.contains(&(Slot::Param(1).into(), Slot::StreamOut.into())));
-        let sum = &eng.summaries[&hexid(&[0x04; 32])];
+        let sum = &eng.summaries.get(&hexid(&[0x04; 32])).unwrap();
         assert!(
             sum.flows.contains(&(Slot::Param(0).into(), Slot::StreamOut.into())),
             "helper StreamOut must surface in handler: {:?}",
@@ -2444,7 +2806,7 @@ arg = "1"
         let prog = engine_prog(vec![helper, handler]);
         let mut eng = Engine::new(&prog, &cat);
         eng.run();
-        let sum = &eng.summaries[&hexid(&[0x06; 32])];
+        let sum = &eng.summaries.get(&hexid(&[0x06; 32])).unwrap();
         let stream_in_sinks = sum
             .sink_hits
             .iter()
@@ -2497,7 +2859,7 @@ arg = "1"
         );
         let cat = Catalog::load_str(CAT).unwrap();
         let prog = engine_prog(vec![f]);
-        let mut eng = Engine::new(&prog, &cat);
+        let eng = Engine::new(&prog, &cat);
         // simulate compose's view publication: contract summary in the client frame
         let mut csum = Summary {
             confidence: 1.0,
@@ -2516,7 +2878,7 @@ arg = "1"
                 callsite: 0,
             },
         });
-        eng.summaries.insert(hexid(&CONTRACT), csum);
+        eng.summaries.insert(hexid(&CONTRACT), Arc::new(csum));
         let f = &prog.funcs[&hexid(&[0x07; 32])];
         let sum = eng.summarize(f);
         assert!(
@@ -2651,7 +3013,7 @@ arg = "any"
             ]);
             let mut eng = Engine::new(&prog, &cat);
             eng.run();
-            let got = eng.summaries[&hexid(&[a_iid; 32])]
+            let got = eng.summaries.get(&hexid(&[a_iid; 32])).unwrap()
                 .sink_hits
                 .iter()
                 .any(|h| h.class == "sqli");
@@ -2716,7 +3078,7 @@ arg = "any"
         let prog = engine_prog(vec![callee, caller]);
         let mut eng = Engine::new(&prog, &cat);
         eng.run();
-        let sum = &eng.summaries[&hexid(&[0xA9; 32])];
+        let sum = &eng.summaries.get(&hexid(&[0xA9; 32])).unwrap();
         let hit_sites: Vec<usize> = sum.sink_hits.iter().map(|h| h.callsite).collect();
         assert!(hit_sites.contains(&1), "return[3] must taint the [3] variant: {sum:?}");
         assert!(
@@ -2768,7 +3130,7 @@ arg = "any"
         let prog = engine_prog(vec![caller]);
         let mut eng = Engine::new(&prog, &cat);
         eng.run();
-        let sum = &eng.summaries[&hexid(&[0xAB; 32])];
+        let sum = &eng.summaries.get(&hexid(&[0xAB; 32])).unwrap();
         let hit_sites: Vec<usize> = sum.sink_hits.iter().map(|h| h.callsite).collect();
         assert!(
             hit_sites.contains(&1) && hit_sites.contains(&2),
@@ -2825,7 +3187,7 @@ arg = "any"
         let prog = engine_prog(fns);
         let mut eng = Engine::new(&prog, &cat);
         eng.run();
-        eng.summaries[&hexid(&[caller; 32])].sink_hits.iter().any(|h| h.class == "sqli")
+        eng.summaries.get(&hexid(&[caller; 32])).unwrap().sink_hits.iter().any(|h| h.class == "sqli")
     }
 
     /// A dispatch site with two targets: one summarized (no flow from arg 0 to
@@ -2896,7 +3258,7 @@ arg = "any"
         let mut eng = Engine::new(&prog, &cat);
         eng.no_error_leaf = no_error_leaf;
         eng.run();
-        let mut v: Vec<usize> = eng.summaries[&hexid(&[0xE1; 32])]
+        let mut v: Vec<usize> = eng.summaries.get(&hexid(&[0xE1; 32])).unwrap()
             .sink_hits
             .iter()
             .map(|h| h.callsite)
@@ -2956,7 +3318,7 @@ selector = "fmt.Errorf"
         let mut eng = Engine::new(&prog, &cat);
         eng.no_error_leaf = true;
         eng.run();
-        let hits: Vec<usize> = eng.summaries[&hexid(&[0xE1; 32])]
+        let hits: Vec<usize> = eng.summaries.get(&hexid(&[0xE1; 32])).unwrap()
             .sink_hits
             .iter()
             .map(|h| h.callsite)
@@ -3083,7 +3445,7 @@ arg = "any"
         );
         let prog = engine_prog(vec![f]);
         let eng = run(&prog);
-        let sum = &eng.summaries[&hexid(&[0xF1; 32])];
+        let sum = &eng.summaries.get(&hexid(&[0xF1; 32])).unwrap();
 
         let hit = |p: u32| {
             sum.sink_hits
@@ -3120,7 +3482,7 @@ arg = "any"
         );
         let prog = engine_prog(vec![f]);
         let eng = run(&prog);
-        let sum = &eng.summaries[&hexid(&[0xF2; 32])];
+        let sum = &eng.summaries.get(&hexid(&[0xF2; 32])).unwrap();
 
         let direct = sum.sink_hits.iter().filter(|h| h.callsite == 0).count();
         assert_eq!(direct, 1, "the db.Exec site itself, once: {:?}", sum.sink_hits);
@@ -3219,7 +3581,7 @@ arg = "any"
         );
         let prog = engine_prog(vec![f]);
         let eng = run(&prog);
-        let flows = &eng.summaries[&hexid(&[0xF5; 32])].flows;
+        let flows = &eng.summaries.get(&hexid(&[0xF5; 32])).unwrap().flows;
         let has = |p: u32| {
             flows.iter().any(|(i, o)| {
                 i.slot == Slot::Param(p) && o.slot == Slot::Return(0) && o.path.is_empty()
@@ -3303,7 +3665,7 @@ to   = "none"
         let mut eng = Engine::new(&prog, &cat);
         eng.report_unmodeled = unmodeled;
         eng.run();
-        eng.summaries[&h].sink_hits.iter().map(|x| (x.in_slot.clone(), x.class.clone())).collect()
+        eng.summaries.get(&h).unwrap().sink_hits.iter().map(|x| (x.in_slot.clone(), x.class.clone())).collect()
     }
 
     #[test]
@@ -3403,7 +3765,7 @@ mod catalog_port_tests {
     }
 
     fn source_hits(eng: &Engine, iid: u8) -> Vec<String> {
-        eng.summaries[&hexid(&[iid; 32])]
+        eng.summaries.get(&hexid(&[iid; 32])).unwrap()
             .sink_hits
             .iter()
             .filter(|h| h.in_slot == Slot::Source)
@@ -3463,7 +3825,7 @@ mod catalog_port_tests {
         eng.run();
         assert!(source_hits(&eng, 0x63).is_empty(), "no Source hit through err");
         // c itself (Param(0)) still reaches err through the default leaf
-        let hits: Vec<SlotP> = eng.summaries[&hexid(&[0x63; 32])].sink_hits.iter().map(|h| h.in_slot.clone()).collect();
+        let hits: Vec<SlotP> = eng.summaries.get(&hexid(&[0x63; 32])).unwrap().sink_hits.iter().map(|h| h.in_slot.clone()).collect();
         assert_eq!(hits, vec![SlotP::from(Slot::Param(0))]);
     }
 
@@ -3473,7 +3835,7 @@ mod catalog_port_tests {
         let cat = cat_with("to = \"1\"");
         let mut eng = Engine::new(&prog, &cat);
         eng.run();
-        let mut chains = crate::report::intra_chains(&eng, None);
+        let mut chains = crate::report::intra_chains(&eng, None, false);
         assert_eq!(chains.len(), 1, "one sqli chain");
         let route = chains[0].route.as_ref().unwrap();
         assert_eq!(route.incomplete, None);
@@ -3481,8 +3843,7 @@ mod catalog_port_tests {
             route.hops.iter().map(|h| (h.kind, h.callee.as_str())).collect();
         use crate::witness::HopKind::*;
         assert_eq!(shape, vec![(Source, ""), (Call, GIN_BIND), (Sink, "db.Exec")]);
-        crate::backward::set_opts(Default::default());
-        let st = crate::report::backward_check(&eng, &mut chains, false);
+        let st = crate::report::backward_check(&eng, &mut chains, crate::backward::BackOpts::default());
         assert_eq!(st.confirmed, 1, "the demand must land on the arg-port seed: {:?}", chains[0].backward);
     }
 
@@ -3547,12 +3908,11 @@ mod catalog_port_tests {
         let cat = query_cat(true);
         let mut eng = Engine::new(&prog, &cat);
         eng.run();
-        let mut chains = crate::report::intra_chains(&eng, None);
+        let mut chains = crate::report::intra_chains(&eng, None, false);
         assert_eq!(chains.len(), 1);
         let route = chains[0].route.as_ref().unwrap();
         assert_eq!(route.incomplete, None, "the witness fires on the same port propagate did");
-        crate::backward::set_opts(Default::default());
-        let st = crate::report::backward_check(&eng, &mut chains, false);
+        let st = crate::report::backward_check(&eng, &mut chains, crate::backward::BackOpts::default());
         assert_eq!(st.confirmed, 1, "{:?}", chains[0].backward);
         assert_eq!(chains[0].backward.as_ref().unwrap().terminal, Some(crate::backward::Verdict::Confirmed));
     }
@@ -3636,12 +3996,685 @@ mod catalog_port_tests {
         // the Source-keyed hit sits on the Id sink (callsite 1); the Note
         // read (callsite 2) fires only as a caller-facing Param(0) summary
         // row — no source ever taints a plain field read
-        let src_cs: Vec<usize> = eng.summaries[&hexid(&[0x64; 32])]
+        let src_cs: Vec<usize> = eng.summaries.get(&hexid(&[0x64; 32])).unwrap()
             .sink_hits
             .iter()
             .filter(|h| h.in_slot == Slot::Source)
             .map(|h| h.callsite)
             .collect();
         assert_eq!(src_cs, vec![1]);
+    }
+}
+
+/// Fuzz: the parallel scheduler must produce EXACTLY the sequential order's
+/// summaries, for any call-graph shape. The generator emits every edge class
+/// the engine can see: static calls (incl. self and 2-cycles), VTA fan-out
+/// (one site, several callee_iids), dangling targets (iid not in the program),
+/// InvokesRemote sites (default leaf), catalog sinks, bodyless fns, empty bids
+/// (never cacheable) and isolated fns. Every program runs through the parallel
+/// `run_with_store` under the PC_SCHED_SHUFFLE stress (shuffled ready-scan +
+/// randomized per-SCC delays) and is then recomputed strictly sequentially in
+/// SCC order; `debug_verify_sequential` must report zero differences.
+#[cfg(test)]
+mod sched_fuzz_tests {
+    use super::*;
+    use crate::graph::Program;
+    use std::collections::HashMap;
+    use super::cache_tests::{edge, vertex};
+
+    const CAT: &str = r#"
+[[sinks]]
+class = "sqli"
+selector = "db.Exec"
+arg = "any"
+"#;
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            // xorshift64*
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545F4914F6CDD1D)
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            if n == 0 { 0 } else { self.next() % n }
+        }
+    }
+
+    fn iid_of(n: usize, salt: u8) -> Vec<u8> {
+        let mut v = vec![salt; 32];
+        v[0] = (n & 0xFF) as u8;
+        v[1] = ((n >> 8) & 0xFF) as u8;
+        v[2] = ((n >> 16) & 0xFF) as u8;
+        v[3] = ((n >> 24) & 0xFF) as u8;
+        v
+    }
+
+    fn fuzz_program(seed: u64) -> Program {
+        let mut r = Rng(seed | 1);
+        let n = 4 + r.below(120) as usize; // 4..=123 fns: deep chains and big cycles
+        let mut prog = Program {
+            funcs: HashMap::new(),
+            repo_of: HashMap::new(),
+            packages: Vec::new(),
+        };
+        for i in 0..n {
+            let bid = if r.below(100) < 15 {
+                Vec::new() // not cacheable: key_of -> None
+            } else {
+                vec![1 + (r.below(250) as u8); 32]
+            };
+            let mut vertices = Vec::new();
+            let mut edges = Vec::new();
+            let mut callsites = Vec::new();
+            let has_flow = r.below(100) < 90;
+            if has_flow {
+                // params p0 (always) and p1 (sometimes) flowing out and into calls
+                let nparams = 1 + r.below(2) as u32;
+                for p in 0..nparams {
+                    vertices.push(vertex(10 + p, cgf::VertexKind::InParam, p, 0));
+                }
+                vertices.push(vertex(20, cgf::VertexKind::OutReturn, 0, 0));
+                let ncalls = r.below(4) as u32; // 0..3 callsites
+                let mut next_v = 30u32;
+                for c in 0..ncalls {
+                    let cs_id = c;
+                    let class = r.below(100);
+                    let mut cs = cgf::CallSite {
+                        id: cs_id,
+                        callee_fqn: format!("pkg.f{}/call{}", i, c),
+                        argc: 1,
+                        resultc: 0,
+                        ..Default::default()
+                    };
+                    // arg port wired from a random param
+                    let arg_v = next_v;
+                    vertices.push(vertex(arg_v, cgf::VertexKind::CallArgPort, 0, cs_id));
+                    next_v += 1;
+                    let src = 10 + r.below(nparams as u64) as u32;
+                    edges.push(edge(src, arg_v));
+                    if class < 35 {
+                        // static call to a random fn, maybe itself (cycle)
+                        let tgt = r.below(n as u64) as usize;
+                        cs.callee_iids = vec![iid_of(tgt, 0xAA)];
+                        cs.kind = cgf::call_site::Kind::Static as i32;
+                        cs.resultc = 1;
+                        let res_v = next_v;
+                        vertices.push(vertex(res_v, cgf::VertexKind::CallResultPort, 0, cs_id));
+                        next_v += 1;
+                        edges.push(edge(res_v, 20));
+                    } else if class < 50 {
+                        // VTA fan-out: 1-3 targets from one site
+                        let k = 1 + r.below(3) as usize;
+                        let mut tgts = Vec::new();
+                        for _ in 0..k {
+                            let tgt = r.below(n as u64) as usize;
+                            tgts.push(iid_of(tgt, 0xAA));
+                        }
+                        cs.callee_iids = tgts;
+                        cs.kind = cgf::call_site::Kind::Virtual as i32;
+                        cs.resultc = 1;
+                        let res_v = next_v;
+                        vertices.push(vertex(res_v, cgf::VertexKind::CallResultPort, 0, cs_id));
+                        next_v += 1;
+                        edges.push(edge(res_v, 20));
+                    } else if class < 62 {
+                        // dangling target: an iid no function owns
+                        cs.callee_iids = vec![iid_of(999, 0xEE)];
+                        cs.resultc = 1;
+                        let res_v = next_v;
+                        vertices.push(vertex(res_v, cgf::VertexKind::CallResultPort, 0, cs_id));
+                        next_v += 1;
+                        edges.push(edge(res_v, 20));
+                    } else if class < 78 {
+                        // remote/contract site: default leaf in phase 1
+                        cs.kind = cgf::call_site::Kind::InvokesRemote as i32;
+                        cs.callee_fqn = "rpc.Do".into();
+                        cs.resultc = 1;
+                        let res_v = next_v;
+                        vertices.push(vertex(res_v, cgf::VertexKind::CallResultPort, 0, cs_id));
+                        next_v += 1;
+                        edges.push(edge(res_v, 20));
+                    } else {
+                        // catalog sink: db.Exec(arg)
+                        cs.callee_fqn = "db.Exec".into();
+                        cs.callee_iids = Vec::new();
+                    }
+                    callsites.push(cs);
+                }
+                // sometimes flow a param straight to the return
+                if r.below(100) < 40 {
+                    edges.push(edge(10, 20));
+                }
+            }
+            let f = cgf::Function {
+                id: Some(cgf::Ident { iid: iid_of(i, 0xAA), bid }),
+                fqn: format!("pkg.f{i}"),
+                has_body: r.below(100) < 90, // 10% bodyless stubs still in funcs
+                flow: has_flow.then(|| cgf::LocalFlow { vertices, edges, callsites }),
+                ..Default::default()
+            };
+            let h = hexid(&f.id.as_ref().unwrap().iid);
+            prog.repo_of.insert(h.clone(), "test".into());
+            prog.funcs.insert(h, f);
+        }
+        prog
+    }
+
+    #[test]
+    fn fuzz_parallel_summaries_match_sequential() {
+        let cat = Catalog::load_str(CAT).unwrap();
+        // Stress the scheduler: shuffled ready-scan + randomized worker delays.
+        // (Only affects spawn order; the sequential verification ignores it.)
+        std::env::set_var("PC_SCHED_SHUFFLE", "1");
+        for seed in 1..=2000u64 {
+            let prog = fuzz_program(seed);
+            let mut eng = Engine::new(&prog, &cat);
+            let mut store = SummaryStore::ephemeral();
+            eng.run_with_store(&mut store);
+            let bad = eng.debug_verify_sequential();
+            assert!(
+                bad.is_empty(),
+                "seed {seed}: {} summary(ies) differ from the sequential run: {:?}",
+                bad.len(),
+                &bad[..bad.len().min(8)]
+            );
+        }
+        std::env::remove_var("PC_SCHED_SHUFFLE");
+    }
+
+    /// The scan-vs-release race has the widest window on a SMALL pool: the
+    /// scope thread walks the ready list while 1-2 workers tabulate and
+    /// release. Every seed runs on a dedicated 2-thread pool, then on a
+    /// 4-thread pool, each time against the sequential recompute.
+    #[test]
+    fn fuzz_parallel_small_pools_match_sequential() {
+        let cat = Catalog::load_str(CAT).unwrap();
+        std::env::set_var("PC_SCHED_SHUFFLE", "1");
+        for pool_threads in [2usize, 4] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(pool_threads)
+                .build()
+                .unwrap();
+            for seed in 1..=600u64 {
+                let prog = fuzz_program(seed * 7919 + pool_threads as u64);
+                let mut eng = Engine::new(&prog, &cat);
+                let mut store = SummaryStore::ephemeral();
+                pool.install(|| eng.run_with_store(&mut store));
+                let bad = eng.debug_verify_sequential();
+                assert!(
+                    bad.is_empty(),
+                    "pool={pool_threads} seed {seed}: {} differ: {:?}",
+                    bad.len(),
+                    &bad[..bad.len().min(8)]
+                );
+            }
+        }
+        std::env::remove_var("PC_SCHED_SHUFFLE");
+    }
+}
+
+/// Prod-scale stress: 1.74M functions overflow the 1M-entry store LRU, so the
+/// phase runs with a CHURNING cache — evictions, FS blob re-reads and lazy
+/// moka housekeeping all mid-flight — and with dependency chains thousands of
+/// SCCs deep. Small-graph fuzz cannot reach that state. This fixture builds
+/// the production layering (Go resolvers with the sink, GraphQL contracts,
+/// TS gateway wrappers whose remote sites name the contract fns as callee_iids,
+/// $op fns calling the wrappers, VTA fan-out, self-recursion, cycles, bodyless
+/// stubs, empty bids) at 100k+ functions, runs the parallel tabulation against
+/// a FS store whose LRU is deliberately tiny (constant eviction pressure), and
+/// requires the sequential recompute to agree exactly.
+#[cfg(test)]
+mod prod_scale_tests {
+    use super::*;
+    use crate::graph::Program;
+    use std::collections::HashMap;
+
+    const CAT: &str = r#"
+[[sinks]]
+class = "sqli"
+selector = "db.Exec"
+arg = "any"
+"#;
+
+    fn iid_bytes(n: usize, salt: u8) -> Vec<u8> {
+        let mut v = vec![salt; 32];
+        v[0] = (n & 0xFF) as u8;
+        v[1] = ((n >> 8) & 0xFF) as u8;
+        v[2] = ((n >> 16) & 0xFF) as u8;
+        v[3] = ((n >> 24) & 0xFF) as u8;
+        v[4] = ((n >> 32) & 0xFF) as u8;
+        v
+    }
+
+    fn vertex(id: u32, kind: cgf::VertexKind, index: u32, cs: u32) -> cgf::FlowVertex {
+        cgf::FlowVertex { id, kind: kind as i32, index, callsite_id: cs, ..Default::default() }
+    }
+
+    fn edge(from: u32, to: u32) -> cgf::FlowEdge {
+        cgf::FlowEdge { from, to, via_alias: false }
+    }
+
+    pub(super) fn prod_program(layers: usize) -> Program {
+        // For i in 0..layers*4 four roles cycle:
+        //   i%4==0 resolver  : db.Exec(p0) sink, may self-recurse
+        //   i%4==1 contract  : flows p0->ret, named as callee by wrappers
+        //   i%4==2 wrapper   : remote site -> contract i-1 (callee_iids set!),
+        //                      plus a VTA site over 2-3 resolvers
+        //   i%4==3 $op       : static call to wrapper i-1 (and a cycle)
+        let n = layers * 4;
+        let mut prog = Program { funcs: HashMap::new(), repo_of: HashMap::new(), packages: Vec::new() };
+        for i in 0..n {
+            let mut callsites = Vec::new();
+            let mut vertices = vec![
+                vertex(1, cgf::VertexKind::InParam, 0, 0),
+                vertex(2, cgf::VertexKind::OutReturn, 0, 0),
+            ];
+            let mut edges = vec![edge(1, 2)];
+            match i % 4 {
+                0 => {
+                    // resolver: sink on p0; every 16th also self-recursive
+                    callsites.push(cgf::CallSite {
+                        id: 0,
+                        callee_fqn: "db.Exec".into(),
+                        argc: 1,
+                        ..Default::default()
+                    });
+                    vertices.push(vertex(3, cgf::VertexKind::CallArgPort, 0, 0));
+                    edges.push(edge(1, 3));
+                    if i % 16 == 0 {
+                        callsites.push(cgf::CallSite {
+                            id: 1,
+                            callee_iids: vec![iid_bytes(i, 0xA1)],
+                            callee_fqn: format!("go.resolve{i}"),
+                            argc: 1,
+                            resultc: 1,
+                            ..Default::default()
+                        });
+                        vertices.push(vertex(9, cgf::VertexKind::CallResultPort, 0, 1));
+                        edges.push(edge(9, 2));
+                    }
+                }
+                1 => {
+                    // contract: passes p0 through
+                    vertices.push(vertex(3, cgf::VertexKind::OutReturn, 0, 0));
+                    edges.push(edge(1, 3));
+                }
+                2 => {
+                    // wrapper: InvokesRemote site whose callee_iids NAME the
+                    // contract fn (as httplink/contract linking leaves it),
+                    // plus a VTA site over the resolvers i-3, i-5, i-9.
+                    callsites.push(cgf::CallSite {
+                        id: 0,
+                        kind: cgf::call_site::Kind::InvokesRemote as i32,
+                        callee_iids: vec![iid_bytes(i - 1, 0xA1)],
+                        callee_fqn: format!("gw.query{i}"),
+                        argc: 1,
+                        resultc: 1,
+                        ..Default::default()
+                    });
+                    vertices.push(vertex(3, cgf::VertexKind::CallArgPort, 0, 0));
+                    vertices.push(vertex(4, cgf::VertexKind::CallResultPort, 0, 0));
+                    edges.push(edge(1, 3));
+                    edges.push(edge(4, 2));
+                    let mut tgts = Vec::new();
+                    for k in [5usize, 9, 13] {
+                        if i > k {
+                            tgts.push(iid_bytes(i - k, 0xA1));
+                        }
+                    }
+                    callsites.push(cgf::CallSite {
+                        id: 1,
+                        kind: cgf::call_site::Kind::Virtual as i32,
+                        callee_iids: tgts,
+                        callee_fqn: format!("gw.exec{i}"),
+                        argc: 1,
+                        resultc: 1,
+                        ..Default::default()
+                    });
+                    vertices.push(vertex(5, cgf::VertexKind::CallArgPort, 0, 1));
+                    vertices.push(vertex(6, cgf::VertexKind::CallResultPort, 0, 1));
+                    edges.push(edge(1, 5));
+                    edges.push(edge(6, 2));
+                }
+                _ => {
+                    // $op: static call to the wrapper, result to return
+                    let tgt = if i >= 1 { i - 1 } else { n - 1 };
+                    callsites.push(cgf::CallSite {
+                        id: 0,
+                        callee_iids: vec![iid_bytes(tgt, 0xA1)],
+                        callee_fqn: format!("ts.op{i}"),
+                        argc: 1,
+                        resultc: 1,
+                        ..Default::default()
+                    });
+                    vertices.push(vertex(3, cgf::VertexKind::CallArgPort, 0, 0));
+                    vertices.push(vertex(4, cgf::VertexKind::CallResultPort, 0, 0));
+                    edges.push(edge(1, 3));
+                    edges.push(edge(4, 2));
+                }
+            }
+            let bid = if i % 97 == 0 { Vec::new() } else { vec![1u8; 32] };
+            let f = cgf::Function {
+                id: Some(cgf::Ident { iid: iid_bytes(i, 0xA1), bid }),
+                fqn: format!("pkg.f{i}"),
+                has_body: i % 211 != 0, // some bodyless stubs stay in funcs
+                flow: Some(cgf::LocalFlow { vertices, edges, callsites }),
+                ..Default::default()
+            };
+            let h = hexid(&f.id.as_ref().unwrap().iid);
+            prog.repo_of.insert(h.clone(), "r".into());
+            prog.funcs.insert(h, f);
+        }
+        prog
+    }
+
+    #[test]
+    fn prod_shape_parallel_matches_sequential_under_lru_churn() {
+        let cat = Catalog::load_str(CAT).unwrap();
+        let prog = prod_program(30_000); // 120k functions
+        let dir = std::env::temp_dir().join(format!("pc-prodshape-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::set_var("PC_SCHED_SHUFFLE", "1");
+        {
+            // LRU of 64 against ~120k cacheable fns: permanent eviction churn,
+            // every later cache probe falls back to the FS blob mid-run.
+            let mut store = SummaryStore::open(Some(&dir), &[0u8; 32], 64).unwrap();
+            let mut eng = Engine::new(&prog, &cat);
+            eng.run_with_store(&mut store);
+            let bad = eng.debug_verify_sequential();
+            assert!(
+                bad.is_empty(),
+                "{} summary(ies) differ from the sequential run: {:?}",
+                bad.len(),
+                &bad[..bad.len().min(8)]
+            );
+            store.free_lru();
+        }
+        std::env::remove_var("PC_SCHED_SHUFFLE");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+/// Reproduction of the production correctness incident (t8 subset summaries).
+///
+/// The scheduler that shipped to prod tabulated an SCC from TWO sites — the
+/// initial ready-scan and a callee's release path — both gated only on the
+/// readiness counter, with no atomic claim:
+///
+/// ```text
+/// for i in 0..n { if deps[i].load(SeqCst) == 0 { spawn_scc(.., i); } }   // scan
+/// if deps[d].fetch_sub(1, SeqCst) == 1 { spawn_scc(.., d); }             // release
+/// ```
+///
+/// When a release brings `deps[d]` to 0 while the scan has not reached `d`
+/// yet (guaranteed on a 1.7M-function program, where the scan walks for
+/// seconds while early callees finish), BOTH sites spawn `d`. The SCC is then
+/// tabulated twice concurrently, and EACH copy runs the release loop, so
+/// every dependent's counter is decremented twice:
+///
+/// * a dependent of `d` is released while the second fixpoint is still
+///   mid-round — it composes the PARTIAL summaries it finds (subset: flows
+///   empty / fewer sink_hits), and
+/// * a dependent with two callees is released after only ONE of them
+///   completed (the counter hits 0 on the duplicate decrement).
+///
+/// The stale round's insert can also land after the final one, leaving a
+/// non-fixpoint summary in the map. Either way the t8 summary is a strict
+/// subset of the sequential one — the production signature.
+///
+/// This fixture replays that exact pre-fix schedule deterministically (the
+/// scan sleeps past the first callee's completion before it reaches the
+/// released SCC) and asserts the divergence appears. The current scheduler
+/// (claim_scc at both spawn sites) makes the double spawn impossible, which
+/// is why this test is `#[ignore]`d: it documents the incident, it must NOT
+/// run in CI against the fixed code. Run with `cargo test -- --ignored`.
+#[cfg(test)]
+mod sched_race_repro {
+    use super::*;
+    use crate::graph::Program;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const CAT: &str = r#"
+[[sinks]]
+class = "sqli"
+selector = "db.Exec"
+arg = "any"
+"#;
+
+    fn vid(n: u8) -> Vec<u8> {
+        vec![n; 32]
+    }
+
+    fn vertex(id: u32, kind: cgf::VertexKind, index: u32, cs: u32) -> cgf::FlowVertex {
+        cgf::FlowVertex { id, kind: kind as i32, index, callsite_id: cs, ..Default::default() }
+    }
+
+    fn edge(from: u32, to: u32) -> cgf::FlowEdge {
+        cgf::FlowEdge { from, to, via_alias: false }
+    }
+
+    /// The orchestrated shape, four functions, SCC order [X, A, B, D2]:
+    ///
+    /// * X  — `db.Exec(p0)`: a sink leaf, tabulates instantly.
+    /// * A  — calls X (so deps[A] = 1). Its release path and the ready-scan
+    ///        BOTH spawn it (the double spawn), so its dependent counter is
+    ///        decremented TWICE.
+    /// * B  — `db.Exec(p0)` plus a `p0 -> ret` flow: its summary is what D2
+    ///        misses when the race fires (D2 spawns on the duplicate release,
+    ///        before the scan has even reached B).
+    /// * D2 — calls A and B (deps[D2] = 2). The DUPLICATE release from A's
+    ///        second copy takes deps[D2] 1 -> 0 and spawns it while B has no
+    ///        summary: D2 takes the default leaf at B's site and never sees
+    ///        B's sink hit — its summary is a strict subset of the sequential
+    ///        one, exactly the production signature. (B's later release then
+    ///        wraps the counter below zero, which the pre-fix code never
+    ///        checks.)
+    fn race_program() -> Program {
+        let mut prog = Program { funcs: HashMap::new(), repo_of: HashMap::new(), packages: Vec::new() };
+        let x = cgf::Function {
+            id: Some(cgf::Ident { iid: vid(0x01), bid: vec![1u8; 32] }),
+            fqn: "pkg.X".into(),
+            has_body: true,
+            flow: Some(cgf::LocalFlow {
+                vertices: vec![
+                    vertex(1, cgf::VertexKind::InParam, 0, 0),
+                    vertex(2, cgf::VertexKind::CallArgPort, 0, 0),
+                ],
+                edges: vec![edge(1, 2)],
+                callsites: vec![cgf::CallSite {
+                    id: 0,
+                    callee_fqn: "db.Exec".into(),
+                    argc: 1,
+                    ..Default::default()
+                }],
+            }),
+            ..Default::default()
+        };
+        let a = cgf::Function {
+            id: Some(cgf::Ident { iid: vid(0x02), bid: vec![1u8; 32] }),
+            fqn: "pkg.A".into(),
+            has_body: true,
+            flow: Some(cgf::LocalFlow {
+                vertices: vec![
+                    vertex(1, cgf::VertexKind::InParam, 0, 0),
+                    vertex(2, cgf::VertexKind::CallArgPort, 0, 0),
+                ],
+                edges: vec![edge(1, 2)],
+                callsites: vec![cgf::CallSite {
+                    id: 0,
+                    callee_iids: vec![vid(0x01)],
+                    callee_fqn: "pkg.X".into(),
+                    argc: 1,
+                    ..Default::default()
+                }],
+            }),
+            ..Default::default()
+        };
+        // B: InParam -> db.Exec arg port (a sink hit in B's own summary) and
+        // InParam -> OutReturn (a flow D2 composes). B stays tiny: the race
+        // does not need a slow B — it needs D2 to spawn on the DUPLICATE
+        // release from A's second copy, which lands before the scan has even
+        // reached B. (A 150k-vertex chain would hang the tabulation itself:
+        // summarize runs propagate once per in_slot, so a function with k
+        // InGlobal vertices costs O(k * V) — quadratic in k. That is an
+        // engine cost property, not part of this reproduction.)
+        let b = cgf::Function {
+            id: Some(cgf::Ident { iid: vid(0x03), bid: vec![1u8; 32] }),
+            fqn: "pkg.B".into(),
+            has_body: true,
+            flow: Some(cgf::LocalFlow {
+                vertices: vec![
+                    vertex(1, cgf::VertexKind::InParam, 0, 0),
+                    vertex(2, cgf::VertexKind::CallArgPort, 0, 0),
+                    vertex(3, cgf::VertexKind::OutReturn, 0, 0),
+                ],
+                edges: vec![edge(1, 2), edge(1, 3)],
+                callsites: vec![cgf::CallSite {
+                    id: 0,
+                    callee_fqn: "db.Exec".into(),
+                    argc: 1,
+                    ..Default::default()
+                }],
+            }),
+            ..Default::default()
+        };
+        let d2 = cgf::Function {
+            id: Some(cgf::Ident { iid: vid(0x04), bid: vec![1u8; 32] }),
+            fqn: "pkg.D2".into(),
+            has_body: true,
+            flow: Some(cgf::LocalFlow {
+                vertices: vec![
+                    vertex(1, cgf::VertexKind::InParam, 0, 0),
+                    vertex(2, cgf::VertexKind::CallArgPort, 0, 0),
+                    vertex(3, cgf::VertexKind::CallResultPort, 0, 0),
+                    vertex(4, cgf::VertexKind::CallArgPort, 0, 1),
+                    vertex(5, cgf::VertexKind::CallResultPort, 0, 1),
+                    vertex(6, cgf::VertexKind::OutReturn, 0, 0),
+                ],
+                edges: vec![edge(1, 2), edge(3, 6), edge(1, 4), edge(5, 6)],
+                callsites: vec![
+                    cgf::CallSite {
+                        id: 0,
+                        callee_iids: vec![vid(0x02)],
+                        callee_fqn: "pkg.A".into(),
+                        argc: 1,
+                        resultc: 1,
+                        ..Default::default()
+                    },
+                    cgf::CallSite {
+                        id: 1,
+                        callee_iids: vec![vid(0x03)],
+                        callee_fqn: "pkg.B".into(),
+                        argc: 1,
+                        resultc: 1,
+                        ..Default::default()
+                    },
+                ],
+            }),
+            ..Default::default()
+        };
+        for f in [x, a, b, d2] {
+            let h = hexid(&f.id.as_ref().unwrap().iid);
+            prog.repo_of.insert(h.clone(), "r".into());
+            prog.funcs.insert(h, f);
+        }
+        prog
+    }
+
+    /// The pre-fix scheduler, verbatim in shape: ready-scan and release path
+    /// both spawn on the counter alone, no claim.
+    fn run_prefix_scheduler(eng: &Engine<'_>, store: &SummaryStore) {
+        let sccs = eng.prog.scc_order();
+        let n = sccs.len();
+        let mut scc_of: HashMap<&IidHex, usize> = HashMap::new();
+        for (i, scc) in sccs.iter().enumerate() {
+            for iid in scc {
+                scc_of.insert(iid, i);
+            }
+        }
+        let mut dep_sets: Vec<std::collections::HashSet<usize>> = vec![Default::default(); n];
+        for (i, scc) in sccs.iter().enumerate() {
+            for iid in scc {
+                if let Some(f) = eng.prog.funcs.get(iid) {
+                    for c in eng.prog.callees(f) {
+                        if let Some(&j) = scc_of.get(&c) {
+                            if j != i {
+                                dep_sets[i].insert(j);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let deps: Vec<AtomicUsize> = dep_sets.iter().map(|s| AtomicUsize::new(s.len())).collect();
+        let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for (i, ds) in dep_sets.iter().enumerate() {
+            for &j in ds {
+                dependents[j].push(i);
+            }
+        }
+        let out = TabOut::default();
+        fn spawn_pre<'a>(
+            scope: &rayon::Scope<'a>,
+            eng: &'a Engine<'a>,
+            store: &'a SummaryStore,
+            sccs: &'a [Vec<IidHex>],
+            deps: &'a [AtomicUsize],
+            dependents: &'a [Vec<usize>],
+            out: &'a TabOut,
+            i: usize,
+        ) {
+            scope.spawn(move |s| {
+                eng.tabulate_scc(&sccs[i], store, out);
+                for &d in &dependents[i] {
+                    if deps[d].fetch_sub(1, Ordering::SeqCst) == 1 {
+                        spawn_pre(s, eng, store, sccs, deps, dependents, out, d);
+                    }
+                }
+            });
+        }
+        rayon::scope(|scope| {
+            for i in 0..n {
+                // Hold the scan back so the first callee's release lands
+                // before the scan reaches the released SCC — the window the
+                // 1.74M-function production run fell into (its scan walked
+                // for seconds while early callees finished in milliseconds).
+                std::thread::sleep(std::time::Duration::from_millis(2));
+                if deps[i].load(Ordering::SeqCst) == 0 {
+                    spawn_pre(scope, eng, store, &sccs, &deps, &dependents, &out, i);
+                }
+            }
+        });
+    }
+
+    #[test]
+    #[ignore = "replays the pre-claim prod scheduler to demonstrate the subset-summary race; the shipped scheduler claims spawns, so this must not run in CI"]
+    fn pre_fix_scheduler_loses_summaries() {
+        let cat = Catalog::load_str(CAT).unwrap();
+        let prog = race_program();
+        let mut diverged = 0;
+        for attempt in 0..5 {
+            eprintln!("attempt {attempt}: start");
+            let mut eng = Engine::new(&prog, &cat);
+            let store = SummaryStore::ephemeral();
+            run_prefix_scheduler(&eng, &store);
+            eprintln!("attempt {attempt}: scheduled");
+            let bad = eng.debug_verify_sequential();
+            eprintln!("attempt {attempt}: verified, {} differ", bad.len());
+            if !bad.is_empty() {
+                diverged += 1;
+                eprintln!("attempt {attempt}: {} subset/incomplete summaries, e.g. {:?}", bad.len(), &bad[..bad.len().min(4)]);
+            }
+        }
+        assert!(
+            diverged > 0,
+            "the pre-claim schedule did not diverge in 5 attempts — the reproduction window moved"
+        );
     }
 }
